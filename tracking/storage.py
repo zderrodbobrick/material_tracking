@@ -159,31 +159,111 @@ class DwellTracker:
     # ── schema migration ──────────────────────────────────────────────────
 
     def _ensure_columns(self) -> None:
-        """Add the four extra columns to component_sessions if not present."""
+        """Migrate component_sessions to antenna-suffixed enter/exit columns.
+
+        Target columns:
+            first_enter_at_ant1, first_enter_rssi_ant1,
+            last_enter_at_ant1,  last_enter_rssi_ant1,
+            first_exit_at_ant2,  first_exit_rssi_ant2,
+            last_exit_at_ant2,   last_exit_rssi_ant2
+        """
+        target_columns = [
+            ("first_enter_at_ant1",   "TEXT"),
+            ("first_enter_rssi_ant1", "INTEGER"),
+            ("last_enter_at_ant1",    "TEXT"),
+            ("last_enter_rssi_ant1",  "INTEGER"),
+            ("first_exit_at_ant2",    "TEXT"),
+            ("first_exit_rssi_ant2",  "INTEGER"),
+            ("last_exit_at_ant2",     "TEXT"),
+            ("last_exit_rssi_ant2",   "INTEGER"),
+        ]
+        # All known historical names that should funnel into each target.
+        # Order matters only for cosmetic priority; we COALESCE on the new
+        # column being NULL so re-runs are no-ops.
+        copy_pairs = [
+            # current → target
+            ("first_enter_at_ant1",   "first_enter_at"),
+            ("first_enter_rssi_ant1", "first_enter_rssi"),
+            ("last_enter_at_ant1",    "last_enter_at"),
+            ("last_enter_rssi_ant1",  "last_enter_rssi"),
+            ("first_exit_at_ant2",    "first_exit_at"),
+            ("first_exit_rssi_ant2",  "first_exit_rssi"),
+            ("last_exit_at_ant2",     "last_exit_at"),
+            ("last_exit_rssi_ant2",   "last_exit_rssi"),
+            # very old → target (in case someone upgrades from gen-1 schema)
+            ("first_enter_at_ant1",   "entered_at"),
+            ("first_enter_rssi_ant1", "entry_rssi"),
+            ("last_enter_at_ant1",    "last_ant1_at"),
+            ("last_enter_rssi_ant1",  "last_ant1_rssi"),
+            ("first_exit_at_ant2",    "first_ant2_at"),
+            ("first_exit_rssi_ant2",  "first_ant2_rssi"),
+            ("last_exit_at_ant2",     "exited_at"),
+            ("last_exit_rssi_ant2",   "exit_rssi"),
+        ]
+        legacy_columns_to_drop = [
+            # gen-2 (the rename we just did)
+            "first_enter_at", "first_enter_rssi",
+            "last_enter_at",  "last_enter_rssi",
+            "first_exit_at",  "first_exit_rssi",
+            "last_exit_at",   "last_exit_rssi",
+            "enter_antenna",  "exit_antenna",
+            # gen-1
+            "entered_at", "entry_rssi",
+            "last_ant1_at", "last_ant1_rssi",
+            "first_ant2_at", "first_ant2_rssi",
+            "exited_at", "exit_rssi",
+        ]
+
         with self._lock:
             cols = {row[1] for row in self._conn.execute(
                 "PRAGMA table_info(component_sessions)"
             )}
-            for name, ddl in [
-                ("last_ant1_at",    "TEXT"),
-                ("last_ant1_rssi",  "INTEGER"),
-                ("first_ant2_at",   "TEXT"),
-                ("first_ant2_rssi", "INTEGER"),
-            ]:
+
+            # 1. Add new columns if missing.
+            for name, ddl in target_columns:
                 if name not in cols:
                     self._conn.execute(
-                        f"ALTER TABLE component_sessions ADD COLUMN {name} {ddl}"
+                        f"ALTER TABLE component_sessions "
+                        f"ADD COLUMN {name} {ddl}"
                     )
+
+            # Refresh column set after additions.
+            cols = {row[1] for row in self._conn.execute(
+                "PRAGMA table_info(component_sessions)"
+            )}
+
+            # 2. Copy data from any legacy column that still exists into its
+            #    target counterpart (only where the target is NULL).
+            for target_col, legacy_col in copy_pairs:
+                if legacy_col in cols and target_col in cols:
+                    self._conn.execute(
+                        f"UPDATE component_sessions "
+                        f"SET {target_col} = {legacy_col} "
+                        f"WHERE {target_col} IS NULL "
+                        f"  AND {legacy_col} IS NOT NULL"
+                    )
+
+            # 3. Drop legacy columns. SQLite >= 3.35 supports DROP COLUMN.
+            for legacy_col in legacy_columns_to_drop:
+                if legacy_col in cols:
+                    try:
+                        self._conn.execute(
+                            f"ALTER TABLE component_sessions "
+                            f"DROP COLUMN {legacy_col}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
 
     # ── recovery ──────────────────────────────────────────────────────────
 
     def _recover_open_sessions(self) -> None:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, epc, entered_at, entry_rssi, "
-                "       last_ant1_at, last_ant1_rssi, "
-                "       first_ant2_at, first_ant2_rssi, "
-                "       exited_at, exit_rssi "
+                "SELECT id, epc, "
+                "       first_enter_at_ant1, first_enter_rssi_ant1, "
+                "       last_enter_at_ant1,  last_enter_rssi_ant1, "
+                "       first_exit_at_ant2,  first_exit_rssi_ant2, "
+                "       last_exit_at_ant2,   last_exit_rssi_ant2 "
                 "FROM component_sessions WHERE status IN (?, ?)",
                 (STATUS_OPEN, STATUS_EXIT_ONLY),
             ).fetchall()
@@ -267,10 +347,12 @@ class DwellTracker:
                     if sess is None:
                         cur = self._conn.execute(
                             "INSERT INTO component_sessions "
-                            "(epc, entered_at, entry_rssi, "
-                            " last_ant1_at, last_ant1_rssi, status) "
+                            "(epc, first_enter_at_ant1, first_enter_rssi_ant1, "
+                            " last_enter_at_ant1, last_enter_rssi_ant1, "
+                            " status) "
                             "VALUES (?, ?, ?, ?, ?, ?)",
-                            (epc, reader_iso, rssi, reader_iso, rssi, STATUS_OPEN),
+                            (epc, reader_iso, rssi, reader_iso, rssi,
+                             STATUS_OPEN),
                         )
                         new_sess = _Session(cur.lastrowid, epc, reader_dt, rssi)
                         self._open[epc] = new_sess
@@ -281,7 +363,8 @@ class DwellTracker:
                         sess.last_seen_wall = datetime.now(timezone.utc)
                         self._conn.execute(
                             "UPDATE component_sessions "
-                            "SET last_ant1_at = ?, last_ant1_rssi = ? "
+                            "SET last_enter_at_ant1 = ?, "
+                            "    last_enter_rssi_ant1 = ? "
                             "WHERE id = ?",
                             (reader_iso, rssi, sess.id),
                         )
@@ -294,8 +377,9 @@ class DwellTracker:
                     if sess is None:
                         cur = self._conn.execute(
                             "INSERT INTO component_sessions "
-                            "(epc, first_ant2_at, first_ant2_rssi, "
-                            " exited_at, exit_rssi, status) "
+                            "(epc, first_exit_at_ant2, first_exit_rssi_ant2, "
+                            " last_exit_at_ant2, last_exit_rssi_ant2, "
+                            " status) "
                             "VALUES (?, ?, ?, ?, ?, ?)",
                             (epc, reader_iso, rssi, reader_iso, rssi,
                              STATUS_EXIT_ONLY),
@@ -328,9 +412,12 @@ class DwellTracker:
                         ))
                         self._conn.execute(
                             "UPDATE component_sessions "
-                            "SET first_ant2_at = COALESCE(first_ant2_at, ?), "
-                            "    first_ant2_rssi = COALESCE(first_ant2_rssi, ?), "
-                            "    exited_at = ?, exit_rssi = ?, "
+                            "SET first_exit_at_ant2 = "
+                            "        COALESCE(first_exit_at_ant2, ?), "
+                            "    first_exit_rssi_ant2 = "
+                            "        COALESCE(first_exit_rssi_ant2, ?), "
+                            "    last_exit_at_ant2 = ?, "
+                            "    last_exit_rssi_ant2 = ?, "
                             "    dwell_seconds = ? "
                             "WHERE id = ?",
                             (
@@ -346,7 +433,8 @@ class DwellTracker:
                         # EXIT_ONLY session: just refresh exit columns.
                         self._conn.execute(
                             "UPDATE component_sessions "
-                            "SET exited_at = ?, exit_rssi = ? "
+                            "SET last_exit_at_ant2 = ?, "
+                            "    last_exit_rssi_ant2 = ? "
                             "WHERE id = ?",
                             (reader_iso, rssi, sess.id),
                         )
@@ -356,6 +444,10 @@ class DwellTracker:
                 self._inserts_since_prune = 0
 
         return summary
+
+    def open_session_count(self) -> int:
+        with self._lock:
+            return len(self._open)
 
     def close(self) -> None:
         self._stop_evt.set()
@@ -405,7 +497,7 @@ class DwellTracker:
             ))
             self._conn.execute(
                 "UPDATE component_sessions "
-                "SET exited_at = ?, exit_rssi = ?, "
+                "SET last_exit_at_ant2 = ?, last_exit_rssi_ant2 = ?, "
                 "    dwell_seconds = ?, status = ? "
                 "WHERE id = ?",
                 (
@@ -421,7 +513,8 @@ class DwellTracker:
             # and stamp the final status.
             self._conn.execute(
                 "UPDATE component_sessions "
-                "SET exited_at = ?, exit_rssi = ?, status = ? "
+                "SET last_exit_at_ant2 = ?, last_exit_rssi_ant2 = ?, "
+                "    status = ? "
                 "WHERE id = ?",
                 (
                     sess.last_ant2_ts.isoformat(),

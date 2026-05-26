@@ -38,10 +38,45 @@ def divider(label=""):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_http():
-    from flask import Flask, request
+    import time
+    from flask import Flask, request, jsonify
 
     app = Flask(__name__)
     tracker = DwellTracker()
+
+    state = {
+        "started_at":      time.time(),
+        "last_event_at":   None,    # epoch seconds; None until first POST
+        "events_total":    0,
+        "batches_total":   0,
+    }
+
+    @app.route("/healthz", methods=["GET"])
+    def healthz():
+        now = time.time()
+        # Confirm DB is writable by pinging it through the tracker.
+        try:
+            open_n = tracker.open_session_count()
+            db_ok = True
+        except Exception as exc:
+            open_n = -1
+            db_ok = False
+
+        last_evt = state["last_event_at"]
+        last_evt_ago = (now - last_evt) if last_evt is not None else None
+
+        body = {
+            "status":                  "ok" if db_ok else "degraded",
+            "uptime_seconds":          int(now - state["started_at"]),
+            "open_sessions":           open_n,
+            "events_total":            state["events_total"],
+            "batches_total":           state["batches_total"],
+            "last_event_seconds_ago":  (
+                int(last_evt_ago) if last_evt_ago is not None else None
+            ),
+            "db_writable":             db_ok,
+        }
+        return jsonify(body), (200 if db_ok else 503)
 
     @app.route("/tags", methods=["POST"])
     def receive_tags():
@@ -84,6 +119,9 @@ def run_http():
             # events; tag_reads-style payloads are not used by FX9600 webhooks.
             events = data if isinstance(data, list) else [data]
             summary = tracker.ingest_batch(events)
+            state["batches_total"] += 1
+            state["events_total"]  += len(events)
+            state["last_event_at"]  = time.time()
             print(
                 f"\n  DB: tag_reads+{summary['raw_inserted']} "
                 f"throttled={summary['raw_throttled']} "
@@ -214,10 +252,60 @@ def run_llrp():
         server_sock.close()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MODE 3 — Health check client (queries a running listener)
+# ══════════════════════════════════════════════════════════════════════════════
+
+HEALTH_URL = "http://127.0.0.1:5000/healthz"
+
+def run_health_check() -> int:
+    """Hit /healthz on the running listener and print a readable summary.
+
+    Returns a process exit code: 0 healthy, 1 degraded, 2 unreachable.
+    """
+    import urllib.request
+    import urllib.error
+
+    divider("Listener Health Check")
+    print(f"\n  GET {HEALTH_URL}\n")
+
+    try:
+        with urllib.request.urlopen(HEALTH_URL, timeout=3) as resp:
+            raw = resp.read().decode("utf-8")
+            code = resp.getcode()
+    except urllib.error.URLError as exc:
+        print(f"  UNREACHABLE — is the listener running?")
+        print(f"  Detail: {exc.reason}")
+        return 2
+    except Exception as exc:
+        print(f"  UNREACHABLE — {exc}")
+        return 2
+
+    try:
+        body = json.loads(raw)
+    except Exception:
+        print(f"  HTTP {code}, non-JSON body:\n{raw}")
+        return 1
+
+    status = body.get("status", "unknown")
+    print(f"  Status              : {status.upper()}  (HTTP {code})")
+    print(f"  Uptime (s)          : {body.get('uptime_seconds')}")
+    print(f"  Open sessions       : {body.get('open_sessions')}")
+    print(f"  Events total        : {body.get('events_total')}")
+    print(f"  Batches total       : {body.get('batches_total')}")
+    print(f"  Last event (s ago)  : {body.get('last_event_seconds_ago')}")
+    print(f"  DB writable         : {body.get('db_writable')}")
+    print()
+
+    return 0 if status == "ok" else 1
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if "--llrp" in sys.argv:
+    if "--health" in sys.argv:
+        sys.exit(run_health_check())
+    elif "--llrp" in sys.argv:
         run_llrp()
     else:
         run_http()
