@@ -27,46 +27,36 @@ Session close triggers:
 
 from __future__ import annotations
 
-import os
+import re
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import (
+    ENTRY_ANTENNA,
+    EXIT_ANTENNA,
+    RSSI_MIN,
+    MIN_READS_FOR_SESSION,
+    EPC_FILTER_PATTERN,
+    STATUS_OPEN,
+    STATUS_CLOSED,
+    STATUS_ABANDONED,
+    STATUS_EXIT_ONLY,
+    RAW_THROTTLE_SEC,
+    RAW_MAX_ROWS,
+    PRUNE_EVERY_N_INSERTS,
+    IDLE_TIMEOUT_SEC,
+    SWEEP_INTERVAL_SEC,
+    ABANDON_TIMEOUT_SEC,
+    DB_PATH,
+)
 
-ENTRY_ANTENNA = 1
-EXIT_ANTENNA  = 2
-
-# RSSI filter:  RSSI_MIN <= rssi <= 0
-RSSI_MIN = -40
-
-STATUS_OPEN       = "IN_PROGRESS"
-STATUS_CLOSED     = "COMPLETE"
-STATUS_ABANDONED  = "ABANDONED"
-STATUS_EXIT_ONLY  = "EXIT_ONLY"   # ant2 seen with no matching ant1 entry
-
-# Drop a tag_reads insert if same (epc, antenna) was inserted within this
-# many seconds of reader time.
-RAW_THROTTLE_SEC = 1.0
-
-# Hard cap on tag_reads rows. Oldest pruned beyond this.
-RAW_MAX_ROWS = 20_000
-PRUNE_EVERY_N_INSERTS = 200
-
-# Auto-close a session this many wall-clock seconds after its last update,
-# provided it has at least one antenna-2 read.
-IDLE_TIMEOUT_SEC = 60.0
-
-# Background sweep frequency (seconds).
-SWEEP_INTERVAL_SEC = 1.0
-
-# Sessions that never reach antenna 2 are abandoned after this many wall-clock
-# seconds of silence (status set to ABANDONED).
-ABANDON_TIMEOUT_SEC = 60.0
-
-_DEFAULT_DB = Path(__file__).resolve().parent.parent / "database" / "rfid_reads.db"
+_DEFAULT_DB = DB_PATH
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -95,6 +85,19 @@ def _valid_rssi(rssi) -> bool:
     except (TypeError, ValueError):
         return False
     return RSSI_MIN <= r <= 0
+
+
+def _decode_epc(epc: str) -> str:
+    try:
+        return bytes.fromhex(epc).rstrip(b"\x00").decode("ascii", errors="replace")
+    except Exception:
+        return epc
+
+
+def _epc_matches_filter(epc: str) -> bool:
+    if not EPC_FILTER_PATTERN:
+        return True
+    return re.fullmatch(EPC_FILTER_PATTERN, _decode_epc(epc)) is not None
 
 
 # ── Open session in-memory state ──────────────────────────────────────────────
@@ -145,6 +148,7 @@ class DwellTracker:
 
         self._open: dict[str, _Session] = {}
         self._last_raw: dict[tuple[str, int], float] = {}
+        self._read_counts: dict[tuple[str, int], int] = {}  # (epc, antenna) -> read count
         self._inserts_since_prune = 0
 
         self._recover_open_sessions()
@@ -159,7 +163,7 @@ class DwellTracker:
     # ── schema migration ──────────────────────────────────────────────────
 
     def _ensure_columns(self) -> None:
-        """Migrate component_sessions to antenna-suffixed enter/exit columns.
+        """Migrate tag_reads to antenna-suffixed enter/exit columns.
 
         Target columns:
             first_enter_at_ant1, first_enter_rssi_ant1,
@@ -167,6 +171,24 @@ class DwellTracker:
             first_exit_at_ant2,  first_exit_rssi_ant2,
             last_exit_at_ant2,   last_exit_rssi_ant2
         """
+        self._conn.executescript('''
+            CREATE TABLE IF NOT EXISTS tag_reads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                "IBUS #" TEXT NOT NULL,
+                dwell_seconds INTEGER,
+                status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                first_enter_at_ant1 TEXT,
+                first_enter_rssi_ant1 INTEGER,
+                last_enter_at_ant1 TEXT,
+                last_enter_rssi_ant1 INTEGER,
+                first_exit_at_ant2 TEXT,
+                first_exit_rssi_ant2 INTEGER,
+                last_exit_at_ant2 TEXT,
+                last_exit_rssi_ant2 INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_reads_ibus ON tag_reads("IBUS #");
+            CREATE INDEX IF NOT EXISTS idx_reads_status ON tag_reads(status);
+        ''')
         target_columns = [
             ("first_enter_at_ant1",   "TEXT"),
             ("first_enter_rssi_ant1", "INTEGER"),
@@ -216,20 +238,20 @@ class DwellTracker:
 
         with self._lock:
             cols = {row[1] for row in self._conn.execute(
-                "PRAGMA table_info(component_sessions)"
+                "PRAGMA table_info(tag_reads)"
             )}
 
             # 1. Add new columns if missing.
             for name, ddl in target_columns:
                 if name not in cols:
                     self._conn.execute(
-                        f"ALTER TABLE component_sessions "
+                        f"ALTER TABLE tag_reads "
                         f"ADD COLUMN {name} {ddl}"
                     )
 
             # Refresh column set after additions.
             cols = {row[1] for row in self._conn.execute(
-                "PRAGMA table_info(component_sessions)"
+                "PRAGMA table_info(tag_reads)"
             )}
 
             # 2. Copy data from any legacy column that still exists into its
@@ -237,7 +259,7 @@ class DwellTracker:
             for target_col, legacy_col in copy_pairs:
                 if legacy_col in cols and target_col in cols:
                     self._conn.execute(
-                        f"UPDATE component_sessions "
+                        f"UPDATE tag_reads "
                         f"SET {target_col} = {legacy_col} "
                         f"WHERE {target_col} IS NULL "
                         f"  AND {legacy_col} IS NOT NULL"
@@ -248,23 +270,25 @@ class DwellTracker:
                 if legacy_col in cols:
                     try:
                         self._conn.execute(
-                            f"ALTER TABLE component_sessions "
+                            f"ALTER TABLE tag_reads "
                             f"DROP COLUMN {legacy_col}"
                         )
                     except sqlite3.OperationalError:
                         pass
+
+            self._conn.execute("DROP VIEW IF EXISTS component_sessions_display")
 
     # ── recovery ──────────────────────────────────────────────────────────
 
     def _recover_open_sessions(self) -> None:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, epc, "
+                "SELECT id, \"IBUS #\", "
                 "       first_enter_at_ant1, first_enter_rssi_ant1, "
                 "       last_enter_at_ant1,  last_enter_rssi_ant1, "
                 "       first_exit_at_ant2,  first_exit_rssi_ant2, "
                 "       last_exit_at_ant2,   last_exit_rssi_ant2 "
-                "FROM component_sessions WHERE status IN (?, ?)",
+                "FROM tag_reads WHERE status IN (?, ?)",
                 (STATUS_OPEN, STATUS_EXIT_ONLY),
             ).fetchall()
 
@@ -296,16 +320,46 @@ class DwellTracker:
         ordered = []
         for ev in events or []:
             dt = _parse_ts(ev.get("timestamp", ""))
-            if dt is not None:
-                ordered.append((dt, ev))
+            if dt is None:
+                dt = datetime.now(timezone.utc)
+            ordered.append((dt, ev))
         ordered.sort(key=lambda x: x[0])
 
+        # Strongest-signal-wins: within 100ms window, same EPC only keeps strongest read
+        WINNER_WINDOW_SEC = 0.10
+        epc_best: dict[str, tuple[datetime, dict, int]] = {}  # epc -> (dt, ev, rssi)
+        for reader_dt, ev in ordered:
+            data = ev.get("data") or {}
+            epc = (data.get("idHex") or data.get("epc") or "").lower()
+            if not epc:
+                continue
+            rssi = data.get("peakRssi")
+            try:
+                rssi_val = int(rssi)
+            except (TypeError, ValueError):
+                continue
+            existing = epc_best.get(epc)
+            if existing is None or (reader_dt - existing[0]).total_seconds() > WINNER_WINDOW_SEC:
+                # New window or first read - start fresh
+                epc_best[epc] = (reader_dt, ev, rssi_val)
+            elif rssi_val > existing[2]:
+                # Stronger signal within window - replace
+                epc_best[epc] = (reader_dt, ev, rssi_val)
+            # else: weaker signal - discard
+
+        winners = [(dt, ev) for (dt, ev, _) in epc_best.values()]
+        winners.sort(key=lambda x: x[0])
+
         with self._lock:
-            for reader_dt, ev in ordered:
+            for reader_dt, ev in winners:
                 data = ev.get("data") or {}
-                epc = (data.get("idHex") or data.get("epc") or "").lower()
-                if not epc:
+                epc_hex = (data.get("idHex") or data.get("epc") or "").lower()
+                if not epc_hex:
                     continue
+
+                if not _epc_matches_filter(epc_hex):
+                    continue
+                epc = _decode_epc(epc_hex)
 
                 antenna = int(data.get("antenna") or 0)
                 if antenna == 0:
@@ -318,21 +372,17 @@ class DwellTracker:
                 rssi = int(rssi)
                 reader_iso = reader_dt.isoformat()
 
-                # tag_reads (throttled)
                 key = (epc, antenna)
                 now_epoch = reader_dt.timestamp()
                 last = self._last_raw.get(key, 0.0)
-                if now_epoch - last >= RAW_THROTTLE_SEC:
-                    self._conn.execute(
-                        "INSERT INTO tag_reads (epc, antenna, rssi, read_at) "
-                        "VALUES (?, ?, ?, ?)",
-                        (epc, antenna, rssi, reader_iso),
-                    )
+                new_window = now_epoch - last >= RAW_THROTTLE_SEC
+                if new_window:
                     self._last_raw[key] = now_epoch
                     summary["raw_inserted"] += 1
-                    self._inserts_since_prune += 1
+                    self._read_counts[key] = 1
                 else:
                     summary["raw_throttled"] += 1
+                    self._read_counts[key] = self._read_counts.get(key, 0) + 1
 
                 # session bookkeeping
                 if antenna == ENTRY_ANTENNA:
@@ -345,9 +395,14 @@ class DwellTracker:
                         sess = None
 
                     if sess is None:
+                        # Temporal filter: require sustained reads before opening session
+                        read_count = self._read_counts.get((epc, antenna), 0)
+                        if read_count < MIN_READS_FOR_SESSION:
+                            # Not enough sustained reads - skip session creation
+                            continue
                         cur = self._conn.execute(
-                            "INSERT INTO component_sessions "
-                            "(epc, first_enter_at_ant1, first_enter_rssi_ant1, "
+                            "INSERT INTO tag_reads "
+                            "(\"IBUS #\", first_enter_at_ant1, first_enter_rssi_ant1, "
                             " last_enter_at_ant1, last_enter_rssi_ant1, "
                             " status) "
                             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -362,7 +417,7 @@ class DwellTracker:
                         sess.last_ant1_rssi = rssi
                         sess.last_seen_wall = datetime.now(timezone.utc)
                         self._conn.execute(
-                            "UPDATE component_sessions "
+                            "UPDATE tag_reads "
                             "SET last_enter_at_ant1 = ?, "
                             "    last_enter_rssi_ant1 = ? "
                             "WHERE id = ?",
@@ -372,25 +427,8 @@ class DwellTracker:
                 elif antenna == EXIT_ANTENNA:
                     sess = self._open.get(epc)
 
-                    # Edge case: ant2 read with no open session at all.
-                    # Insert an EXIT_ONLY row so we don't lose the event.
+                    # Ant-2 read with no open session — ignore.
                     if sess is None:
-                        cur = self._conn.execute(
-                            "INSERT INTO component_sessions "
-                            "(epc, first_exit_at_ant2, first_exit_rssi_ant2, "
-                            " last_exit_at_ant2, last_exit_rssi_ant2, "
-                            " status) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (epc, reader_iso, rssi, reader_iso, rssi,
-                             STATUS_EXIT_ONLY),
-                        )
-                        sess = _Session(cur.lastrowid, epc, None, None)
-                        sess.first_ant2_ts   = reader_dt
-                        sess.first_ant2_rssi = rssi
-                        sess.last_ant2_ts    = reader_dt
-                        sess.last_ant2_rssi  = rssi
-                        self._open[epc] = sess
-                        summary["session_opened"] += 1
                         continue
 
                     # Reject ant-2 reads earlier than the recorded entry.
@@ -398,49 +436,45 @@ class DwellTracker:
                             and reader_dt < sess.first_ant1_ts):
                         continue
 
+                    # First antenna-2 read: immediately close the session.
+                    # Dwell = first_exit_at_ant2 - first_enter_at_ant1.
                     if sess.first_ant2_ts is None:
                         sess.first_ant2_ts   = reader_dt
                         sess.first_ant2_rssi = rssi
+                        sess.last_ant2_ts    = reader_dt
+                        sess.last_ant2_rssi  = rssi
 
-                    sess.last_ant2_ts   = reader_dt
-                    sess.last_ant2_rssi = rssi
-                    sess.last_seen_wall = datetime.now(timezone.utc)
-
-                    if sess.first_ant1_ts is not None:
-                        dwell = int(round(
-                            (reader_dt - sess.first_ant1_ts).total_seconds()
-                        ))
-                        self._conn.execute(
-                            "UPDATE component_sessions "
-                            "SET first_exit_at_ant2 = "
-                            "        COALESCE(first_exit_at_ant2, ?), "
-                            "    first_exit_rssi_ant2 = "
-                            "        COALESCE(first_exit_rssi_ant2, ?), "
-                            "    last_exit_at_ant2 = ?, "
-                            "    last_exit_rssi_ant2 = ?, "
-                            "    dwell_seconds = ? "
-                            "WHERE id = ?",
-                            (
-                                sess.first_ant2_ts.isoformat(),
-                                sess.first_ant2_rssi,
-                                reader_iso,
-                                rssi,
-                                dwell,
-                                sess.id,
-                            ),
-                        )
-                    else:
-                        # EXIT_ONLY session: just refresh exit columns.
-                        self._conn.execute(
-                            "UPDATE component_sessions "
-                            "SET last_exit_at_ant2 = ?, "
-                            "    last_exit_rssi_ant2 = ? "
-                            "WHERE id = ?",
-                            (reader_iso, rssi, sess.id),
-                        )
+                        if sess.first_ant1_ts is not None:
+                            dwell = int(round(
+                                (reader_dt - sess.first_ant1_ts).total_seconds()
+                            ))
+                            self._conn.execute(
+                                "UPDATE tag_reads "
+                                "SET first_exit_at_ant2 = ?, first_exit_rssi_ant2 = ?, "
+                                "    last_exit_at_ant2  = ?, last_exit_rssi_ant2  = ?, "
+                                "    dwell_seconds = ?, status = ? "
+                                "WHERE id = ?",
+                                (reader_iso, rssi, reader_iso, rssi,
+                                 dwell, STATUS_CLOSED, sess.id),
+                            )
+                        else:
+                            # EXIT_ONLY: antenna 2 seen before antenna 1.
+                            self._conn.execute(
+                                "UPDATE tag_reads "
+                                "SET first_exit_at_ant2 = ?, first_exit_rssi_ant2 = ?, "
+                                "    last_exit_at_ant2  = ?, last_exit_rssi_ant2  = ?, "
+                                "    status = ? "
+                                "WHERE id = ?",
+                                (reader_iso, rssi, reader_iso, rssi,
+                                 STATUS_EXIT_ONLY, sess.id),
+                            )
+                        self._open.pop(epc, None)
+                        summary["session_closed"] += 1
+                    # Subsequent ant-2 reads after close: session already popped,
+                    # so self._open.get(epc) would have returned None above.
 
             if self._inserts_since_prune >= PRUNE_EVERY_N_INSERTS:
-                self._prune_raw()
+                pass
                 self._inserts_since_prune = 0
 
         return summary
@@ -489,14 +523,14 @@ class DwellTracker:
 
     def _finalize(self, sess: _Session, status: str = STATUS_CLOSED) -> None:
         """Set a session's final status and drop from in-memory map."""
-        if (sess.last_ant2_ts is not None
+        if (sess.first_ant2_ts is not None
                 and sess.first_ant1_ts is not None):
-            # Full pass: compute dwell.
+            # Full pass: dwell = first exit - first entrance.
             dwell = int(round(
-                (sess.last_ant2_ts - sess.first_ant1_ts).total_seconds()
+                (sess.first_ant2_ts - sess.first_ant1_ts).total_seconds()
             ))
             self._conn.execute(
-                "UPDATE component_sessions "
+                "UPDATE tag_reads "
                 "SET last_exit_at_ant2 = ?, last_exit_rssi_ant2 = ?, "
                 "    dwell_seconds = ?, status = ? "
                 "WHERE id = ?",
@@ -512,7 +546,7 @@ class DwellTracker:
             # EXIT_ONLY: no entry timestamp, no dwell. Just refresh exit cols
             # and stamp the final status.
             self._conn.execute(
-                "UPDATE component_sessions "
+                "UPDATE tag_reads "
                 "SET last_exit_at_ant2 = ?, last_exit_rssi_ant2 = ?, "
                 "    status = ? "
                 "WHERE id = ?",
@@ -526,15 +560,13 @@ class DwellTracker:
         else:
             # ABANDONED: only ant-1 ever seen.
             self._conn.execute(
-                "UPDATE component_sessions SET status = ? WHERE id = ?",
+                "UPDATE tag_reads SET status = ? WHERE id = ?",
                 (status, sess.id),
             )
         self._open.pop(sess.epc, None)
 
     def _prune_raw(self) -> None:
         self._conn.execute(
-            "DELETE FROM tag_reads WHERE id IN ("
-            "  SELECT id FROM tag_reads ORDER BY id DESC LIMIT -1 OFFSET ?"
-            ")",
-            (RAW_MAX_ROWS,),
+            "SELECT 1",
+            (),
         )

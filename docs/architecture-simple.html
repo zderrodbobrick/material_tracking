@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>RFID Tracking System — Architecture</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #fff;
+    color: #1a1a1a;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 40px 32px 64px; }
+  h1 {
+    font-size: 30px; margin: 0 0 4px;
+    border-bottom: 3px solid #0b69c7; padding-bottom: 8px;
+  }
+  h2 {
+    font-size: 20px; margin: 36px 0 6px; color: #0b69c7;
+  }
+  p { font-size: 14px; margin: 6px 0 14px; }
+  .meta { color: #555; font-size: 13px; }
+  .diagram {
+    border: 1px solid #d8dee6;
+    border-radius: 6px;
+    padding: 18px;
+    margin: 8px 0 24px;
+    background: #fff;
+    overflow-x: auto;
+    page-break-inside: avoid;
+  }
+  @media print {
+    main { padding: 12px 8px; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 17px; }
+    .diagram { border: none; padding: 4px 0; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>RFID Tracking System — Architecture</h1>
+<p class="meta">
+  High-level view of how a tag is tracked from the moment it passes the
+  entry antenna to when its session is closed. Each vertical lane in the
+  flow diagrams represents one part of the system.
+</p>
+
+<!-- ============================================================ -->
+<h2>1. Startup</h2>
+<p>What happens when the listener is launched.</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U  as Operator
+    participant S  as Listener
+    participant DB as Database
+    participant SW as Cleanup Worker
+
+    U  ->>  S:  Start the listener
+    S  ->>  DB: Open and prepare database
+    S  ->>  DB: Reload any unfinished sessions
+    DB -->> S:  Open sessions restored
+    S  ->>  SW: Start the cleanup worker
+    Note over S,SW: Listener is ready to receive tag events.
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Normal Tag Pass</h2>
+<p>
+  A tag enters the zone at antenna 1, travels through, and leaves at
+  antenna 2. The dwell time is the difference between the first read at
+  antenna 1 and the last read at antenna 2.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R  as Reader
+    participant S  as Listener
+    participant M  as Active Sessions
+    participant DB as Database
+
+    R ->> S: Tag seen at antenna 1
+    S ->> M: Open new session for this tag
+    S ->> DB: Save first-enter timestamp
+
+    R ->> S: Tag seen again at antenna 1
+    S ->> M: Update last-enter timestamp
+    S ->> DB: Save last-enter timestamp
+
+    R ->> S: Tag seen at antenna 2
+    S ->> M: Mark first-exit timestamp
+    S ->> DB: Save first-exit timestamp
+
+    R ->> S: Tag seen again at antenna 2
+    S ->> M: Update last-exit timestamp
+    S ->> DB: Save last-exit and dwell time
+
+    Note over R,DB: Tag goes silent.
+    S ->> DB: Mark session COMPLETE
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Exit-Only Edge Case</h2>
+<p>
+  A tag is seen at the exit antenna without ever appearing at the entry
+  antenna. The system still records the read so nothing is lost.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R  as Reader
+    participant S  as Listener
+    participant DB as Database
+    participant SW as Cleanup Worker
+
+    R ->> S: Tag seen at antenna 2 only
+    S ->> DB: Create session marked EXIT-ONLY
+    R ->> S: More antenna 2 reads
+    S ->> DB: Update last-exit timestamp
+    Note over R,SW: Tag goes silent.
+    SW ->> DB: Close session, keep status EXIT-ONLY
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Cleanup Worker</h2>
+<p>
+  Runs continuously in the background. Closes sessions whose tags have
+  gone silent so nothing stays open forever.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant SW as Cleanup Worker
+    participant M  as Active Sessions
+    participant DB as Database
+
+    loop Every second
+        SW ->> M: Check each open session
+        alt Tag still active
+            SW -->> SW: Leave session open
+        else Tag was seen at both antennas, then went silent
+            SW ->> DB: Close as COMPLETE with dwell time
+        else Tag only seen at exit antenna
+            SW ->> DB: Close as EXIT-ONLY
+        else Tag only seen at entry antenna and disappeared
+            SW ->> DB: Close as ABANDONED
+        end
+    end
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Health Check</h2>
+<p>An operator or monitor asks the listener if it is alive and well.</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U  as Operator
+    participant S  as Listener
+
+    U ->> S: Ask for health status
+    S ->> S: Check uptime, open sessions, last event, database
+    alt Healthy
+        S -->> U: Status OK
+    else Database problem
+        S -->> U: Status DEGRADED
+    end
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. System Components</h2>
+<p>How the moving parts connect.</p>
+<div class="diagram">
+<pre class="mermaid">
+flowchart LR
+    R[Reader<br/>FX9600]
+    L[Listener]
+    M[Active Sessions<br/>in memory]
+    SW[Cleanup Worker]
+    DB[(Database)]
+    H[Health Check]
+
+    R  -- tag events --> L
+    L  -- update      --> M
+    L  -- write       --> DB
+    SW -- inspect     --> M
+    SW -- close       --> DB
+    H  -- query       --> L
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Session Lifecycle</h2>
+<p>The possible states a session can be in.</p>
+<div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> InProgress  : First seen at entry antenna
+    [*] --> ExitOnly    : First seen at exit antenna only
+
+    InProgress --> InProgress : Tag still being seen
+    InProgress --> Complete   : Saw both antennas, then went silent
+    InProgress --> Abandoned  : Never reached exit, then went silent
+
+    ExitOnly --> ExitOnly : More exit reads
+    ExitOnly --> ExitOnly : Closed by cleanup worker
+
+    Complete  --> [*]
+    Abandoned --> [*]
+    ExitOnly  --> [*]
+</pre>
+</div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "default",
+    sequence: { useMaxWidth: true, mirrorActors: false, showSequenceNumbers: false },
+    flowchart: { htmlLabels: true, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

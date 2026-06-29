@@ -14,12 +14,26 @@ Requirements:
 
 import sys
 import json
+import re
 import threading
 from datetime import datetime, timezone
 
+sys.path.insert(0, str(__file__).rsplit('\\', 2)[0])
+from config import RSSI_MIN, EPC_FILTER_PATTERN, LISTENER_HOST, LISTENER_PORT
 from storage import DwellTracker
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def decode_epc(epc: str) -> str:
+    try:
+        return bytes.fromhex(epc).rstrip(b"\x00").decode("ascii", errors="replace")
+    except Exception:
+        return epc
+
+def epc_matches_filter(epc: str) -> bool:
+    if not EPC_FILTER_PATTERN:
+        return True
+    return re.fullmatch(EPC_FILTER_PATTERN, decode_epc(epc)) is not None
 
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -79,55 +93,47 @@ def run_http():
 
     @app.route("/tags", methods=["POST"])
     def receive_tags():
-        divider(f"Event received at {ts()}")
-
-        # Headers
-        print("\n  Headers:")
-        for key, value in request.headers:
-            print(f"    {key}: {value}")
-
-        # Raw body
         raw = request.get_data(as_text=True)
-        print(f"\n  Raw body:\n  {raw}")
 
-        # Pretty-print if JSON
         try:
             data = json.loads(raw)
-            print(f"\n  Parsed JSON:")
-            print(json.dumps(data, indent=4))
-
-            # Pull out tag reads if present (only for dict-shaped payloads)
-            if isinstance(data, dict):
-                tags = (
-                    data.get("tag_reads")
-                    or data.get("tagReads")
-                    or data.get("data", {}).get("tagReads")
-                    or []
-                )
-            else:
-                tags = []
-            if tags:
-                print(f"\n  ── Tag summary ({len(tags)} read(s)) ──")
-                for t in tags:
-                    epc  = t.get("epc") or t.get("EPC") or t.get("idHex") or "unknown"
-                    rssi = t.get("peakRssi") or t.get("rssi") or t.get("PeakRSSI") or "n/a"
-                    ant  = t.get("antennaPort") or t.get("antenna") or "?"
-                    print(f"    EPC: {epc}  |  RSSI: {rssi} dBm  |  Antenna: {ant}")
-
-            # Persist + dwell tracking. The reader sends a top-level list of
-            # events; tag_reads-style payloads are not used by FX9600 webhooks.
             events = data if isinstance(data, list) else [data]
+
+            def _passes_filters(ev):
+                if not isinstance(ev, dict):
+                    return False
+                rssi = (ev.get("data") or {}).get("peakRssi")
+                try:
+                    if not (RSSI_MIN <= int(rssi) <= 0):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+                epc = ((ev.get("data") or {}).get("idHex") or "").lower()
+                if not epc_matches_filter(epc):
+                    return False
+                return True
+
+            shown = [ev for ev in events if _passes_filters(ev)]
+
+            # Only print tag reads (clean output)
+            for ev in shown:
+                d = ev.get("data", {})
+                epc = d.get("idHex", "")
+                antenna = d.get("antenna", 0)
+                rssi = d.get("peakRssi", 0)
+                epc_readable = decode_epc(epc)
+                print(f"[{ts()}] Tag: {epc_readable} (hex:{epc[:16]}..) Ant{antenna} RSSI:{rssi}dBm")
+
+            # Persist + dwell tracking
             summary = tracker.ingest_batch(events)
             state["batches_total"] += 1
             state["events_total"]  += len(events)
             state["last_event_at"]  = time.time()
-            print(
-                f"\n  DB: tag_reads+{summary['raw_inserted']} "
-                f"throttled={summary['raw_throttled']} "
-                f"rejected={summary['raw_rejected']} "
-                f"opened+{summary['session_opened']} "
-                f"closed+{summary['session_closed']}"
-            )
+            
+            if summary['raw_inserted'] > 0 or summary['session_opened'] > 0:
+                print(f"  DB: +{summary['raw_inserted']} reads, "
+                      f"+{summary['session_opened']} sessions, "
+                      f"+{summary['session_closed']} completed")
 
         except Exception as exc:
             print(f"\n  (body is not JSON or ingest failed: {exc})")
@@ -135,18 +141,18 @@ def run_http():
         return "OK", 200
 
     divider("Zebra FX9600 — HTTP Listener")
-    print(f"\n  Listening on  http://0.0.0.0:5000/tags")
+    print(f"\n  Listening on  http://{LISTENER_HOST}:{LISTENER_PORT}/tags")
     print(f"  Point the reader's HTTP POST target to:")
-    print(f"  http://YOUR_PC_IP:5000/tags")
+    print(f"  http://YOUR_PC_IP:{LISTENER_PORT}/tags")
     print(f"\n  Waiting for tag events...\n")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host=LISTENER_HOST, port=LISTENER_PORT, debug=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE 2 — Health check client (queries a running listener)
 # ══════════════════════════════════════════════════════════════════════════════
 
-HEALTH_URL = "http://127.0.0.1:5000/healthz"
+HEALTH_URL = f"http://127.0.0.1:{LISTENER_PORT}/healthz"
 
 def run_health_check() -> int:
     """Hit /healthz on the running listener and print a readable summary.
@@ -193,7 +199,17 @@ def run_health_check() -> int:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import logging
+    
+    # Check for verbose flag
+    VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv
+    
     if "--health" in sys.argv:
         sys.exit(run_health_check())
     else:
+        # Suppress Flask/Werkzeug request logging unless verbose
+        if not VERBOSE:
+            log = logging.getLogger('werkzeug')
+            log.setLevel(logging.ERROR)  # Only show errors, not INFO logs
+        
         run_http()

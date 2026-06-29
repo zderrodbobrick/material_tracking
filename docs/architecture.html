@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>RFID Tracking System — Architecture (UML)</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #555;
+    --accent: #0b69c7;
+    --bg: #ffffff;
+    --section: #f5f7fa;
+    --border: #d8dee6;
+  }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  main {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 36px 32px 64px;
+  }
+  h1 {
+    font-size: 28px;
+    margin: 0 0 4px;
+    border-bottom: 3px solid var(--accent);
+    padding-bottom: 6px;
+  }
+  h2 {
+    font-size: 20px;
+    margin: 32px 0 8px;
+    color: var(--accent);
+  }
+  h3 {
+    font-size: 15px;
+    margin: 18px 0 6px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  p, li { font-size: 13.5px; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .legend {
+    background: var(--section);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 16px;
+    font-size: 13px;
+  }
+  .legend code {
+    background: #eef2f7;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+  .diagram {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    margin: 12px 0 20px;
+    background: #fff;
+    overflow-x: auto;
+    page-break-inside: avoid;
+  }
+  .pagebreak { page-break-before: always; }
+  @media print {
+    main { padding: 12px 8px; }
+    h1   { font-size: 22px; }
+    h2   { font-size: 16px; }
+    h3   { font-size: 12px; }
+    .diagram { border: none; padding: 4px 0; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>RFID Tracking System — Architecture (UML)</h1>
+<p class="meta">
+  Component: <code>tracking/listener.py</code> + <code>tracking/storage.py</code>.
+  Database: <code>database/rfid_reads.db</code> (SQLite, WAL mode).
+  Diagrams below model startup, normal event ingestion, edge cases, the
+  background sweeper, and the health-check probe. Each <em>participant</em>
+  acts as a swim lane (lifeline).
+</p>
+
+<section class="legend">
+  <strong>Participants used across diagrams</strong>
+  <ul>
+    <li><strong>FX9600</strong> — Zebra reader; pushes JSON event batches via HTTP POST.</li>
+    <li><strong>Flask /tags</strong> — Flask route inside <code>listener.py</code>.</li>
+    <li><strong>DwellTracker</strong> — orchestrator in <code>storage.py</code>; holds <code>self._lock</code>.</li>
+    <li><strong>_open</strong> — in-memory <code>dict[epc → _Session]</code> of active sessions.</li>
+    <li><strong>SQLite</strong> — persistent store: <code>tag_reads</code> + <code>component_sessions</code>.</li>
+    <li><strong>Sweeper</strong> — daemon thread running <code>_sweep_loop</code> every 1s.</li>
+    <li><strong>HealthClient</strong> — anything calling <code>GET /healthz</code> (e.g. <code>python listener.py --health</code>).</li>
+  </ul>
+</section>
+
+<!-- ============================================================ -->
+<h2>1. Startup &amp; Schema Migration</h2>
+<p>
+  Boot path from CLI through <code>DwellTracker.__init__</code>, idempotent
+  schema migration, in-memory recovery of open sessions, and Flask startup.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant U  as User (CLI)
+    participant LP as listener.py
+    participant DT as DwellTracker
+    participant DB as SQLite
+    participant SW as Sweeper
+    participant FL as Flask /tags
+
+    U  ->>  LP: python listener.py
+    LP ->>  DT: DwellTracker()
+    DT ->>  DB: connect, PRAGMA journal_mode=WAL
+    DT ->>  DB: CREATE TABLE IF NOT EXISTS tag_reads
+    DT ->>  DB: CREATE TABLE IF NOT EXISTS component_sessions
+
+    rect rgb(245,247,250)
+    Note over DT,DB: _ensure_columns() — idempotent migration
+    DT ->>  DB: PRAGMA table_info(component_sessions)
+    DB -->> DT: existing columns
+    loop for each target column
+        DT ->>  DB: ALTER TABLE ADD COLUMN ...
+    end
+    loop for each (target, legacy) pair
+        DT ->>  DB: UPDATE SET target = legacy WHERE target IS NULL
+    end
+    loop for each legacy column
+        DT ->>  DB: ALTER TABLE DROP COLUMN legacy
+    end
+    end
+
+    rect rgb(245,250,245)
+    Note over DT,DB: _recover_open_sessions()
+    DT ->>  DB: SELECT * WHERE status IN (IN_PROGRESS, EXIT_ONLY)
+    DB -->> DT: rows
+    DT ->>  DT: rebuild self._open[epc] = _Session(...)
+    end
+
+    DT ->>  SW: threading.Thread(_sweep_loop).start()
+    LP ->>  FL: register routes (/tags, /healthz)
+    LP ->>  FL: app.run(0.0.0.0:5000)
+    Note over LP,FL: Listener ready.
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Normal Tag Pass — Antenna 1 &rarr; Antenna 2</h2>
+<p>
+  Granular flow of a complete pass. Shows raw read insertion, throttling,
+  RSSI filter, session create on first ant1, last_enter updates, ant2
+  edge-case rejection if earlier than entry, dwell calculation, and the
+  POST response.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R   as FX9600
+    participant FL  as Flask /tags
+    participant DT  as DwellTracker
+    participant OP  as _open dict
+    participant DB  as SQLite
+
+    R  ->>  FL: POST /tags  (batch of N events)
+    FL ->>  FL: parse JSON, log headers/body
+    FL ->>  DT: ingest_batch(events)
+
+    DT ->>  DT: sort events by reader timestamp
+    DT ->>  DT: acquire self._lock
+
+    loop per event
+        DT ->>  DT: extract epc, antenna, peakRssi
+        alt epc missing OR antenna == 0
+            DT -->> DT: skip
+        else RSSI fails _valid_rssi
+            DT -->> DT: summary.raw_rejected++
+        else
+            DT ->>  DT: _last_raw[(epc,ant)] check
+            alt within RAW_THROTTLE_SEC (1s)
+                DT -->> DT: summary.raw_throttled++
+            else
+                DT ->>  DB: INSERT INTO tag_reads (...)
+                DT ->>  DT: summary.raw_inserted++
+            end
+
+            alt antenna == ENTRY_ANTENNA (1)
+                DT ->>  OP: lookup self._open[epc]
+                alt previous pass already saw ant2
+                    DT ->>  DT: _finalize(prev, COMPLETE)
+                    DT ->>  DB: UPDATE component_sessions ...
+                    DT ->>  OP: del self._open[epc]
+                end
+                alt no open session
+                    DT ->>  DB: INSERT component_sessions<br/>(first_enter_at_ant1, ...)
+                    DB -->> DT: lastrowid
+                    DT ->>  OP: self._open[epc] = _Session(...)
+                else session exists
+                    DT ->>  DB: UPDATE last_enter_at_ant1, last_enter_rssi_ant1
+                    DT ->>  OP: sess.last_ant1_ts = reader_dt
+                end
+
+            else antenna == EXIT_ANTENNA (2)
+                DT ->>  OP: lookup self._open[epc]
+                alt no open session  (EDGE CASE)
+                    DT ->>  DB: INSERT EXIT_ONLY row<br/>(first_exit_at_ant2, ...)
+                    DT ->>  OP: self._open[epc] = _Session(no entry)
+                else reader_dt &lt; first_ant1_ts
+                    DT -->> DT: drop (out-of-order ant2)
+                else
+                    alt first ant2 read
+                        DT ->>  OP: sess.first_ant2_ts = reader_dt
+                    end
+                    DT ->>  OP: sess.last_ant2_ts = reader_dt
+                    alt session has first_ant1_ts
+                        DT ->>  DT: dwell = last_ant2 - first_ant1
+                        DT ->>  DB: UPDATE last_exit_at_ant2,<br/>last_exit_rssi_ant2,<br/>dwell_seconds
+                    else  (EXIT_ONLY)
+                        DT ->>  DB: UPDATE last_exit_at_ant2 only
+                    end
+                end
+            end
+        end
+    end
+
+    DT ->>  DT: release self._lock
+    DT -->> FL: summary {raw_inserted, throttled, rejected, opened, closed}
+    FL -->> R: HTTP 200 OK
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>3. Edge Case: <code>EXIT_ONLY</code> Session</h2>
+<p>
+  Antenna 2 fires for an EPC with no open session. We record the event so
+  no read is lost and rely on the sweeper to finalize.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant R  as FX9600
+    participant FL as Flask /tags
+    participant DT as DwellTracker
+    participant OP as _open dict
+    participant DB as SQLite
+    participant SW as Sweeper
+
+    R  ->> FL: event { antenna:2, epc:X }
+    FL ->> DT: ingest_batch([event])
+    DT ->> OP: self._open.get(X)  →  None
+    DT ->> DB: INSERT component_sessions<br/>status=EXIT_ONLY,<br/>first_exit_at_ant2 = now
+    DT ->> OP: self._open[X] = _Session(no entry)
+
+    Note over R,DT: more ant2 reads arrive...
+    R  ->> FL: event { antenna:2, epc:X }
+    FL ->> DT: ingest_batch([event])
+    DT ->> DB: UPDATE last_exit_at_ant2, last_exit_rssi_ant2
+
+    Note over SW,DB: 30s of silence elapses...
+    SW ->> SW: _sweep_once()
+    SW ->> OP: idle_secs = now - last_seen_wall  >= IDLE_TIMEOUT
+    SW ->> SW: first_ant1_ts is None → keep status=EXIT_ONLY
+    SW ->> DT: _finalize(sess, status=EXIT_ONLY)
+    DT ->> DB: UPDATE last_exit_at_ant2, status=EXIT_ONLY
+    DT ->> OP: del self._open[X]
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>4. Background Sweeper</h2>
+<p>
+  Independent daemon thread. Every <code>SWEEP_INTERVAL_SEC</code> (1s) it
+  inspects all open sessions and finalizes any whose idle wall-clock time
+  has crossed a threshold. This is the only path that closes sessions when
+  no further POSTs arrive.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant SW as Sweeper Thread
+    participant DT as DwellTracker
+    participant OP as _open dict
+    participant DB as SQLite
+
+    loop every 1.0s
+        SW ->> SW: time.sleep(1.0)
+        SW ->> DT: _sweep_once()
+        DT ->> DT: acquire self._lock
+        loop for each sess in self._open
+            DT ->> DT: idle = now - sess.last_seen_wall
+            alt idle &lt; IDLE_TIMEOUT_SEC
+                DT -->> DT: continue (still active)
+            else first_ant1_ts is None
+                DT ->> DT: status = EXIT_ONLY
+                DT ->> DB: UPDATE last_exit_at_ant2, status
+                DT ->> OP: del self._open[epc]
+            else last_ant2_ts is not None
+                DT ->> DT: status = COMPLETE,<br/>dwell = last_ant2 - first_ant1
+                DT ->> DB: UPDATE last_exit_at_ant2,<br/>dwell_seconds, status
+                DT ->> OP: del self._open[epc]
+            else idle &gt;= ABANDON_TIMEOUT_SEC
+                DT ->> DT: status = ABANDONED
+                DT ->> DB: UPDATE status only
+                DT ->> OP: del self._open[epc]
+            end
+        end
+        DT ->> DT: release self._lock
+    end
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>5. Health Check Probe</h2>
+<p>
+  CLI client (<code>python listener.py --health</code>) opens a short HTTP
+  request against the running listener.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant HC as HealthClient
+    participant FL as Flask /healthz
+    participant DT as DwellTracker
+    participant OP as _open dict
+
+    HC ->> FL: GET /healthz
+    FL ->> DT: tracker.open_session_count()
+    DT ->> OP: with lock: len(self._open)
+    OP -->> DT: N
+    DT -->> FL: N
+    FL ->> FL: build JSON {status, uptime, open_sessions,<br/>events_total, batches_total,<br/>last_event_seconds_ago, db_writable}
+    alt db_ok
+        FL -->> HC: 200 {status: ok, ...}
+    else db_ok == false
+        FL -->> HC: 503 {status: degraded, ...}
+    end
+    HC ->> HC: print summary, exit code 0/1/2
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>6. Component &amp; Persistence Overview</h2>
+<p>
+  Static structure: classes, threads, and tables.
+</p>
+<div class="diagram">
+<pre class="mermaid">
+classDiagram
+    direction LR
+
+    class Reader_FX9600 {
+        +outbound HTTP POST
+    }
+
+    class listener_py {
+        +run_http()
+        +run_health_check()
+        +state: dict
+    }
+
+    class DwellTracker {
+        -_conn: sqlite3.Connection
+        -_lock: threading.RLock
+        -_open: dict[str, _Session]
+        -_last_raw: dict[(epc,ant), float]
+        -_sweeper: Thread
+        +ingest_batch(events) dict
+        +open_session_count() int
+        +close()
+        -_ensure_columns()
+        -_recover_open_sessions()
+        -_sweep_loop()
+        -_sweep_once()
+        -_finalize(sess, status)
+        -_prune_raw()
+    }
+
+    class _Session {
+        +id: int
+        +epc: str
+        +first_ant1_ts: datetime
+        +first_ant1_rssi: int
+        +last_ant1_ts: datetime
+        +last_ant1_rssi: int
+        +first_ant2_ts: datetime
+        +first_ant2_rssi: int
+        +last_ant2_ts: datetime
+        +last_ant2_rssi: int
+        +last_seen_wall: datetime
+    }
+
+    class tag_reads {
+        +id INTEGER PK
+        +epc TEXT
+        +antenna INTEGER
+        +rssi INTEGER
+        +read_at TEXT
+    }
+
+    class component_sessions {
+        +id INTEGER PK
+        +epc TEXT
+        +first_enter_at_ant1 TEXT
+        +first_enter_rssi_ant1 INTEGER
+        +last_enter_at_ant1 TEXT
+        +last_enter_rssi_ant1 INTEGER
+        +first_exit_at_ant2 TEXT
+        +first_exit_rssi_ant2 INTEGER
+        +last_exit_at_ant2 TEXT
+        +last_exit_rssi_ant2 INTEGER
+        +dwell_seconds INTEGER
+        +status TEXT
+    }
+
+    Reader_FX9600 --> listener_py : POST /tags
+    listener_py --> DwellTracker : ingest_batch()
+    DwellTracker o-- _Session : self._open
+    DwellTracker --> tag_reads : INSERT/DELETE
+    DwellTracker --> component_sessions : INSERT/UPDATE
+</pre>
+</div>
+
+<!-- ============================================================ -->
+<h2>7. State Machine — <code>component_sessions.status</code></h2>
+<p>
+  Valid transitions for a single row. Every row is born <code>IN_PROGRESS</code>
+  (from ant1) or <code>EXIT_ONLY</code> (from ant2 with no open session).
+</p>
+<div class="diagram">
+<pre class="mermaid">
+stateDiagram-v2
+    [*] --> IN_PROGRESS : ant1 read,<br/>no existing session
+    [*] --> EXIT_ONLY   : ant2 read,<br/>no existing session
+
+    IN_PROGRESS --> IN_PROGRESS : ant1 read updates<br/>last_enter_at_ant1
+    IN_PROGRESS --> IN_PROGRESS : ant2 read updates<br/>last_exit_at_ant2,<br/>dwell_seconds
+    IN_PROGRESS --> COMPLETE    : sweeper closes<br/>(idle &gt;= IDLE_TIMEOUT,<br/>last_ant2 set)
+    IN_PROGRESS --> ABANDONED   : sweeper closes<br/>(idle &gt;= ABANDON_TIMEOUT,<br/>no ant2 ever)
+    IN_PROGRESS --> COMPLETE    : new ant1 read on<br/>session that already saw ant2<br/>(close + start new row)
+
+    EXIT_ONLY --> EXIT_ONLY     : more ant2 reads<br/>refresh last_exit_at_ant2
+    EXIT_ONLY --> EXIT_ONLY     : sweeper finalizes<br/>(status unchanged)
+
+    COMPLETE  --> [*]
+    ABANDONED --> [*]
+    EXIT_ONLY --> [*]
+</pre>
+</div>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "default",
+    sequence: { useMaxWidth: true, mirrorActors: false, showSequenceNumbers: false },
+    flowchart: { htmlLabels: true, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

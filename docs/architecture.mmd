@@ -1,0 +1,35 @@
+%% RFID Tracking System — Granular Architecture (Mermaid)
+%% Source file. Render via docs/architecture.html (open in browser, print to PDF).
+
+%% ───────────────────────────────────────────────────────────────
+%% Diagram 1: Startup / boot sequence
+%% ───────────────────────────────────────────────────────────────
+sequenceDiagram
+    autonumber
+    participant U  as User (CLI)
+    participant LP as listener.py
+    participant DT as DwellTracker
+    participant DB as SQLite (rfid_reads.db)
+    participant SW as Sweeper Thread
+    participant FL as Flask App
+
+    U  ->>  LP: python listener.py
+    LP ->>  DT: DwellTracker()
+    DT ->>  DB: connect (WAL mode)
+    DT ->>  DB: CREATE TABLE IF NOT EXISTS tag_reads
+    DT ->>  DB: CREATE TABLE IF NOT EXISTS component_sessions
+    DT ->>  DT: _ensure_columns()
+    Note over DT,DB: Idempotent migration:<br/>add target columns,<br/>copy from any legacy column,<br/>drop legacy columns.
+    DT ->>  DB: ALTER TABLE ADD COLUMN first_enter_at_ant1 ...
+    DT ->>  DB: UPDATE component_sessions SET <new> = <old>
+    DT ->>  DB: ALTER TABLE DROP COLUMN <legacy>
+    DT ->>  DT: _recover_open_sessions()
+    DT ->>  DB: SELECT WHERE status IN (IN_PROGRESS, EXIT_ONLY)
+    DB -->> DT: open rows
+    DT ->>  DT: rebuild self._open dict (in-memory)
+    DT ->>  SW: start daemon thread (_sweep_loop)
+    LP ->>  FL: Flask(__name__)
+    LP ->>  FL: register /tags POST
+    LP ->>  FL: register /healthz GET
+    LP ->>  FL: app.run(0.0.0.0:5000)
+    Note over LP,FL: Listener ready.
