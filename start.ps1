@@ -1,47 +1,167 @@
-﻿# RFID Tracking System - Start Script
-# Run this from the project root: .\start.ps1
+﻿# ===================================================================
+#  RFID Gannomat Tracking System -- Launcher
+#  Usage:  .\start.ps1
+#  Ctrl+C  stops all services cleanly
+# ===================================================================
 
-$Root = $PSScriptRoot
+$Root   = $PSScriptRoot
 $Python = "$Root\.venv\Scripts\python.exe"
 
-# Install dependencies if needed
-Write-Host "Checking dependencies..." -ForegroundColor Cyan
-& $Python -m pip install -r "$Root\requirements.txt" --quiet
+# Force UTF-8 so colour codes render correctly on all terminals
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding            = [System.Text.Encoding]::UTF8
 
-# Start API (port 5001) first — listener forwards events to it
-Write-Host "Starting API on port 5001..." -ForegroundColor Green
+# ── Header ──────────────────────────────────────────────────────────
+Clear-Host
+Write-Host ""
+Write-Host "  +--------------------------------------------------+" -ForegroundColor Cyan
+Write-Host "  |   RFID GANNOMAT TRACKING SYSTEM                  |" -ForegroundColor Cyan
+Write-Host "  |   Bobrick Washroom Equipment                     |" -ForegroundColor Cyan
+Write-Host "  +--------------------------------------------------+" -ForegroundColor Cyan
+Write-Host ""
+
+# ── Helper: kill whatever is listening on a port ────────────────────
+function Stop-Port {
+    param([int]$Port)
+    $found = netstat -ano |
+        Select-String ":$Port\s" |
+        Where-Object  { $_ -match "LISTENING" } |
+        ForEach-Object { ($_ -split '\s+')[-1] } |
+        Where-Object  { $_ -match '^\d+$' } |
+        Select-Object -Unique
+    foreach ($p in $found) {
+        Stop-Process -Id ([int]$p) -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ── Helper: check if a port is listening via netstat ────────────────
+function Wait-ForPort {
+    param([int]$Port, [int]$Attempts = 20)
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        Start-Sleep -Milliseconds 500
+        $hit = netstat -ano | Select-String ":$Port\s" | Where-Object { $_ -match "LISTENING" }
+        if ($hit) { return $true }
+    }
+    return $false
+}
+
+# ── Kill any leftover services ───────────────────────────────────────
+Write-Host "  Stopping any existing services ..." -ForegroundColor DarkGray
+Stop-Port 5001
+Stop-Port 5000
+Start-Sleep -Milliseconds 600
+
+# ── Start API (port 5001) ────────────────────────────────────────────
+Write-Host "  Starting API server      (port 5001) ..." -ForegroundColor Green
 $api = Start-Job -ScriptBlock {
     param($root, $python)
+    Set-Location $root
     & $python "$root\api.py" 2>&1
 } -ArgumentList $Root, $Python
 
-Start-Sleep -Seconds 3
+if (Wait-ForPort 5001) {
+    Write-Host "  API ready             -> http://localhost:5001" -ForegroundColor Green
+} else {
+    Write-Host "  API may not be ready -- check errors below"    -ForegroundColor Yellow
+}
 
-# Start listener (port 5000) after API is ready
-Write-Host "Starting listener on port 5000..." -ForegroundColor Green
+# ── Start RFID listener (port 5000) ─────────────────────────────────
+Write-Host "  Starting RFID listener   (port 5000) ..." -ForegroundColor Green
 $listener = Start-Job -ScriptBlock {
     param($root, $python)
+    Set-Location "$root\tracking"
     & $python "$root\tracking\listener.py" 2>&1
 } -ArgumentList $Root, $Python
 
-Write-Host ""
-Write-Host "Both services running (Listener Job=$($listener.Id), API Job=$($api.Id))" -ForegroundColor Cyan
-Write-Host "  Listener -> http://localhost:5000/tags" -ForegroundColor White
-Write-Host "  API      -> http://localhost:5001" -ForegroundColor White
-Write-Host ""
-Write-Host "Streaming logs (Ctrl+C to stop log view, services keep running):" -ForegroundColor Yellow
-Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+if (Wait-ForPort 5000 -Attempts 10) {
+    Write-Host "  Listener ready        -> http://localhost:5000/tags" -ForegroundColor Green
+} else {
+    Write-Host "  Listener may not be ready -- check errors below"    -ForegroundColor Yellow
+}
 
+# ── Detect local IP for the reader config hint ───────────────────────
+$myIp = (Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet' } |
+    Select-Object -First 1).IPAddress
+
+# ── Ready banner ─────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "  --------------------------------------------------" -ForegroundColor DarkGray
+Write-Host "  Reader POST target  ->  http://${myIp}:5000/tags" -ForegroundColor White
+Write-Host "  Dashboard           ->  http://localhost:5001"     -ForegroundColor White
+Write-Host "  Health check        ->  http://localhost:5000/healthz" -ForegroundColor White
+Write-Host "  --------------------------------------------------" -ForegroundColor DarkGray
+Write-Host ""
+Write-Host "  Press Ctrl+C to stop everything" -ForegroundColor DarkYellow
+Write-Host ""
+Write-Host "==================================================" -ForegroundColor DarkCyan
+Write-Host "   LIVE RFID READS" -ForegroundColor Cyan
+Write-Host "==================================================" -ForegroundColor DarkCyan
+Write-Host ""
+
+$readCount = 0
+
+# ── Live log stream ───────────────────────────────────────────────────
 try {
     while ($true) {
-        $listenerOut = Receive-Job $listener
-        $apiOut = Receive-Job $api
-        if ($listenerOut) { $listenerOut | ForEach-Object { Write-Host "[LISTENER] $_" -ForegroundColor Cyan } }
-        if ($apiOut)      { $apiOut      | ForEach-Object { Write-Host "[API]      $_" -ForegroundColor Green } }
-        Start-Sleep -Milliseconds 500
+
+        # -- Listener output (RFID reads + session events) -----------
+        $lines = Receive-Job $listener 2>$null
+        foreach ($line in $lines) {
+            # Jobs can emit non-string objects (e.g. ErrorRecord). Coerce to a
+            # string so .Trim()/-match never blow up the launcher.
+            $line = [string]$line
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            # Skip raw Flask/Werkzeug HTTP access logs
+            if ($line -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} - -') { continue }
+
+            if ($line -match "^\[.+\] Tag:") {
+                # Primary read: [HH:MM:SS] Tag: S6IBUS... Ant1 RSSI:-48dBm
+                $readCount++
+                Write-Host "  >> $line" -ForegroundColor Cyan
+
+            } elseif ($line -match "session.*closed|COMPLETE|Completed") {
+                Write-Host "     [DONE ] $($line.Trim())" -ForegroundColor Green
+
+            } elseif ($line -match "session.*open|session_opened|IN_PROGRESS") {
+                Write-Host "     [ENTER] $($line.Trim())" -ForegroundColor Yellow
+
+            } elseif ($line -match "DB:\s*\+") {
+                Write-Host "     [DB   ] $($line.Trim())" -ForegroundColor DarkCyan
+
+            } elseif ($line -match "ABANDONED|EXIT_ONLY|abandon") {
+                Write-Host "     [WARN ] $($line.Trim())" -ForegroundColor DarkYellow
+
+            } elseif ($line -match "[Ee]rror|[Ee]xcep|Traceback") {
+                Write-Host "  !! [ERR  ] $($line.Trim())" -ForegroundColor Red
+
+            } elseif ($line -match "Listening on|Waiting for|FX9600|HTTP Listener") {
+                Write-Host "     $($line.Trim())" -ForegroundColor DarkGray
+            }
+        }
+
+        # -- API errors only (suppress normal HTTP traffic logs) -----
+        $apiLines = Receive-Job $api 2>$null
+        foreach ($line in $apiLines) {
+            $line = [string]$line
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -match "[Ee]rror|[Ee]xcep|Traceback" -and
+                $line -notmatch "NativeCommand|CategoryInfo|FullyQualified|WARNING") {
+                Write-Host "  !! [API  ] $($line.Trim())" -ForegroundColor Red
+            }
+        }
+
+        Start-Sleep -Milliseconds 150
     }
-} finally {
+}
+finally {
     Write-Host ""
-    Write-Host "Log stream stopped. To kill services run:" -ForegroundColor Yellow
-    Write-Host "  Stop-Job $($listener.Id), $($api.Id)" -ForegroundColor White
+    Write-Host "==================================================" -ForegroundColor DarkGray
+    Write-Host "  Stopping all services ..." -ForegroundColor Yellow
+    Stop-Job   $listener, $api -ErrorAction SilentlyContinue
+    Remove-Job $listener, $api -ErrorAction SilentlyContinue
+    Stop-Port 5001
+    Stop-Port 5000
+    Write-Host "  Stopped. Total RFID reads this session: $readCount" -ForegroundColor Green
+    Write-Host ""
 }

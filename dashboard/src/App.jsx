@@ -5,6 +5,7 @@ import { SummaryCards } from './components/SummaryCards'
 import { LiveQueueTable } from './components/LiveQueueTable'
 import { CompletedTable } from './components/CompletedTable'
 import { RecentReadsPanel } from './components/RecentReadsPanel'
+import { useTheme } from './hooks/useTheme'
 
 const API = 'http://localhost:5001'
 
@@ -15,6 +16,7 @@ async function apiFetch(path) {
 }
 
 export default function App() {
+  const { isDark, toggleTheme }             = useTheme()
   const [summary, setSummary]               = useState(null)
   const [liveSessions, setLiveSessions]     = useState([])
   const [completedSessions, setCompleted]   = useState([])
@@ -57,8 +59,16 @@ export default function App() {
   }, [fetchAll])
 
   return (
-    <div className="min-h-screen bg-gray-100">
-      <Header wsStatus={wsStatus} lastUpdated={lastUpdated} />
+    <div className="min-h-screen bg-gray-100 text-gray-900
+                    dark:bg-slate-950 dark:text-slate-100
+                    bg-[radial-gradient(ellipse_at_top,theme(colors.gray.50),theme(colors.gray.100))]
+                    dark:bg-[radial-gradient(ellipse_at_top,theme(colors.slate.900),theme(colors.slate.950))]">
+      <Header
+        wsStatus={wsStatus}
+        lastUpdated={lastUpdated}
+        isDark={isDark}
+        onToggleTheme={toggleTheme}
+      />
       <main className="max-w-screen-2xl mx-auto px-4 py-6 space-y-6">
         <SummaryCards summary={summary} />
         <LiveQueueTable sessions={liveSessions} onEndSession={handleEndSession} />

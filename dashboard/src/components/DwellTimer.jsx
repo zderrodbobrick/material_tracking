@@ -28,14 +28,16 @@ export function DwellTimer({ entranceTime, entranceEpochMs, exitTime, dwellSecon
     return () => clearInterval(id)
   }, [rawStartMs, exitTime])
 
-  if (!rawStartMs && !entranceTime) return <span className="text-gray-400">—</span>
+  if (!rawStartMs && !entranceTime) return <span className="text-gray-400 dark:text-slate-500">—</span>
 
   if (exitTime != null && dwellSeconds != null) {
-    return <span className="font-mono text-gray-700">{formatDwell(dwellSeconds)}</span>
+    return <span className="font-mono text-gray-700 dark:text-slate-300">{formatDwell(dwellSeconds)}</span>
   }
 
   return (
-    <span className="font-mono text-blue-600 font-semibold tabular-nums">
+    <span className="inline-flex items-center gap-1.5 font-mono font-semibold tabular-nums
+                     text-blue-600 dark:text-blue-400">
+      <span className="w-1.5 h-1.5 rounded-full bg-blue-500 dark:bg-blue-400 animate-pulse" />
       {formatDwell(elapsed)}
     </span>
   )

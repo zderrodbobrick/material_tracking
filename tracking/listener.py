@@ -115,14 +115,31 @@ def run_http():
 
             shown = [ev for ev in events if _passes_filters(ev)]
 
-            # Only print tag reads (clean output)
+            # Collapse the batch so stationary tags hammering an antenna don't
+            # flood the console. One line per (tag, antenna): count + best RSSI.
+            grouped = {}  # (epc_readable, antenna) -> {count, best_rssi}
             for ev in shown:
                 d = ev.get("data", {})
                 epc = d.get("idHex", "")
                 antenna = d.get("antenna", 0)
-                rssi = d.get("peakRssi", 0)
-                epc_readable = decode_epc(epc)
-                print(f"[{ts()}] Tag: {epc_readable} (hex:{epc[:16]}..) Ant{antenna} RSSI:{rssi}dBm")
+                try:
+                    rssi = int(d.get("peakRssi", 0))
+                except (TypeError, ValueError):
+                    rssi = 0
+                key = (decode_epc(epc), antenna)
+                g = grouped.get(key)
+                if g is None:
+                    grouped[key] = {"count": 1, "best_rssi": rssi}
+                else:
+                    g["count"] += 1
+                    if rssi > g["best_rssi"]:
+                        g["best_rssi"] = rssi
+
+            stamp = ts()
+            for (epc_readable, antenna), g in sorted(grouped.items()):
+                suffix = f"  (x{g['count']})" if g["count"] > 1 else ""
+                print(f"[{stamp}] Tag: {epc_readable} Ant{antenna} "
+                      f"RSSI:{g['best_rssi']}dBm{suffix}")
 
             # Persist + dwell tracking
             summary = tracker.ingest_batch(events)

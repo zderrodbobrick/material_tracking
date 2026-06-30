@@ -28,7 +28,7 @@ EXIT_ANTENNA = int(os.getenv("EXIT_ANTENNA", "2"))
 # Valid reads must satisfy: RSSI_MIN <= rssi <= 0
 # Lower = greater range, Higher = more selective (less cross-antenna reads)
 # Use -55 if antennas are close, -65 if far apart
-RSSI_MIN = int(os.getenv("RSSI_MIN", "-60"))
+RSSI_MIN = int(os.getenv("RSSI_MIN", "-100"))
 
 # Temporal filtering: require N reads within throttle window before session starts
 # Prevents stray/distant tags from creating sessions (1=disabled, 3=balanced, 5=strict)

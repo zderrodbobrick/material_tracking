@@ -1,5 +1,5 @@
 import { useState, useMemo } from 'react'
-import { Search, Filter } from 'lucide-react'
+import { Search, Filter, Radio } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
 import { DwellTimer } from './DwellTimer'
 
@@ -29,32 +29,50 @@ export function LiveQueueTable({ sessions, onEndSession }) {
     })
   }, [sessions, search, statusFilter])
 
+  const inputCls =
+    'pl-8 pr-3 py-1.5 text-sm rounded-md w-44 transition-colors ' +
+    'border border-gray-300 bg-white text-gray-900 placeholder-gray-400 ' +
+    'focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent ' +
+    'dark:border-slate-600 dark:bg-slate-900/60 dark:text-slate-100 dark:placeholder-slate-500'
+
   return (
-    <div className="bg-white rounded-lg shadow-sm border border-gray-200">
-      <div className="px-5 py-4 border-b border-gray-200 flex flex-wrap items-center justify-between gap-3">
+    <div className="animate-fade-in rounded-xl shadow-sm overflow-hidden
+                    bg-white border border-gray-200
+                    dark:bg-slate-800/60 dark:border-slate-700/60">
+      <div className="px-5 py-4 border-b border-gray-200 dark:border-slate-700/60
+                      flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-base font-semibold text-gray-900">Live Gannomat Queue</h2>
-          <p className="text-xs text-gray-500 mt-0.5">
+          <h2 className="flex items-center gap-2 text-base font-semibold text-gray-900 dark:text-slate-100">
+            <span className="relative flex w-2.5 h-2.5">
+              <span className="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75 animate-ping" />
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500" />
+            </span>
+            Live Gannomat Queue
+          </h2>
+          <p className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">
             {sessions.length} active session{sessions.length !== 1 ? 's' : ''} — sorted oldest first
           </p>
         </div>
         <div className="flex items-center gap-2">
           <div className="relative">
-            <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-gray-400 pointer-events-none" />
+            <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-gray-400 dark:text-slate-500 pointer-events-none" />
             <input
               type="text"
               placeholder="Search IBUS #..."
               value={search}
               onChange={e => setSearch(e.target.value)}
-              className="pl-8 pr-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent w-44"
+              className={inputCls}
             />
           </div>
           <div className="flex items-center gap-1.5">
-            <Filter className="w-3.5 h-3.5 text-gray-400" />
+            <Filter className="w-3.5 h-3.5 text-gray-400 dark:text-slate-500" />
             <select
               value={statusFilter}
               onChange={e => setStatusFilter(e.target.value)}
-              className="text-sm border border-gray-300 rounded-md px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="text-sm rounded-md px-2 py-1.5 transition-colors
+                         border border-gray-300 bg-white text-gray-900
+                         focus:outline-none focus:ring-2 focus:ring-blue-500
+                         dark:border-slate-600 dark:bg-slate-900/60 dark:text-slate-100"
             >
               <option value="ALL">All</option>
               <option value="IN_PROGRESS">In Process</option>
@@ -65,11 +83,12 @@ export function LiveQueueTable({ sessions, onEndSession }) {
       </div>
 
       {filtered.length === 0 ? (
-        <div className="px-5 py-12 text-center">
-          <div className="w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center mx-auto mb-3">
-            <Search className="w-5 h-5 text-gray-400" />
+        <div className="px-5 py-14 text-center">
+          <div className="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3
+                          bg-gray-100 dark:bg-slate-700/50">
+            <Radio className="w-6 h-6 text-gray-400 dark:text-slate-500" />
           </div>
-          <p className="text-sm text-gray-500">
+          <p className="text-sm text-gray-500 dark:text-slate-400">
             {sessions.length === 0 ? 'No active sessions — waiting for RFID reads' : 'No sessions match the current filter'}
           </p>
         </div>
@@ -77,38 +96,43 @@ export function LiveQueueTable({ sessions, onEndSession }) {
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="bg-gray-50 border-b border-gray-200 text-left">
-                <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">IBUS #</th>
-                <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Status</th>
-                <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Entrance</th>
-                <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Last Seen</th>
-                <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">RSSI</th>
-                <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Current Dwell</th>
-                <th className="px-4 py-3"></th>
+              <tr className="text-left bg-gray-50 dark:bg-slate-900/40
+                             border-b border-gray-200 dark:border-slate-700/60">
+                {['IBUS #', 'Status', 'Entrance', 'Last Seen', 'RSSI', 'Current Dwell', ''].map((h, i) => (
+                  <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
+                                         text-gray-600 dark:text-slate-400">
+                    {h}
+                  </th>
+                ))}
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
-              {filtered.map(s => (
+            <tbody className="divide-y divide-gray-100 dark:divide-slate-700/50">
+              {filtered.map((s, i) => (
                 <tr
                   key={s.id}
-                  className={`hover:bg-gray-50 transition-colors ${
-                    s.status === 'EXIT_ONLY' ? 'bg-orange-50 hover:bg-orange-100' : ''
-                  }`}
+                  style={{ animationDelay: `${Math.min(i * 35, 400)}ms` }}
+                  className={`animate-row-in transition-colors
+                    ${s.status === 'EXIT_ONLY'
+                      ? 'bg-orange-50 hover:bg-orange-100 dark:bg-orange-500/5 dark:hover:bg-orange-500/10'
+                      : 'hover:bg-gray-50 dark:hover:bg-slate-700/30'}`}
                 >
-                  <td className="px-4 py-3 font-mono font-semibold text-slate-800 whitespace-nowrap">
+                  <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap
+                                 text-slate-800 dark:text-slate-100">
                     {s.ibus_number}
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
                     <StatusBadge status={s.status} />
                   </td>
-                  <td className="px-4 py-3 text-gray-600 whitespace-nowrap font-mono text-xs">
+                  <td className="px-4 py-3 whitespace-nowrap font-mono text-xs
+                                 text-gray-600 dark:text-slate-400">
                     {formatTime(s.entrance_time)}
                   </td>
-                  <td className="px-4 py-3 text-gray-600 whitespace-nowrap font-mono text-xs">
+                  <td className="px-4 py-3 whitespace-nowrap font-mono text-xs
+                                 text-gray-600 dark:text-slate-400">
                     {formatTime(s.last_seen)}
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
-                    <span className="font-mono text-xs text-gray-500">
+                    <span className="font-mono text-xs text-gray-500 dark:text-slate-400">
                       {s.last_rssi != null ? `${s.last_rssi} dBm` : '—'}
                     </span>
                   </td>
@@ -128,7 +152,11 @@ export function LiveQueueTable({ sessions, onEndSession }) {
                             onEndSession(s.id)
                           }
                         }}
-                        className="text-xs text-red-600 hover:text-red-800 font-medium px-2 py-1 rounded border border-red-200 hover:bg-red-50 transition-colors"
+                        className="text-xs font-medium px-2.5 py-1 rounded-md border transition-all
+                                   text-red-600 border-red-200 hover:bg-red-50 hover:border-red-300
+                                   active:scale-95
+                                   dark:text-red-400 dark:border-red-500/30 dark:hover:bg-red-500/10
+                                   dark:hover:border-red-500/50"
                       >
                         End
                       </button>
