@@ -71,6 +71,26 @@ body {
   100% { transform: scale(1); }
 }
 
+@keyframes radar-sweep {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+@keyframes ping-slow {
+  0%   { transform: scale(0.6); opacity: 0.7; }
+  80%, 100% { transform: scale(2.2); opacity: 0; }
+}
+
+@keyframes float-up {
+  from { opacity: 0; transform: translateY(24px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes grid-drift {
+  from { background-position: 0 0; }
+  to   { background-position: 40px 40px; }
+}
+
 /* ── Animation utilities ─────────────────────────────────────────────────── */
 .animate-fade-in       { animation: fade-in 0.45s cubic-bezier(0.4, 0, 0.2, 1) both; }
 .animate-fade-in-scale { animation: fade-in-scale 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
@@ -78,6 +98,10 @@ body {
 .animate-row-in        { animation: row-in 0.35s ease-out both; }
 .animate-pulse-ring    { animation: pulse-ring 2s ease-out infinite; }
 .animate-value-pop     { animation: value-pop 0.4s ease-out; }
+.animate-radar-sweep   { animation: radar-sweep 6s linear infinite; }
+.animate-ping-slow     { animation: ping-slow 3s cubic-bezier(0, 0, 0.2, 1) infinite; }
+.animate-float-up      { animation: float-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.animate-grid-drift    { animation: grid-drift 3s linear infinite; }
 
 /* Respect reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {

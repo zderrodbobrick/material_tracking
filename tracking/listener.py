@@ -19,21 +19,29 @@ import threading
 from datetime import datetime, timezone
 
 sys.path.insert(0, str(__file__).rsplit('\\', 2)[0])
-from config import RSSI_MIN, EPC_FILTER_PATTERN, LISTENER_HOST, LISTENER_PORT
+from config import (
+    RSSI_MIN, EPC_FILTER_PATTERN, LISTENER_HOST, LISTENER_PORT,
+    STATION_NAME, READER_NAME,
+)
 from storage import DwellTracker
+from epc_type_map import format_tag_id, parse_tag_id
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def decode_epc(epc: str) -> str:
     try:
-        return bytes.fromhex(epc).rstrip(b"\x00").decode("ascii", errors="replace")
+        raw = bytes.fromhex(epc).rstrip(b"\x00").decode("ascii", errors="replace")
     except Exception:
-        return epc
+        raw = epc
+    return format_tag_id(raw)
 
 def epc_matches_filter(epc: str) -> bool:
+    decoded = decode_epc(epc)
+    if not parse_tag_id(decoded)["is_known"]:
+        return False
     if not EPC_FILTER_PATTERN:
         return True
-    return re.fullmatch(EPC_FILTER_PATTERN, decode_epc(epc)) is not None
+    return re.fullmatch(EPC_FILTER_PATTERN, decoded) is not None
 
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -138,7 +146,16 @@ def run_http():
             stamp = ts()
             for (epc_readable, antenna), g in sorted(grouped.items()):
                 suffix = f"  (x{g['count']})" if g["count"] > 1 else ""
-                print(f"[{stamp}] Tag: {epc_readable} Ant{antenna} "
+                p = parse_tag_id(epc_readable)
+                if p["is_known"]:
+                    tag_detail = (
+                        f"Qty:{p['qty']}  Part#:{p['part_number']}  "
+                        f"Type:{p['type_label']}  WO#:{p['work_order']}  "
+                        f"[{p['formatted']}]"
+                    )
+                else:
+                    tag_detail = f"Tag:{epc_readable}"
+                print(f"[{stamp}] {tag_detail}  Ant{antenna} "
                       f"RSSI:{g['best_rssi']}dBm{suffix}")
 
             # Persist + dwell tracking
@@ -158,7 +175,8 @@ def run_http():
         return "OK", 200
 
     divider("Zebra FX9600 — HTTP Listener")
-    print(f"\n  Listening on  http://{LISTENER_HOST}:{LISTENER_PORT}/tags")
+    print(f"\n  Station: {STATION_NAME}   Reader: {READER_NAME}")
+    print(f"  Listening on  http://{LISTENER_HOST}:{LISTENER_PORT}/tags")
     print(f"  Point the reader's HTTP POST target to:")
     print(f"  http://YOUR_PC_IP:{LISTENER_PORT}/tags")
     print(f"\n  Waiting for tag events...\n")

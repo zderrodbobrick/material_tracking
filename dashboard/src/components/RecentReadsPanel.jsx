@@ -1,5 +1,6 @@
 import { Radio } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
+import { parseEpc } from '../utils/parseEpc'
 
 function formatTime(isoStr) {
   if (!isoStr) return '—'
@@ -38,7 +39,7 @@ export function RecentReadsPanel({ reads }) {
             <thead>
               <tr className="text-left bg-gray-50 dark:bg-slate-900/40
                              border-b border-gray-200 dark:border-slate-700/60">
-                {['Read Time', 'IBUS #', 'Status', 'RSSI'].map((h, i) => (
+                {['Read Time', 'Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Antenna', 'Role', 'RSSI'].map((h, i) => (
                   <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
                                          text-gray-600 dark:text-slate-400">
                     {h}
@@ -55,18 +56,46 @@ export function RecentReadsPanel({ reads }) {
                 >
                   <td className="px-4 py-2.5 whitespace-nowrap font-mono text-xs
                                  text-gray-600 dark:text-slate-400">
-                    {formatTime(r.first_enter_at_ant1)}
+                    {formatTime(r.read_time)}
                   </td>
-                  <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap
-                                 text-slate-800 dark:text-slate-100">
-                    {r['IBUS #']}
+                  {(() => {
+                    const p = parseEpc(r.epc)
+                    return p.isKnown ? (
+                      <>
+                        <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {p.qty}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {p.partNumber}
+                        </td>
+                        <td className="px-4 py-2.5 whitespace-nowrap">
+                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold
+                                           bg-blue-100 text-blue-800 dark:bg-blue-500/20 dark:text-blue-300">
+                            {p.typeLabel}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {p.workOrder}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono text-xs whitespace-nowrap text-gray-400 dark:text-slate-500">
+                          {p.formatted}
+                        </td>
+                      </>
+                    ) : (
+                      <td colSpan={5} className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                        {r.epc}
+                      </td>
+                    )
+                  })()}
+                  <td className="px-4 py-2.5 whitespace-nowrap text-xs text-gray-600 dark:text-slate-400">
+                    {r.antenna_name ?? (r.antenna_port != null ? `Port ${r.antenna_port}` : '—')}
                   </td>
                   <td className="px-4 py-2.5 whitespace-nowrap">
-                    <StatusBadge status={r.status} />
+                    {r.role ? <StatusBadge status={r.role} /> : <span className="text-gray-400 dark:text-slate-500">—</span>}
                   </td>
                   <td className="px-4 py-2.5 whitespace-nowrap">
                     <span className="font-mono text-xs text-gray-500 dark:text-slate-400">
-                      {r.first_enter_rssi_ant1 != null ? `${r.first_enter_rssi_ant1} dBm` : '—'}
+                      {r.rssi != null ? `${r.rssi} dBm` : '—'}
                     </span>
                   </td>
                 </tr>

@@ -1,4 +1,5 @@
-export const API = 'http://localhost:5001'
+// Same origin when served by Flask (port 5001). Vite dev proxies /api and /socket.io.
+export const API = import.meta.env.VITE_API_URL || ''
 
 export async function apiFetch(path) {
   const res = await fetch(`${API}${path}`)

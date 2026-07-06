@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react'
 import { Search, CheckCircle } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
 import { formatDwell } from './DwellTimer'
+import { parseEpc } from '../utils/parseEpc'
 
 function formatTime(isoStr) {
   if (!isoStr) return '—'
@@ -22,8 +23,9 @@ export function CompletedTable({ sessions }) {
 
   const filtered = useMemo(() => {
     if (!search) return sessions
+    const q = search.toLowerCase()
     return sessions.filter(s =>
-      s.ibus_number?.toLowerCase().includes(search.toLowerCase())
+      `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''}`.toLowerCase().includes(q)
     )
   }, [sessions, search])
 
@@ -44,7 +46,7 @@ export function CompletedTable({ sessions }) {
           <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-gray-400 dark:text-slate-500 pointer-events-none" />
           <input
             type="text"
-            placeholder="Search IBUS #..."
+            placeholder="Search part / EPC..."
             value={search}
             onChange={e => setSearch(e.target.value)}
             className="pl-8 pr-3 py-1.5 text-sm rounded-md w-40 transition-colors
@@ -67,7 +69,7 @@ export function CompletedTable({ sessions }) {
             <thead>
               <tr className="text-left bg-gray-50 dark:bg-slate-900/40
                              border-b border-gray-200 dark:border-slate-700/60">
-                {['IBUS #', 'Status', 'Entrance', 'Exit', 'Dwell', 'In RSSI', 'Out RSSI'].map((h, i) => (
+                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Status', 'Entered', 'Exit', 'Dwell'].map((h, i) => (
                   <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
                                          text-gray-600 dark:text-slate-400">
                     {h}
@@ -82,16 +84,47 @@ export function CompletedTable({ sessions }) {
                   style={{ animationDelay: `${Math.min(i * 30, 350)}ms` }}
                   className="animate-row-in transition-colors hover:bg-gray-50 dark:hover:bg-slate-700/30"
                 >
-                  <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap
-                                 text-slate-800 dark:text-slate-100">
-                    {s.ibus_number}
+                  {(() => {
+                    const p = parseEpc(s.epc)
+                    const type = s.part_type ?? p.typeLabel
+                    const partNo = s.part_name ?? s.part_number ?? p.partNumber
+                    const wo = s.work_order ?? p.workOrder
+                    return p.isKnown ? (
+                      <>
+                        <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {p.qty}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {partNo}
+                        </td>
+                        <td className="px-4 py-2.5 whitespace-nowrap">
+                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold
+                                           bg-blue-100 text-blue-800 dark:bg-blue-500/20 dark:text-blue-300">
+                            {type}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {wo}
+                        </td>
+                        <td className="px-4 py-2.5 font-mono text-xs whitespace-nowrap text-gray-400 dark:text-slate-500">
+                          {p.formatted}
+                        </td>
+                      </>
+                    ) : (
+                      <td colSpan={5} className="px-4 py-2.5 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                        {s.epc ?? s.ibus_number}
+                      </td>
+                    )
+                  })()}
+                  <td className="px-4 py-2.5 whitespace-nowrap text-xs text-gray-600 dark:text-slate-400">
+                    {s.station_name ?? '—'}
                   </td>
                   <td className="px-4 py-2.5 whitespace-nowrap">
                     <StatusBadge status={s.status} />
                   </td>
                   <td className="px-4 py-2.5 whitespace-nowrap font-mono text-xs
                                  text-gray-600 dark:text-slate-400">
-                    {formatTime(s.entrance_time)}
+                    {formatTime(s.entry_time)}
                   </td>
                   <td className="px-4 py-2.5 whitespace-nowrap font-mono text-xs
                                  text-gray-600 dark:text-slate-400">
@@ -100,16 +133,6 @@ export function CompletedTable({ sessions }) {
                   <td className="px-4 py-2.5 whitespace-nowrap">
                     <span className="font-mono text-xs font-semibold text-slate-700 dark:text-slate-200">
                       {s.dwell_seconds != null ? formatDwell(s.dwell_seconds) : '—'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 whitespace-nowrap">
-                    <span className="font-mono text-xs text-gray-500 dark:text-slate-400">
-                      {s.entry_rssi != null ? `${s.entry_rssi} dBm` : '—'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 whitespace-nowrap">
-                    <span className="font-mono text-xs text-gray-500 dark:text-slate-400">
-                      {s.exit_rssi != null ? `${s.exit_rssi} dBm` : '—'}
                     </span>
                   </td>
                 </tr>

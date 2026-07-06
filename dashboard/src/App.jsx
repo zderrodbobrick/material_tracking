@@ -1,62 +1,71 @@
 import { useState, useEffect, useCallback } from 'react'
-import { io } from 'socket.io-client'
 import { Header } from './components/Header'
-import { SummaryCards } from './components/SummaryCards'
-import { LiveQueueTable } from './components/LiveQueueTable'
-import { CompletedTable } from './components/CompletedTable'
-import { RecentReadsPanel } from './components/RecentReadsPanel'
+import { LandingPage } from './pages/LandingPage'
+import { LiveDashboard } from './pages/LiveDashboard'
+import { FullReport } from './pages/FullReport'
+import { AnalyticsPage } from './pages/AnalyticsPage'
 import { useTheme } from './hooks/useTheme'
+import { useLiveSocket } from './hooks/useLiveSocket'
+import { apiFetch, apiPost } from './api'
 
-const API = 'http://localhost:5001'
-
-async function apiFetch(path) {
-  const res = await fetch(`${API}${path}`)
-  if (!res.ok) throw new Error(`${res.status}`)
-  return res.json()
-}
+const ENTERED_KEY = 'rfid-entered'
 
 export default function App() {
-  const { isDark, toggleTheme }             = useTheme()
-  const [summary, setSummary]               = useState(null)
-  const [liveSessions, setLiveSessions]     = useState([])
-  const [completedSessions, setCompleted]   = useState([])
-  const [recentReads, setRecentReads]       = useState([])
-  const [wsStatus, setWsStatus]             = useState('connecting')
-  const [lastUpdated, setLastUpdated]       = useState(null)
+  const { isDark, toggleTheme } = useTheme()
+  const { wsStatus, tick } = useLiveSocket()
 
-  const fetchAll = useCallback(async () => {
+  const [entered, setEntered] = useState(() => sessionStorage.getItem(ENTERED_KEY) === '1')
+  const [tab, setTab] = useState('live')
+
+  // Live dashboard data (also powers the landing teaser)
+  const [summary, setSummary]             = useState(null)
+  const [liveSessions, setLiveSessions]   = useState([])
+  const [completedSessions, setCompleted] = useState([])
+  const [recentReads, setRecentReads]     = useState([])
+  const [lastUpdated, setLastUpdated]     = useState(null)
+
+  const fetchLive = useCallback(async () => {
     const [sum, live, done, reads] = await Promise.allSettled([
-      apiFetch('/api/dashboard/summary'),
-      apiFetch('/api/gannomat/live-status'),
-      apiFetch('/api/gannomat/completed'),
-      apiFetch('/api/reads/recent?limit=20'),
+      apiFetch('/api/summary'),
+      apiFetch('/api/live'),
+      apiFetch('/api/completed'),
+      apiFetch('/api/raw-reads/recent?limit=20'),
     ])
-    if (sum.status  === 'fulfilled') setSummary(sum.value)
+    if (sum.status === 'fulfilled') setSummary(sum.value)
     if (live.status === 'fulfilled') setLiveSessions(live.value)
     if (done.status === 'fulfilled') setCompleted(done.value)
     if (reads.status === 'fulfilled') setRecentReads(reads.value)
     setLastUpdated(new Date())
   }, [])
 
+  useEffect(() => { fetchLive() }, [fetchLive, tick])
+
   const handleEndSession = useCallback(async (sessionId) => {
-    await fetch(`${API}/api/sessions/${sessionId}/end`, { method: 'POST' })
-    fetchAll()
-  }, [fetchAll])
+    await apiPost(`/api/sessions/${sessionId}/end`)
+    fetchLive()
+  }, [fetchLive])
 
-  useEffect(() => {
-    fetchAll()
+  const enter = useCallback(() => {
+    sessionStorage.setItem(ENTERED_KEY, '1')
+    setEntered(true)
+  }, [])
 
-    const sock = io(API, { transports: ['polling', 'websocket'] })
+  const goHome = useCallback(() => {
+    sessionStorage.removeItem(ENTERED_KEY)
+    setEntered(false)
+  }, [])
 
-    sock.on('connect',       () => { setWsStatus('live'); fetchAll() })
-    sock.on('disconnect',    () => setWsStatus('reconnecting'))
-    sock.on('connect_error', () => setWsStatus('offline'))
-    sock.on('rfid_update',   fetchAll)
-
-    const fallback = setInterval(fetchAll, 3000)
-
-    return () => { sock.disconnect(); clearInterval(fallback) }
-  }, [fetchAll])
+  if (!entered) {
+    return (
+      <LandingPage
+        summary={summary}
+        wsStatus={wsStatus}
+        onEnter={enter}
+        isDark={isDark}
+        onToggleTheme={toggleTheme}
+      />
+    )
+  }
 
   return (
     <div className="min-h-screen bg-gray-100 text-gray-900
@@ -68,14 +77,22 @@ export default function App() {
         lastUpdated={lastUpdated}
         isDark={isDark}
         onToggleTheme={toggleTheme}
+        activeTab={tab}
+        onTabChange={setTab}
+        onHome={goHome}
       />
-      <main className="max-w-screen-2xl mx-auto px-4 py-6 space-y-6">
-        <SummaryCards summary={summary} />
-        <LiveQueueTable sessions={liveSessions} onEndSession={handleEndSession} />
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-          <CompletedTable sessions={completedSessions} />
-          <RecentReadsPanel reads={recentReads} />
-        </div>
+      <main className="max-w-screen-2xl mx-auto px-4 py-6">
+        {tab === 'live' && (
+          <LiveDashboard
+            summary={summary}
+            liveSessions={liveSessions}
+            completedSessions={completedSessions}
+            recentReads={recentReads}
+            onEndSession={handleEndSession}
+          />
+        )}
+        {tab === 'report' && <FullReport tick={tick} />}
+        {tab === 'analytics' && <AnalyticsPage tick={tick} />}
       </main>
     </div>
   )

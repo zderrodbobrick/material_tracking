@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react'
 import { Search, Filter, Radio } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
 import { DwellTimer } from './DwellTimer'
+import { parseEpc } from '../utils/parseEpc'
 
 function formatTime(isoStr) {
   if (!isoStr) return '—'
@@ -23,7 +24,8 @@ export function LiveQueueTable({ sessions, onEndSession }) {
 
   const filtered = useMemo(() => {
     return sessions.filter(s => {
-      if (search && !s.ibus_number?.toLowerCase().includes(search.toLowerCase())) return false
+      const hay = `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''}`.toLowerCase()
+      if (search && !hay.includes(search.toLowerCase())) return false
       if (statusFilter !== 'ALL' && s.status !== statusFilter) return false
       return true
     })
@@ -58,7 +60,7 @@ export function LiveQueueTable({ sessions, onEndSession }) {
             <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-gray-400 dark:text-slate-500 pointer-events-none" />
             <input
               type="text"
-              placeholder="Search IBUS #..."
+              placeholder="Search part / EPC..."
               value={search}
               onChange={e => setSearch(e.target.value)}
               className={inputCls}
@@ -75,8 +77,8 @@ export function LiveQueueTable({ sessions, onEndSession }) {
                          dark:border-slate-600 dark:bg-slate-900/60 dark:text-slate-100"
             >
               <option value="ALL">All</option>
-              <option value="IN_PROGRESS">In Process</option>
-              <option value="EXIT_ONLY">Exit Only</option>
+              <option value="open">In Process</option>
+              <option value="exit_only">Exit Only</option>
             </select>
           </div>
         </div>
@@ -98,7 +100,7 @@ export function LiveQueueTable({ sessions, onEndSession }) {
             <thead>
               <tr className="text-left bg-gray-50 dark:bg-slate-900/40
                              border-b border-gray-200 dark:border-slate-700/60">
-                {['IBUS #', 'Status', 'Entrance', 'Last Seen', 'RSSI', 'Current Dwell', ''].map((h, i) => (
+                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Status', 'Entered', 'Current Dwell', ''].map((h, i) => (
                   <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
                                          text-gray-600 dark:text-slate-400">
                     {h}
@@ -112,34 +114,56 @@ export function LiveQueueTable({ sessions, onEndSession }) {
                   key={s.id}
                   style={{ animationDelay: `${Math.min(i * 35, 400)}ms` }}
                   className={`animate-row-in transition-colors
-                    ${s.status === 'EXIT_ONLY'
+                    ${s.status === 'exit_only'
                       ? 'bg-orange-50 hover:bg-orange-100 dark:bg-orange-500/5 dark:hover:bg-orange-500/10'
                       : 'hover:bg-gray-50 dark:hover:bg-slate-700/30'}`}
                 >
-                  <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap
-                                 text-slate-800 dark:text-slate-100">
-                    {s.ibus_number}
+                  {(() => {
+                    const p = parseEpc(s.epc)
+                    const type = s.part_type ?? p.typeLabel
+                    const partNo = s.part_name ?? s.part_number ?? p.partNumber
+                    const wo = s.work_order ?? p.workOrder
+                    return p.isKnown ? (
+                      <>
+                        <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {p.qty}
+                        </td>
+                        <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {partNo}
+                        </td>
+                        <td className="px-4 py-3 whitespace-nowrap">
+                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold
+                                           bg-blue-100 text-blue-800 dark:bg-blue-500/20 dark:text-blue-300">
+                            {type}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                          {wo}
+                        </td>
+                        <td className="px-4 py-3 font-mono text-xs whitespace-nowrap text-gray-400 dark:text-slate-500">
+                          {p.formatted}
+                        </td>
+                      </>
+                    ) : (
+                      <td colSpan={5} className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                        {s.epc ?? s.ibus_number}
+                      </td>
+                    )
+                  })()}
+                  <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-600 dark:text-slate-400">
+                    {s.station_name ?? '—'}
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
                     <StatusBadge status={s.status} />
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap font-mono text-xs
                                  text-gray-600 dark:text-slate-400">
-                    {formatTime(s.entrance_time)}
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap font-mono text-xs
-                                 text-gray-600 dark:text-slate-400">
-                    {formatTime(s.last_seen)}
-                  </td>
-                  <td className="px-4 py-3 whitespace-nowrap">
-                    <span className="font-mono text-xs text-gray-500 dark:text-slate-400">
-                      {s.last_rssi != null ? `${s.last_rssi} dBm` : '—'}
-                    </span>
+                    {formatTime(s.entry_time)}
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
                     <DwellTimer
-                      entranceTime={s.entrance_time}
-                      entranceEpochMs={s.entrance_epoch_ms}
+                      entranceTime={s.entry_time}
+                      entranceEpochMs={s.entry_epoch_ms}
                       exitTime={null}
                       dwellSeconds={null}
                     />
@@ -148,7 +172,9 @@ export function LiveQueueTable({ sessions, onEndSession }) {
                     {onEndSession && (
                       <button
                         onClick={() => {
-                          if (window.confirm(`End session for ${s.ibus_number}?`)) {
+                          const p = parseEpc(s.epc)
+                          const label = p.isKnown ? `${s.part_type ?? p.typeLabel} WO#${s.work_order ?? p.workOrder}` : (s.epc ?? s.ibus_number)
+                          if (window.confirm(`End session for ${label}?`)) {
                             onEndSession(s.id)
                           }
                         }}

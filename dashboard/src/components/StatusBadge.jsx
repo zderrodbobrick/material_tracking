@@ -1,34 +1,28 @@
+const BLUE   = 'bg-blue-100 text-blue-800 border border-blue-200 dark:bg-blue-500/15 dark:text-blue-300 dark:border-blue-500/30'
+const GREEN  = 'bg-green-100 text-green-800 border border-green-200 dark:bg-green-500/15 dark:text-green-300 dark:border-green-500/30'
+const GRAY   = 'bg-gray-100 text-gray-600 border border-gray-200 dark:bg-slate-700/50 dark:text-slate-300 dark:border-slate-600/50'
+const ORANGE = 'bg-orange-100 text-orange-800 border border-orange-200 dark:bg-orange-500/15 dark:text-orange-300 dark:border-orange-500/30'
+
 const STATUS_STYLES = {
-  // Legacy tag_reads statuses
-  IN_PROGRESS:        'bg-blue-100 text-blue-800 border border-blue-200 dark:bg-blue-500/15 dark:text-blue-300 dark:border-blue-500/30',
-  COMPLETE:           'bg-green-100 text-green-800 border border-green-200 dark:bg-green-500/15 dark:text-green-300 dark:border-green-500/30',
-  ABANDONED:          'bg-gray-100 text-gray-600 border border-gray-200 dark:bg-slate-700/50 dark:text-slate-300 dark:border-slate-600/50',
-  EXIT_ONLY:          'bg-orange-100 text-orange-800 border border-orange-200 dark:bg-orange-500/15 dark:text-orange-300 dark:border-orange-500/30',
-  // station_sessions statuses
-  'In Process':       'bg-blue-100 text-blue-800 border border-blue-200 dark:bg-blue-500/15 dark:text-blue-300 dark:border-blue-500/30',
-  'Completed':        'bg-green-100 text-green-800 border border-green-200 dark:bg-green-500/15 dark:text-green-300 dark:border-green-500/30',
-  'Abandoned':        'bg-gray-100 text-gray-600 border border-gray-200 dark:bg-slate-700/50 dark:text-slate-300 dark:border-slate-600/50',
-  'Missing Exit':     'bg-orange-100 text-orange-800 border border-orange-200 dark:bg-orange-500/15 dark:text-orange-300 dark:border-orange-500/30',
-  'Missing Entrance': 'bg-red-100 text-red-800 border border-red-200 dark:bg-red-500/15 dark:text-red-300 dark:border-red-500/30',
-  // rfid_events antenna locations
-  'Entrance':         'bg-blue-100 text-blue-800 border border-blue-200 dark:bg-blue-500/15 dark:text-blue-300 dark:border-blue-500/30',
-  'Exit':             'bg-green-100 text-green-800 border border-green-200 dark:bg-green-500/15 dark:text-green-300 dark:border-green-500/30',
+  // Normalized part_station_sessions.session_status
+  open:      BLUE,
+  closed:    GREEN,
+  abandoned: GRAY,
+  exit_only: ORANGE,
+  // Antenna roles (raw reads feed)
+  Entry:     BLUE,
+  Exit:      GREEN,
 }
 
-const FALLBACK = 'bg-gray-100 text-gray-600 border border-gray-200 dark:bg-slate-700/50 dark:text-slate-300 dark:border-slate-600/50'
+const FALLBACK = GRAY
 
 const STATUS_LABELS = {
-  IN_PROGRESS:        'In Process',
-  COMPLETE:           'Completed',
-  ABANDONED:          'Abandoned',
-  EXIT_ONLY:          'Exit Only',
-  'In Process':       'In Process',
-  'Completed':        'Completed',
-  'Abandoned':        'Abandoned',
-  'Missing Exit':     'Missing Exit',
-  'Missing Entrance': 'Missing Entrance',
-  'Entrance':         'Entrance',
-  'Exit':             'Exit',
+  open:      'In Process',
+  closed:    'Completed',
+  abandoned: 'Abandoned',
+  exit_only: 'Exit Only',
+  Entry:     'Entry',
+  Exit:      'Exit',
 }
 
 export function StatusBadge({ status }) {

@@ -1,8 +1,12 @@
 """
-test_database.py — Direct SQLite database checks
-Tests: schema correctness, row counts, FK integrity, WAL mode, data written by API.
+test_database.py — Schema, seed, and integrity checks for the normalized RFID schema.
 
-Does NOT require the API to be running (reads DB directly).
+Validates the 12-table POC schema from Database.md (9 core + 3 operator),
+the vw_live_part_status view, recommended indexes, seed data, and FK integrity.
+
+Runs against a fresh in-memory database built by database.migrate.run_migrations,
+so it does NOT require the listener/API to be running.
+
 Run:  python tests/test_database.py
 """
 
@@ -10,7 +14,6 @@ import sqlite3
 import sys
 from pathlib import Path
 
-# Force UTF-8 output so box-drawing chars work on Windows cp1252 consoles
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -18,8 +21,7 @@ except (AttributeError, ValueError):
     pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import DB_PATH
-from database.schema import get_connection
+from database.migrate import run_migrations
 
 PASS = "\033[92m  PASS\033[0m"
 FAIL = "\033[91m  FAIL\033[0m"
@@ -30,8 +32,7 @@ def check(label, condition, detail=""):
     if condition:
         print(f"{PASS}  {label}")
     else:
-        msg = f"{FAIL}  {label}" + (f"  ->  {detail}" if detail else "")
-        print(msg)
+        print(f"{FAIL}  {label}" + (f"  ->  {detail}" if detail else ""))
         _failures.append(label)
 
 
@@ -39,136 +40,158 @@ def section(title):
     print(f"\n-- {title} {'-' * max(0, 55 - len(title))}")
 
 
-# ── 0. File exists ────────────────────────────────────────────────────────────
+def cols(conn, table):
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
-section("0. Database file")
-db_path = Path(DB_PATH)
-check(f"DB file exists at {db_path}", db_path.exists(), str(db_path))
-if not db_path.exists():
-    print("\033[91m  FATAL: Database not found. Start the API and ingest at least one event first.\033[0m")
-    sys.exit(1)
 
-check("DB file is non-empty", db_path.stat().st_size > 0,
-      f"size={db_path.stat().st_size}")
+# ── Build a fresh schema in-memory ────────────────────────────────────────────
 
-conn = get_connection(str(db_path))
+conn = sqlite3.connect(":memory:")
+conn.execute("PRAGMA foreign_keys=ON")
+run_migrations(
+    conn,
+    station_name="Gannomat",
+    station_type="Drilling",
+    station_location="TPF CL",
+    reader_name="FX9600-Gannomat",
+    reader_ip="192.168.1.50",
+    entry_antenna=1,
+    exit_antenna=2,
+)
 
-# ── 1. PRAGMA / WAL mode ─────────────────────────────────────────────────────
-
-section("1. PRAGMA settings")
-journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
-check("WAL journal mode enabled", journal == "wal", journal)
-
-fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
-check("Foreign keys enabled", fk == 1, str(fk))
-
-# ── 2. Schema — all required tables exist ────────────────────────────────────
-
-section("2. Schema - tables")
 tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-for t in ("rfid_events", "station_sessions", "station_alerts", "label_prints"):
-    check(f"Table '{t}' exists", t in tables, f"found: {tables}")
-
-# ── 3. Schema — column checks ────────────────────────────────────────────────
-
-section("3. Schema - columns")
-
-def cols(table):
-    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-
-rfid_cols = cols("rfid_events")
-for c in ("event_id", "epc", "ibus_number", "station_name", "antenna_location",
-          "read_time", "rssi", "created_at"):
-    check(f"rfid_events.{c}", c in rfid_cols)
-
-sess_cols = cols("station_sessions")
-for c in ("session_id", "ibus_number", "status", "entrance_time", "exit_time",
-          "dwell_time_seconds", "operator_name", "last_seen_time", "alert_flag"):
-    check(f"station_sessions.{c}", c in sess_cols)
-
-alert_cols = cols("station_alerts")
-for c in ("alert_id", "session_id", "ibus_number", "alert_type", "severity",
-          "status", "created_at", "resolved_at"):
-    check(f"station_alerts.{c}", c in alert_cols)
-
-# ── 4. Indexes ────────────────────────────────────────────────────────────────
-
-section("4. Indexes")
+views = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='view'")}
 indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
-for idx in ("idx_rfid_events_ibus_time", "idx_station_sessions_ibus_status",
-            "idx_station_alerts_status"):
+
+# ── 1. Migration system ───────────────────────────────────────────────────────
+
+section("1. Migration system")
+check("schema_migrations table exists", "schema_migrations" in tables)
+applied = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
+check("All 6 migrations applied", len(applied) == 6, f"applied: {applied}")
+for v in range(1, 7):
+    check(f"Migration v{v} applied", v in applied)
+
+# ── 2. Core tables (9) ────────────────────────────────────────────────────────
+
+section("2. Core tables (9)")
+CORE = [
+    "rfid_tags", "parts", "part_tag_assignments",
+    "stations", "rfid_readers", "rfid_antennas",
+    "rfid_raw_reads", "part_station_events", "part_station_sessions",
+]
+for t in CORE:
+    check(f"Table '{t}' exists", t in tables)
+
+# ── 3. Operator tables (3) ────────────────────────────────────────────────────
+
+section("3. Operator tables (3)")
+OPS = ["operators", "operator_station_presence", "part_operator_assignments"]
+for t in OPS:
+    check(f"Table '{t}' exists", t in tables)
+
+# ── 4. Key columns ────────────────────────────────────────────────────────────
+
+section("4. Key columns")
+check("rfid_tags.epc", "epc" in cols(conn, "rfid_tags"))
+for c in ("part_number", "part_name", "part_type", "ibus_number", "job_number", "quantity_required"):
+    check(f"parts.{c}", c in cols(conn, "parts"))
+for c in ("antenna_role", "antenna_port", "station_id", "reader_id"):
+    check(f"rfid_antennas.{c}", c in cols(conn, "rfid_antennas"))
+for c in ("antenna_id", "antenna_port", "rssi", "reader_timestamp", "server_received_at",
+          "read_status", "is_stale"):
+    check(f"rfid_raw_reads.{c}", c in cols(conn, "rfid_raw_reads"))
+for c in ("entry_time", "exit_time", "dwell_seconds", "session_status",
+          "entry_event_id", "exit_event_id"):
+    check(f"part_station_sessions.{c}", c in cols(conn, "part_station_sessions"))
+for c in ("employee_number", "operator_name", "rtls_badge_id", "is_active"):
+    check(f"operators.{c}", c in cols(conn, "operators"))
+
+# ── 5. View ───────────────────────────────────────────────────────────────────
+
+section("5. Live status view")
+check("vw_live_part_status exists", "vw_live_part_status" in views)
+view_cols = cols(conn, "vw_live_part_status")
+for c in ("session_id", "part_name", "part_type", "ibus_number", "job_number",
+          "epc", "station_name", "entry_time", "exit_time", "dwell_seconds", "session_status"):
+    check(f"view.{c}", c in view_cols)
+
+# ── 6. Indexes ────────────────────────────────────────────────────────────────
+
+section("6. Indexes")
+for idx in ("IX_raw_reads_epc_time", "IX_raw_reads_reader_time", "IX_raw_reads_antenna_time",
+            "IX_sessions_tag_station_status", "IX_events_tag_station_time"):
     check(f"Index '{idx}' exists", idx in indexes)
 
-# ── 5. Row counts ─────────────────────────────────────────────────────────────
+# ── 7. Seed data ──────────────────────────────────────────────────────────────
 
-section("5. Row counts")
-for table in ("rfid_events", "station_sessions", "station_alerts"):
-    count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    check(f"{table} has rows", count > 0, f"count={count}")
-    print(f"         ({table}: {count} rows)")
+section("7. Seed data")
+station_names = {r[0] for r in conn.execute("SELECT station_name FROM stations")}
+for s in ("Gannomat", "Tennoner", "Insert Station", "Anderson", "Final Packing"):
+    check(f"Station '{s}' seeded", s in station_names)
 
-# ── 6. Status values are valid ────────────────────────────────────────────────
+reader = conn.execute(
+    "SELECT reader_id, station_id FROM rfid_readers WHERE reader_name = 'FX9600-Gannomat'"
+).fetchone()
+check("Gannomat reader seeded", reader is not None)
 
-section("6. Data integrity - valid status values")
-valid_statuses = {"In Process", "Completed", "Missing Exit", "Missing Entrance"}
-bad = conn.execute(
-    "SELECT DISTINCT status FROM station_sessions WHERE status NOT IN "
-    "('In Process','Completed','Missing Exit','Missing Entrance')"
-).fetchall()
-check("All session statuses are valid", len(bad) == 0,
-      f"invalid: {[r[0] for r in bad]}")
+roles = {r[0]: r[1] for r in conn.execute(
+    "SELECT antenna_port, antenna_role FROM rfid_antennas"
+)}
+check("Entry antenna on port 1", roles.get(1) == "Entry", str(roles))
+check("Exit antenna on port 2", roles.get(2) == "Exit", str(roles))
 
-valid_alert_statuses = {"Open", "Resolved"}
-bad_a = conn.execute(
-    "SELECT DISTINCT status FROM station_alerts WHERE status NOT IN ('Open','Resolved')"
-).fetchall()
-check("All alert statuses are valid", len(bad_a) == 0,
-      f"invalid: {[r[0] for r in bad_a]}")
+# ── 8. FK integrity (full pipeline insert) ────────────────────────────────────
 
-# ── 7. Completed sessions have exit_time and dwell ────────────────────────────
+section("8. FK integrity — pipeline round-trip")
+station_id = conn.execute(
+    "SELECT station_id FROM stations WHERE station_name='Gannomat'").fetchone()[0]
+reader_id = reader[0]
+antenna_id = conn.execute(
+    "SELECT antenna_id FROM rfid_antennas WHERE reader_id=? AND antenna_port=1",
+    (reader_id,)).fetchone()[0]
 
-section("7. Completed session integrity")
-bad_completed = conn.execute(
-    """SELECT COUNT(*) FROM station_sessions
-       WHERE status = 'Completed' AND (exit_time IS NULL OR dwell_time_seconds IS NULL)"""
-).fetchone()[0]
-check("All Completed sessions have exit_time + dwell_time_seconds",
-      bad_completed == 0, f"{bad_completed} rows missing")
+tag_id = conn.execute("INSERT INTO rfid_tags (epc) VALUES ('1D40463947')").lastrowid
+part_id = conn.execute(
+    "INSERT INTO parts (part_number, part_name, part_type, ibus_number, job_number, quantity_required) "
+    "VALUES ('D4','D4','IBUS','1D40463947','463947',1)").lastrowid
+conn.execute("INSERT INTO part_tag_assignments (part_id, tag_id) VALUES (?, ?)", (part_id, tag_id))
+read_id = conn.execute(
+    "INSERT INTO rfid_raw_reads (tag_id, epc, reader_id, antenna_id, antenna_port, rssi, reader_timestamp) "
+    "VALUES (?, '1D40463947', ?, ?, 1, -42.0, '2026-07-02T10:00:00Z')",
+    (tag_id, reader_id, antenna_id)).lastrowid
+enter_ev = conn.execute(
+    "INSERT INTO part_station_events (part_id, tag_id, station_id, event_type, event_time, source_read_id) "
+    "VALUES (?, ?, ?, 'ENTER', '2026-07-02T10:00:00Z', ?)",
+    (part_id, tag_id, station_id, read_id)).lastrowid
+session_id = conn.execute(
+    "INSERT INTO part_station_sessions (part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
+    "VALUES (?, ?, ?, ?, '2026-07-02T10:00:00Z', 'open')",
+    (part_id, tag_id, station_id, enter_ev)).lastrowid
+conn.commit()
 
-# ── 8. In Process sessions have entrance_time ────────────────────────────────
+check("Tag/part/assignment/read/event/session inserted", session_id is not None)
 
-bad_inprocess = conn.execute(
-    """SELECT COUNT(*) FROM station_sessions
-       WHERE status = 'In Process' AND entrance_time IS NULL"""
-).fetchone()[0]
-check("All 'In Process' sessions have entrance_time",
-      bad_inprocess == 0, f"{bad_inprocess} rows missing")
+vw = conn.execute(
+    "SELECT part_name, part_type, station_name, epc, session_status "
+    "FROM vw_live_part_status WHERE session_id = ?", (session_id,)
+).fetchone()
+check("Session visible in vw_live_part_status", vw is not None)
+if vw:
+    check("View joins part_name", vw[0] == "D4", str(vw))
+    check("View joins station_name", vw[2] == "Gannomat", str(vw))
+    check("View exposes epc", vw[3] == "1D40463947", str(vw))
+    check("View exposes status", vw[4] == "open", str(vw))
 
-# ── 9. FK integrity — all alerts reference valid sessions ─────────────────────
-
-section("8. Foreign key integrity")
-orphan_alerts = conn.execute(
-    """SELECT COUNT(*) FROM station_alerts a
-       LEFT JOIN station_sessions s ON a.session_id = s.session_id
-       WHERE a.session_id IS NOT NULL AND s.session_id IS NULL"""
-).fetchone()[0]
-check("No orphaned alerts (all session_ids exist)", orphan_alerts == 0,
-      f"{orphan_alerts} orphaned alerts")
-
-# ── 10. Timestamps look like ISO-8601 UTC ────────────────────────────────────
-
-section("9. Timestamp format - recent rfid_events")
-recent = conn.execute(
-    "SELECT read_time, created_at FROM rfid_events ORDER BY event_id DESC LIMIT 10"
-).fetchall()
-check("Recent rfid_events exist", len(recent) > 0)
-for row in recent:
-    for ts in (row["read_time"], row["created_at"]):
-        if ts:
-            check(f"Timestamp '{ts[:19]}' is ISO-8601 format",
-                  "T" in ts or " " in ts, ts)
-            break
-    break  # just check one row
+# FK enforcement: inserting an event with a bogus station should fail
+try:
+    conn.execute(
+        "INSERT INTO part_station_events (tag_id, station_id, event_type, event_time) "
+        "VALUES (?, 99999, 'ENTER', '2026-07-02T10:00:00Z')", (tag_id,))
+    conn.commit()
+    check("FK rejects bad station_id", False, "insert unexpectedly succeeded")
+except sqlite3.IntegrityError:
+    check("FK rejects bad station_id", True)
 
 conn.close()
 
@@ -181,4 +204,4 @@ if _failures:
         print(f"    - {f}")
     sys.exit(1)
 else:
-    print(f"\033[92m  All database tests passed.\033[0m")
+    print("\033[92m  All database tests passed.\033[0m")

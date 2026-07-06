@@ -28,20 +28,32 @@ EXIT_ANTENNA = int(os.getenv("EXIT_ANTENNA", "2"))
 # Valid reads must satisfy: RSSI_MIN <= rssi <= 0
 # Lower = greater range, Higher = more selective (less cross-antenna reads)
 # Use -55 if antennas are close, -65 if far apart
-RSSI_MIN = int(os.getenv("RSSI_MIN", "-100"))
+RSSI_MIN = int(os.getenv("RSSI_MIN", "-65"))
+
+# Exit antenna (port 2): only reads with rssi >= EXIT_RSSI_MIN set exit_time.
+# The last such valid read wins; weaker reads are logged but ignored for close.
+EXIT_RSSI_MIN = int(os.getenv("EXIT_RSSI_MIN", "-65"))
 
 # Temporal filtering: require N reads within throttle window before session starts
 # Prevents stray/distant tags from creating sessions (1=disabled, 3=balanced, 5=strict)
 MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "0"))
 
+# Set to True to only process tags containing "IBUS" in their EPC value.
+# Set to False to accept all tags regardless of EPC content.
+CHECK_FOR_IBUS = False
+
 # EPC whitelist filter - only process tags matching this readable pattern.
-# Default accepts values like S6IBUS459302.
-EPC_FILTER_PATTERN = os.getenv("EPC_FILTER_PATTERN", r".*IBUS.*")  # Only require IBUS in tag value
+# Automatically set based on CHECK_FOR_IBUS above; override with EPC_FILTER_PATTERN env var if needed.
+EPC_FILTER_PATTERN = os.getenv("EPC_FILTER_PATTERN", r".*IBUS.*" if CHECK_FOR_IBUS else r".*")
 
 # ── Session Management ────────────────────────────────────────────────────────
 # Fast-moving tags: lower throttle for higher resolution, shorter timeouts
 RAW_THROTTLE_SEC = float(os.getenv("RAW_THROTTLE_SEC", "0.05"))     # 50ms between stored reads
-IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "5.0"))      # Idle after last read before sweeper acts
+IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "5.0"))      # Idle (non-exit) before sweeper acts
+# After the last valid exit-antenna read (>= EXIT_RSSI_MIN), wait this long with no
+# new exit reads before closing. Keeps the session live while the tag passes ant 2;
+# exit_time stays the timestamp of that last valid read. Set to 0 to close immediately.
+EXIT_IDLE_TIMEOUT_SEC = float(os.getenv("EXIT_IDLE_TIMEOUT_SEC", "5.0"))
 ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h — keep alive until antenna 2
 SWEEP_INTERVAL_SEC = float(os.getenv("SWEEP_INTERVAL_SEC", "1.0"))  # Check every second
 
@@ -49,12 +61,26 @@ SWEEP_INTERVAL_SEC = float(os.getenv("SWEEP_INTERVAL_SEC", "1.0"))  # Check ever
 RAW_MAX_ROWS = int(os.getenv("RAW_MAX_ROWS", "20000"))
 PRUNE_EVERY_N_INSERTS = int(os.getenv("PRUNE_EVERY_N_INSERTS", "200"))
 
+# ── Station / Reader Identity ────────────────────────────────────────────────
+# Set these per-machine so every read is traceable to a physical station + reader.
+# Each machine runs its own listener bound to one station. Override via env / .env
+# when deploying to a new station (e.g. Tennoner, Anderson).
+STATION_NAME     = os.getenv("STATION_NAME", "Gannomat")        # must match a stations row
+STATION_TYPE     = os.getenv("STATION_TYPE", "Drilling")
+STATION_LOCATION = os.getenv("STATION_LOCATION", "TPF CL")      # plant/site, stored on the reader
+READER_NAME      = os.getenv("READER_NAME",  "FX9600-Gannomat")
+READER_IP        = os.getenv("READER_IP",    "")                # reader device IP
+
 # ── Printer Configuration ───────────────────────────────────────────────────
 PRINTER_IP = os.getenv("PRINTER_IP", "10.25.100.157")
 PRINTER_PORT = int(os.getenv("PRINTER_PORT", "9100"))
 
-# ── Status Constants ─────────────────────────────────────────────────────────
-STATUS_OPEN = "IN_PROGRESS"
-STATUS_CLOSED = "COMPLETE"
-STATUS_ABANDONED = "ABANDONED"
-STATUS_EXIT_ONLY = "EXIT_ONLY"
+# ── Event Type Constants (part_station_events.event_type) ────────────────────
+ENTER_EVENT = "ENTER"
+EXIT_EVENT = "EXIT"
+
+# ── Session Status Constants (part_station_sessions.session_status) ───────────
+STATUS_OPEN = "open"
+STATUS_CLOSED = "closed"
+STATUS_ABANDONED = "abandoned"
+STATUS_EXIT_ONLY = "exit_only"

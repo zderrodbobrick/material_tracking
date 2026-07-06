@@ -1,29 +1,35 @@
 """
-test_api.py — API endpoint tests
-Tests: RFID ingest, session lifecycle, live-status, completed, alerts, stats, resolve.
+test_api.py — Endpoint tests for the normalized RFID API.
+
+Exercises the schema-aware read endpoints and the manual session-end write path.
+Ingest happens through the listener/DwellTracker (not the API), so these tests
+seed a session directly into the DB, then assert the API surfaces it correctly.
 
 Requires: API running on localhost:5001
 Run:      python tests/test_api.py
 """
 
 import json
+import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
+from pathlib import Path
 
-# Force UTF-8 output so box-drawing chars work on Windows cp1252 consoles
 try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 except (AttributeError, ValueError):
     pass
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import DB_PATH, STATUS_OPEN, STATUS_CLOSED
+
 BASE = "http://localhost:5001"
 PASS = "\033[92m  PASS\033[0m"
 FAIL = "\033[91m  FAIL\033[0m"
-
 _failures = []
 
 
@@ -46,13 +52,34 @@ def check(label, condition, detail=""):
     if condition:
         print(f"{PASS}  {label}")
     else:
-        msg = f"{FAIL}  {label}" + (f"  ->  {detail}" if detail else "")
-        print(msg)
+        print(f"{FAIL}  {label}" + (f"  ->  {detail}" if detail else ""))
         _failures.append(label)
 
 
 def section(title):
     print(f"\n-- {title} {'-' * max(0, 55 - len(title))}")
+
+
+def _seed_session(epc, status, entry_time, exit_time=None, dwell=None):
+    """Insert a tag/part/session directly so the API has something to serve."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("PRAGMA foreign_keys=ON")
+    station_id = conn.execute(
+        "SELECT station_id FROM stations WHERE station_name='Gannomat'").fetchone()[0]
+    tag_id = conn.execute("INSERT INTO rfid_tags (epc) VALUES (?)", (epc,)).lastrowid
+    part_id = conn.execute(
+        "INSERT INTO parts (part_number, part_name, part_type, ibus_number, job_number) "
+        "VALUES ('S6','S6','IBUS',?,?)", (epc, epc[-6:])).lastrowid
+    conn.execute("INSERT INTO part_tag_assignments (part_id, tag_id) VALUES (?, ?)",
+                 (part_id, tag_id))
+    sid = conn.execute(
+        "INSERT INTO part_station_sessions "
+        "(part_id, tag_id, station_id, entry_time, exit_time, dwell_seconds, session_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (part_id, tag_id, station_id, entry_time, exit_time, dwell, status)).lastrowid
+    conn.commit()
+    conn.close()
+    return sid
 
 
 # ── 0. Reachability ───────────────────────────────────────────────────────────
@@ -67,163 +94,126 @@ except Exception as e:
     print(f"  Detail: {e}")
     sys.exit(1)
 
-# ── 1. RFID Ingest — Entrance ─────────────────────────────────────────────────
+# ── 1. Catalog endpoints ──────────────────────────────────────────────────────
 
-section("1. RFID ingest - entrance read")
-IBUS = f"S6IBUS{int(time.time()) % 1000000:06d}"
-now_utc = datetime.now(timezone.utc)
-entrance_iso = now_utc.isoformat()
+section("1. Catalog endpoints")
+for path, key in [
+    ("/api/stations", "station_name"),
+    ("/api/readers", "reader_name"),
+    ("/api/antennas", "antenna_role"),
+]:
+    st, rows = _get(path)
+    check(f"GET {path} returns 200", st == 200)
+    check(f"{path} is a non-empty list", isinstance(rows, list) and len(rows) > 0, str(rows)[:80])
+    if rows:
+        check(f"{path} rows have '{key}'", key in rows[0], str(list(rows[0].keys())))
 
-status, r = _post("/api/rfid/events", {
-    "epc": IBUS,
-    "ibus_number": IBUS,
-    "station_name": "Gannomat",
-    "antenna_location": "Entrance",
-    "reader_id": "TEST_READER",
-    "antenna_id": 1,
-    "read_time": entrance_iso,
-    "rssi": -35,
-})
-check("POST /api/rfid/events returns 201", status == 201)
-check("Action is session_created or session_updated",
-      r.get("action") in ("session_created", "session_updated"),
-      r.get("action"))
-session_id = r.get("session_id")
-check("session_id returned", session_id is not None, str(r))
+st, ants = _get("/api/antennas")
+roles = {a["antenna_role"] for a in ants}
+check("Antennas include Entry + Exit roles", {"Entry", "Exit"} <= roles, str(roles))
 
-# ── 2. RFID Ingest — Duplicate suppression ────────────────────────────────────
+# ── 2. Operator endpoints (read-only) ─────────────────────────────────────────
 
-section("2. Duplicate suppression (same IBUS + antenna within 5s)")
-status2, r2 = _post("/api/rfid/events", {
-    "epc": IBUS,
-    "ibus_number": IBUS,
-    "station_name": "Gannomat",
-    "antenna_location": "Entrance",
-    "reader_id": "TEST_READER",
-    "antenna_id": 1,
-    "read_time": entrance_iso,
-    "rssi": -35,
-})
-check("Duplicate returns 201", status2 == 201)
-check("Duplicate is suppressed", r2.get("status") == "suppressed", str(r2))
+section("2. Operator endpoints")
+st, ops = _get("/api/operators")
+check("GET /api/operators returns 200", st == 200)
+check("Operators response is a list", isinstance(ops, list))
 
-# ── 3. Live status shows the new session ─────────────────────────────────────
+# ── 3. Live session appears ───────────────────────────────────────────────────
 
-section("3. Live status")
-status3, live = _get("/api/gannomat/live-status")
-check("GET /api/gannomat/live-status returns 200", status3 == 200)
+section("3. Live sessions")
+EPC = f"S6IBUS{int(time.time()) % 1000000:06d}"
+entry_iso = datetime.now(timezone.utc).isoformat()
+open_sid = _seed_session(EPC, STATUS_OPEN, entry_iso)
+
+st, live = _get("/api/live")
+check("GET /api/live returns 200", st == 200)
 check("Response is a list", isinstance(live, list))
-matching = [s for s in live if s.get("ibus_number") == IBUS]
-check(f"New session {IBUS} appears in live-status", len(matching) > 0,
-      f"found {len(matching)} matching rows")
-if matching:
-    s = matching[0]
-    check("Status is 'In Process'", s["status"] == "In Process", s["status"])
-    check("entrance_time is set", s["entrance_time"] is not None)
+match = [s for s in live if s.get("session_id") == open_sid]
+check(f"Seeded open session appears in /api/live", len(match) == 1, f"found {len(match)}")
+if match:
+    s = match[0]
+    check("status is 'open'", s["status"] == STATUS_OPEN, s["status"])
+    check("entry_time set", s["entry_time"] is not None)
     check("exit_time is None", s["exit_time"] is None)
+    check("part_name surfaced", s["part_name"] == "S6", str(s.get("part_name")))
+    check("station_name surfaced", s["station_name"] == "Gannomat", str(s.get("station_name")))
 
-# ── 4. RFID Ingest — Exit ─────────────────────────────────────────────────────
+# ── 4. Completed session + dwell ──────────────────────────────────────────────
 
-section("4. RFID ingest - exit read")
-exit_iso = datetime.now(timezone.utc).isoformat()
-status4, r4 = _post("/api/rfid/events", {
-    "epc": IBUS,
-    "ibus_number": IBUS,
-    "station_name": "Gannomat",
-    "antenna_location": "Exit",
-    "reader_id": "TEST_READER",
-    "antenna_id": 2,
-    "read_time": exit_iso,
-    "rssi": -38,
-})
-check("Exit POST returns 201", status4 == 201)
-check("Action is session_completed", r4.get("action") == "session_completed", str(r4))
-check("dwell_time_seconds >= 0",
-      isinstance(r4.get("dwell_time_seconds"), int) and r4["dwell_time_seconds"] >= 0,
-      str(r4.get("dwell_time_seconds")))
+section("4. Completed sessions")
+comp_epc = f"S6DONE{int(time.time()) % 1000000:06d}"
+closed_sid = _seed_session(
+    comp_epc, STATUS_CLOSED,
+    "2026-07-02T10:00:00Z", "2026-07-02T10:07:30Z", 450)
+st, completed = _get("/api/completed?limit=100")
+check("GET /api/completed returns 200", st == 200)
+cmatch = [s for s in completed if s.get("session_id") == closed_sid]
+check("Closed session appears in /api/completed", len(cmatch) == 1, f"found {len(cmatch)}")
+if cmatch:
+    s = cmatch[0]
+    check("status is 'closed'", s["status"] == STATUS_CLOSED, s["status"])
+    check("dwell_seconds == 450", s["dwell_seconds"] == 450, str(s["dwell_seconds"]))
+    check("dwell_time_display set", s["dwell_time_display"] is not None)
 
-# ── 5. Completed sessions ─────────────────────────────────────────────────────
+# ── 5. Raw reads feed ─────────────────────────────────────────────────────────
 
-section("5. Completed sessions")
-status5, completed = _get("/api/gannomat/completed?limit=50")
-check("GET /api/gannomat/completed returns 200", status5 == 200)
-check("Response is a list", isinstance(completed, list))
-comp_match = [s for s in completed if s.get("ibus_number") == IBUS]
-check(f"{IBUS} appears in completed list", len(comp_match) > 0,
-      f"found {len(comp_match)} matching rows")
-if comp_match:
-    s = comp_match[0]
-    check("Status is 'Completed'", s["status"] == "Completed", s["status"])
-    check("exit_time is set", s["exit_time"] is not None)
-    check("dwell_time_display is set", s["dwell_time_display"] is not None, str(s.get("dwell_time_display")))
+section("5. Raw reads feed")
+st, reads = _get("/api/raw-reads/recent?limit=10")
+check("GET /api/raw-reads/recent returns 200", st == 200)
+check("Response is a list", isinstance(reads, list))
+if reads:
+    r = reads[0]
+    for k in ("epc", "rssi", "antenna_port", "role", "read_time"):
+        check(f"raw read has '{k}'", k in r, str(list(r.keys())))
 
-# ── 6. Missing Entrance alert ─────────────────────────────────────────────────
+# ── 6. Summary ────────────────────────────────────────────────────────────────
 
-section("6. Missing Entrance - exit with no prior entrance")
-IBUS_ME = f"S6IBUS{(int(time.time()) + 1) % 1000000:06d}"
-status6, r6 = _post("/api/rfid/events", {
-    "epc": IBUS_ME,
-    "ibus_number": IBUS_ME,
-    "station_name": "Gannomat",
-    "antenna_location": "Exit",
-    "reader_id": "TEST_READER",
-    "antenna_id": 2,
-    "read_time": datetime.now(timezone.utc).isoformat(),
-    "rssi": -40,
-})
-check("Missing Entrance POST returns 201", status6 == 201)
-check("Action is missing_entrance_alert",
-      r6.get("action") == "missing_entrance_alert", str(r6))
+section("6. Summary")
+st, summ = _get("/api/summary")
+check("GET /api/summary returns 200", st == 200)
+for key in ("parts_in_process", "completed_today", "average_dwell_display_today",
+            "reader_status", "station_name"):
+    check(f"summary has '{key}'", key in summ, str(list(summ.keys())))
+check("parts_in_process >= 1 (seeded open session)", summ["parts_in_process"] >= 1,
+      str(summ["parts_in_process"]))
 
-# ── 7. Alerts endpoint ────────────────────────────────────────────────────────
+# ── 7. Report + analytics ─────────────────────────────────────────────────────
 
-section("7. Alerts")
-status7, alerts = _get("/api/gannomat/alerts")
-check("GET /api/gannomat/alerts returns 200", status7 == 200)
-check("Response is a list", isinstance(alerts, list))
-me_alerts = [a for a in alerts if a.get("ibus_number") == IBUS_ME]
-check(f"Missing Entrance alert exists for {IBUS_ME}", len(me_alerts) > 0,
-      f"found {len(me_alerts)}")
-if me_alerts:
-    a = me_alerts[0]
-    check("alert_type is 'Missing Entrance'", a["alert_type"] == "Missing Entrance", a["alert_type"])
-    check("severity is 'High'", a["severity"] == "High", a["severity"])
-    alert_id = a["alert_id"]
+section("7. Report + analytics")
+st, rep = _get("/api/report/sessions?limit=10")
+check("GET /api/report/sessions returns 200", st == 200)
+check("report has total + sessions", "total" in rep and "sessions" in rep)
 
-    # ── 8. Resolve alert ──────────────────────────────────────────────────────
-    section("8. Resolve alert")
-    status8, r8 = _post(f"/api/gannomat/alerts/{alert_id}/resolve", {})
-    check("Resolve returns 200", status8 == 200)
-    check("Response has status=ok", r8.get("status") == "ok", str(r8))
-    check("resolved_at is set", r8.get("resolved_at") is not None)
+st, reps = _get("/api/report/stations")
+check("GET /api/report/stations returns 200", st == 200)
+check("stations grouping returned", "stations" in reps and len(reps["stations"]) >= 1)
 
-    status8b, alerts_after = _get("/api/gannomat/alerts")
-    still_open = [a for a in alerts_after if a.get("alert_id") == alert_id]
-    check("Alert no longer in open alerts", len(still_open) == 0,
-          f"still found {len(still_open)} open")
+st, an = _get("/api/analytics")
+check("GET /api/analytics returns 200", st == 200)
+for key in ("totals", "dwell", "stations", "throughput_by_day", "dwell_distribution"):
+    check(f"analytics has '{key}'", key in an, str(list(an.keys())))
+check("analytics totals.complete >= 1", an["totals"]["complete"] >= 1, str(an["totals"]))
 
-# ── 9. Stats ──────────────────────────────────────────────────────────────────
+# ── 8. Manual session end ─────────────────────────────────────────────────────
 
-section("9. Stats")
-status9, stats = _get("/api/gannomat/stats")
-check("GET /api/gannomat/stats returns 200", status9 == 200)
-for key in ("parts_in_process", "parts_completed_today", "open_alerts", "missing_exit_count"):
-    check(f"stats has key '{key}'", key in stats, str(list(stats.keys())))
+section("8. Manual session end")
+st, r = _post(f"/api/sessions/{open_sid}/end", {})
+check("POST /api/sessions/<id>/end returns 200", st == 200)
+check("Response success=True", r.get("success") is True, str(r))
 
-# ── 10. Bad request handling ──────────────────────────────────────────────────
+st, live_after = _get("/api/live")
+still_open = [s for s in live_after if s.get("session_id") == open_sid]
+check("Ended session removed from /api/live", len(still_open) == 0, f"still {len(still_open)}")
 
-section("10. Bad request handling")
+# ── 9. Not-found handling ─────────────────────────────────────────────────────
+
+section("9. Error handling")
 try:
-    _post("/api/rfid/events", {"ibus_number": "IBUS999", "antenna_location": "BadAntenna"})
-    check("Invalid antenna_location rejected", False, "Expected 422, got 201")
+    _post("/api/sessions/999999999/end", {})
+    check("Ending unknown session returns 404", False, "expected 404")
 except urllib.error.HTTPError as e:
-    check("Invalid antenna_location returns 422", e.code == 422, str(e.code))
-
-try:
-    _post("/api/rfid/events", {"antenna_location": "Entrance"})
-    check("Missing ibus_number rejected", False, "Expected 422, got 201")
-except urllib.error.HTTPError as e:
-    check("Missing ibus_number returns 422", e.code == 422, str(e.code))
+    check("Ending unknown session returns 404", e.code == 404, str(e.code))
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
@@ -234,4 +224,4 @@ if _failures:
         print(f"    - {f}")
     sys.exit(1)
 else:
-    print(f"\033[92m  All API tests passed.\033[0m")
+    print("\033[92m  All API tests passed.\033[0m")

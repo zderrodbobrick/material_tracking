@@ -2,8 +2,9 @@ import { useState, useEffect } from 'react'
 
 export function formatDwell(totalSec) {
   if (totalSec == null || totalSec < 0) return '0s'
-  const m = Math.floor(totalSec / 60)
-  const s = totalSec % 60
+  const sec = Math.floor(totalSec)
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
   if (m >= 60) {
     const h = Math.floor(m / 60)
     const rm = m % 60
