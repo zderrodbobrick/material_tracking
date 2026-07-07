@@ -115,7 +115,7 @@ try {
             # Skip raw Flask/Werkzeug HTTP access logs
             if ($line -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3} - -') { continue }
 
-            if ($line -match "^\[.+\] Tag:") {
+            if ($line -match "^\[.+\] Qty:" -or $line -match "^\[.+\] Tag:") {
                 # Primary read: [HH:MM:SS] Tag: S6IBUS... Ant1 RSSI:-48dBm
                 $readCount++
                 Write-Host "  >> $line" -ForegroundColor Cyan

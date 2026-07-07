@@ -27,6 +27,8 @@ DB_PATH = _db_path if _db_path.is_absolute() else BASE_DIR / _db_path
 # ── Antenna Configuration ───────────────────────────────────────────────────
 ENTRY_ANTENNA = int(os.getenv("ENTRY_ANTENNA", "1"))
 EXIT_ANTENNA = int(os.getenv("EXIT_ANTENNA", "2"))
+THIRD_ANTENNA = int(os.getenv("THIRD_ANTENNA", "3"))
+THIRD_ANTENNA_NAME = os.getenv("THIRD_ANTENNA_NAME", "Third")
 
 # ── RSSI Filter ───────────────────────────────────────────────────────────────
 # Valid reads must satisfy: RSSI_MIN <= rssi <= 0

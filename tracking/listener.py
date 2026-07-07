@@ -22,6 +22,7 @@ sys.path.insert(0, str(__file__).rsplit('\\', 2)[0])
 from config import (
     RSSI_MIN, EPC_FILTER_PATTERN, LISTENER_HOST, LISTENER_PORT,
     STATION_NAME, READER_NAME,
+    ENTRY_ANTENNA, EXIT_ANTENNA, THIRD_ANTENNA, THIRD_ANTENNA_NAME,
 )
 from storage import DwellTracker
 from epc_type_map import format_tag_id, parse_tag_id
@@ -54,6 +55,83 @@ def divider(label=""):
         print(line)
 
 
+def _antenna_role(port: int) -> str:
+    if port == ENTRY_ANTENNA:
+        return "Entry"
+    if port == EXIT_ANTENNA:
+        return "Exit"
+    if port == THIRD_ANTENNA:
+        return THIRD_ANTENNA_NAME
+    return "Unknown"
+
+
+def _antenna_label(port: int) -> str:
+    role = _antenna_role(port)
+    return f"Ant{port} ({role})"
+
+
+def _tag_detail(epc_readable: str) -> str:
+    p = parse_tag_id(epc_readable)
+    if p["is_known"]:
+        return (
+            f"Qty:{p['qty']}  Part#:{p['part_number']}  "
+            f"Type:{p['type_label']}  WO#:{p['work_order']}  "
+            f"[{p['formatted']}]"
+        )
+    return f"Tag:{epc_readable}"
+
+
+def _passes_filters(ev) -> bool:
+    if not isinstance(ev, dict):
+        return False
+    rssi = (ev.get("data") or {}).get("peakRssi")
+    try:
+        if not (RSSI_MIN <= int(rssi) <= 0):
+            return False
+    except (TypeError, ValueError):
+        return False
+    epc = ((ev.get("data") or {}).get("idHex") or "").lower()
+    if not epc_matches_filter(epc):
+        return False
+    return True
+
+
+def _group_reads(events: list) -> dict:
+    """Collapse batch to one line per (tag, antenna) with best RSSI."""
+    grouped = {}
+    for ev in events:
+        if not _passes_filters(ev):
+            continue
+        d = ev.get("data", {})
+        epc = d.get("idHex", "")
+        try:
+            antenna = int(d.get("antenna") or 0)
+        except (TypeError, ValueError):
+            continue
+        try:
+            rssi = int(d.get("peakRssi", 0))
+        except (TypeError, ValueError):
+            rssi = 0
+        key = (decode_epc(epc), antenna)
+        g = grouped.get(key)
+        if g is None:
+            grouped[key] = {"count": 1, "best_rssi": rssi}
+        else:
+            g["count"] += 1
+            if rssi > g["best_rssi"]:
+                g["best_rssi"] = rssi
+    return grouped
+
+
+def _print_reads(grouped: dict, stamp: str) -> None:
+    for (epc_readable, antenna), g in sorted(grouped.items()):
+        suffix = f"  (x{g['count']})" if g["count"] > 1 else ""
+        print(
+            f"[{stamp}] {_tag_detail(epc_readable)}  "
+            f"{_antenna_label(antenna)}  RSSI:{g['best_rssi']}dBm{suffix}"
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MODE 1 — HTTP POST listener (reader pushes events to us)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -70,7 +148,15 @@ def run_http():
         "last_event_at":   None,    # epoch seconds; None until first POST
         "events_total":    0,
         "batches_total":   0,
+        "antenna_hits":    {str(ENTRY_ANTENNA): 0, str(EXIT_ANTENNA): 0, str(THIRD_ANTENNA): 0},
+        "third_antenna_last_at": None,
     }
+
+    def _bump_antenna_hit(antenna: int) -> None:
+        key = str(antenna)
+        state["antenna_hits"][key] = state["antenna_hits"].get(key, 0) + 1
+        if antenna == THIRD_ANTENNA:
+            state["third_antenna_last_at"] = ts()
 
     @app.route("/healthz", methods=["GET"])
     def healthz():
@@ -96,6 +182,9 @@ def run_http():
                 int(last_evt_ago) if last_evt_ago is not None else None
             ),
             "db_writable":             db_ok,
+            "antenna_hits":            state["antenna_hits"],
+            "third_antenna":           THIRD_ANTENNA,
+            "third_antenna_last_at":   state["third_antenna_last_at"],
         }
         return jsonify(body), (200 if db_ok else 503)
 
@@ -107,58 +196,21 @@ def run_http():
             data = json.loads(raw)
             events = data if isinstance(data, list) else [data]
 
-            def _passes_filters(ev):
+            for ev in events:
                 if not isinstance(ev, dict):
-                    return False
-                rssi = (ev.get("data") or {}).get("peakRssi")
+                    continue
                 try:
-                    if not (RSSI_MIN <= int(rssi) <= 0):
-                        return False
+                    antenna = int((ev.get("data") or {}).get("antenna") or 0)
                 except (TypeError, ValueError):
-                    return False
-                epc = ((ev.get("data") or {}).get("idHex") or "").lower()
-                if not epc_matches_filter(epc):
-                    return False
-                return True
-
-            shown = [ev for ev in events if _passes_filters(ev)]
-
-            # Collapse the batch so stationary tags hammering an antenna don't
-            # flood the console. One line per (tag, antenna): count + best RSSI.
-            grouped = {}  # (epc_readable, antenna) -> {count, best_rssi}
-            for ev in shown:
-                d = ev.get("data", {})
-                epc = d.get("idHex", "")
-                antenna = d.get("antenna", 0)
-                try:
-                    rssi = int(d.get("peakRssi", 0))
-                except (TypeError, ValueError):
-                    rssi = 0
-                key = (decode_epc(epc), antenna)
-                g = grouped.get(key)
-                if g is None:
-                    grouped[key] = {"count": 1, "best_rssi": rssi}
-                else:
-                    g["count"] += 1
-                    if rssi > g["best_rssi"]:
-                        g["best_rssi"] = rssi
+                    continue
+                if antenna:
+                    _bump_antenna_hit(antenna)
 
             stamp = ts()
-            for (epc_readable, antenna), g in sorted(grouped.items()):
-                suffix = f"  (x{g['count']})" if g["count"] > 1 else ""
-                p = parse_tag_id(epc_readable)
-                if p["is_known"]:
-                    tag_detail = (
-                        f"Qty:{p['qty']}  Part#:{p['part_number']}  "
-                        f"Type:{p['type_label']}  WO#:{p['work_order']}  "
-                        f"[{p['formatted']}]"
-                    )
-                else:
-                    tag_detail = f"Tag:{epc_readable}"
-                print(f"[{stamp}] {tag_detail}  Ant{antenna} "
-                      f"RSSI:{g['best_rssi']}dBm{suffix}")
+            grouped = _group_reads(events)
+            _print_reads(grouped, stamp)
 
-            # Persist + dwell tracking
+            # Persist + dwell tracking (entry/exit logic unchanged — ant 3 not wired yet)
             summary = tracker.ingest_batch(events)
             state["batches_total"] += 1
             state["events_total"]  += len(events)
@@ -176,6 +228,8 @@ def run_http():
 
     divider("Zebra FX9600 — HTTP Listener")
     print(f"\n  Station: {STATION_NAME}   Reader: {READER_NAME}")
+    print(f"  Antennas: {_antenna_label(ENTRY_ANTENNA)}  |  "
+          f"{_antenna_label(EXIT_ANTENNA)}  |  {_antenna_label(THIRD_ANTENNA)}")
     print(f"  Listening on  http://{LISTENER_HOST}:{LISTENER_PORT}/tags")
     print(f"  Point the reader's HTTP POST target to:")
     print(f"  http://YOUR_PC_IP:{LISTENER_PORT}/tags")
@@ -226,6 +280,10 @@ def run_health_check() -> int:
     print(f"  Batches total       : {body.get('batches_total')}")
     print(f"  Last event (s ago)  : {body.get('last_event_seconds_ago')}")
     print(f"  DB writable         : {body.get('db_writable')}")
+    hits = body.get("antenna_hits") or {}
+    print(f"  Antenna hits        : {hits}")
+    print(f"  Ant{body.get('third_antenna', THIRD_ANTENNA)} last seen : "
+          f"{body.get('third_antenna_last_at') or 'never'}")
     print()
 
     return 0 if status == "ok" else 1
