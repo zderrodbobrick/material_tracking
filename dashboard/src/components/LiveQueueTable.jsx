@@ -100,7 +100,7 @@ export function LiveQueueTable({ sessions, onEndSession }) {
             <thead>
               <tr className="text-left bg-gray-50 dark:bg-slate-900/40
                              border-b border-gray-200 dark:border-slate-700/60">
-                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Status', 'Entered', 'Current Dwell', ''].map((h, i) => (
+                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Operator', 'Status', 'Entered', 'Current Dwell', ''].map((h, i) => (
                   <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
                                          text-gray-600 dark:text-slate-400">
                     {h}
@@ -152,6 +152,9 @@ export function LiveQueueTable({ sessions, onEndSession }) {
                   })()}
                   <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-600 dark:text-slate-400">
                     {s.station_name ?? '—'}
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-600 dark:text-slate-300">
+                    {s.operator_name ?? '—'}
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
                     <StatusBadge status={s.status} />

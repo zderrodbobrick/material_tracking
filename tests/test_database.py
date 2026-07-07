@@ -68,8 +68,8 @@ indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type
 section("1. Migration system")
 check("schema_migrations table exists", "schema_migrations" in tables)
 applied = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-check("All 6 migrations applied", len(applied) == 6, f"applied: {applied}")
-for v in range(1, 7):
+check("All 7 migrations applied", len(applied) == 7, f"applied: {applied}")
+for v in range(1, 8):
     check(f"Migration v{v} applied", v in applied)
 
 # ── 2. Core tables (9) ────────────────────────────────────────────────────────
@@ -140,6 +140,9 @@ roles = {r[0]: r[1] for r in conn.execute(
 )}
 check("Entry antenna on port 1", roles.get(1) == "Entry", str(roles))
 check("Exit antenna on port 2", roles.get(2) == "Exit", str(roles))
+
+op_count = conn.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
+check("Operators seeded from RTLS map", op_count >= 10, f"count={op_count}")
 
 # ── 8. FK integrity (full pipeline insert) ────────────────────────────────────
 

@@ -18,7 +18,11 @@ LISTENER_HOST = os.getenv("LISTENER_HOST", "0.0.0.0")
 LISTENER_PORT = int(os.getenv("LISTENER_PORT", "5000"))
 
 # ── Database ────────────────────────────────────────────────────────────────
-DB_PATH = Path(os.getenv("DB_PATH", BASE_DIR / "database" / "rfid_reads.db"))
+# Paths in DB_PATH are relative to the project root (BASE_DIR), not the
+# process cwd — so the listener (started from tracking/) and api.py share one DB.
+_raw_db = os.getenv("DB_PATH", "database/rfid_reads.db")
+_db_path = Path(_raw_db)
+DB_PATH = _db_path if _db_path.is_absolute() else BASE_DIR / _db_path
 
 # ── Antenna Configuration ───────────────────────────────────────────────────
 ENTRY_ANTENNA = int(os.getenv("ENTRY_ANTENNA", "1"))
@@ -36,7 +40,7 @@ EXIT_RSSI_MIN = int(os.getenv("EXIT_RSSI_MIN", "-65"))
 
 # Temporal filtering: require N reads within throttle window before session starts
 # Prevents stray/distant tags from creating sessions (1=disabled, 3=balanced, 5=strict)
-MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "0"))
+MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "3"))
 
 # Set to True to only process tags containing "IBUS" in their EPC value.
 # Set to False to accept all tags regardless of EPC content.
@@ -49,7 +53,7 @@ EPC_FILTER_PATTERN = os.getenv("EPC_FILTER_PATTERN", r".*IBUS.*" if CHECK_FOR_IB
 # ── Session Management ────────────────────────────────────────────────────────
 # Fast-moving tags: lower throttle for higher resolution, shorter timeouts
 RAW_THROTTLE_SEC = float(os.getenv("RAW_THROTTLE_SEC", "0.05"))     # 50ms between stored reads
-IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "5.0"))      # Idle (non-exit) before sweeper acts
+IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "60.0"))      # Idle (non-exit) before sweeper acts
 # After the last valid exit-antenna read (>= EXIT_RSSI_MIN), wait this long with no
 # new exit reads before closing. Keeps the session live while the tag passes ant 2;
 # exit_time stays the timestamp of that last valid read. Set to 0 to close immediately.
@@ -84,3 +88,37 @@ STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
 STATUS_ABANDONED = "abandoned"
 STATUS_EXIT_ONLY = "exit_only"
+
+# ── Sewio RTLS ────────────────────────────────────────────────────────────────
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+ENABLE_LIVE_INGESTION = _env_bool("ENABLE_LIVE_INGESTION", False)
+
+_sewio_host = os.getenv("SEWIO_WS_HOST", "wss://10.25.80.13").rstrip("/")
+if not _sewio_host.endswith("/sensmapserver/api"):
+    _sewio_api_base = f"{_sewio_host}/sensmapserver/api"
+else:
+    _sewio_api_base = _sewio_host
+
+SEWIO_WS_URL = os.getenv("SEWIO_WS_URL", _sewio_api_base)
+SEWIO_REST_URL = os.getenv(
+    "SEWIO_REST_URL",
+    SEWIO_WS_URL.replace("wss://", "https://").replace("ws://", "http://"),
+)
+SEWIO_API_KEY = os.getenv("SEWIO_API_KEY", "")
+SEWIO_FEED_ID = os.getenv("SEWIO_FEED_ID", "").strip()
+SEWIO_LIVE_OFFSET_HOURS = int(os.getenv("SEWIO_LIVE_OFFSET_HOURS", "0"))
+SEWIO_VERIFY_SSL = _env_bool("SEWIO_VERIFY_SSL", False)
+
+# Optional extra zone IDs for this machine's station (zone→station map is in RTLS/zoneMappings.json)
+_raw_zone_ids = os.getenv("SEWIO_STATION_ZONE_IDS", "")
+SEWIO_STATION_ZONE_IDS: set[int] = {
+    int(z.strip()) for z in _raw_zone_ids.split(",") if z.strip().isdigit()
+}
+
+RTLS_DATA_DIR = Path(os.getenv("RTLS_DATA_DIR", BASE_DIR / "RTLS"))

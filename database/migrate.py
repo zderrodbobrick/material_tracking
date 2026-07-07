@@ -287,6 +287,36 @@ def _m006_seed_reader_and_antennas(
             )
 
 
+def _m007_seed_operators(conn: sqlite3.Connection, **_) -> None:
+    """Seed operators from RTLS/operator-names.json (Sewio feed ID -> name)."""
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "RTLS" / "operator-names.json"
+    if not path.exists():
+        return
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for badge_id, name in data.items():
+        if str(badge_id).startswith("_"):
+            continue
+        exists = conn.execute(
+            "SELECT operator_id FROM operators WHERE rtls_badge_id = ?",
+            (str(badge_id),),
+        ).fetchone()
+        if exists:
+            conn.execute(
+                "UPDATE operators SET operator_name = ?, is_active = 1 WHERE rtls_badge_id = ?",
+                (name, str(badge_id)),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO operators (employee_number, operator_name, rtls_badge_id, is_active) "
+                "VALUES (?, ?, ?, 1)",
+                (str(badge_id), name, str(badge_id)),
+            )
+
+
 # ── Migration registry ────────────────────────────────────────────────────────
 
 _MIGRATIONS: list[tuple[int, str, object]] = [
@@ -296,6 +326,7 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (4, "live_view",                _m004_live_view),
     (5, "seed_stations",            _m005_seed_stations),
     (6, "seed_reader_and_antennas", _m006_seed_reader_and_antennas),
+    (7, "seed_operators",            _m007_seed_operators),
 ]
 
 

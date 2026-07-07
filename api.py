@@ -32,6 +32,8 @@ from config import (
     ENTRY_ANTENNA, EXIT_ANTENNA,
     EXIT_IDLE_TIMEOUT_SEC,
     STATUS_OPEN, STATUS_CLOSED, STATUS_ABANDONED, STATUS_EXIT_ONLY,
+    ENABLE_LIVE_INGESTION,
+    SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL,
 )
 from database.migrate import run_migrations
 
@@ -137,7 +139,31 @@ def _session_dict(r: sqlite3.Row) -> dict:
         "dwell_seconds":      dwell,
         "dwell_time_display": _dwell_display(dwell),
         "status":             r["session_status"],
+        "operator_name":      None,
     }
+
+
+def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict]:
+    if not sessions:
+        return sessions
+    ids = [s["session_id"] for s in sessions]
+    placeholders = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"""SELECT poa.session_id, o.operator_name
+            FROM part_operator_assignments poa
+            JOIN operators o ON poa.operator_id = o.operator_id
+            WHERE poa.session_id IN ({placeholders})
+            ORDER BY poa.assigned_at DESC""",
+        ids,
+    ).fetchall()
+    by_session: dict[int, str] = {}
+    for row in rows:
+        sid = row["session_id"]
+        if sid not in by_session:
+            by_session[sid] = row["operator_name"]
+    for s in sessions:
+        s["operator_name"] = by_session.get(s["session_id"])
+    return sessions
 
 
 # ── Static / root ─────────────────────────────────────────────────────────────
@@ -167,6 +193,8 @@ def index():
             "GET  /api/operators",
             "GET  /api/operators/<id>/presence",
             "GET  /api/sessions/<id>/operators",
+            "GET  /api/rtls/health",
+            "GET  /api/rtls/live",
             "POST /api/sessions/<id>/end",
         ],
     })
@@ -197,8 +225,10 @@ def live_sessions():
            ORDER BY entry_time ASC""",
         (STATUS_OPEN, STATUS_EXIT_ONLY),
     ).fetchall()
+    sessions = [_session_dict(r) for r in rows]
+    _attach_operators(db, sessions)
     db.close()
-    return jsonify([_session_dict(r) for r in rows])
+    return jsonify(sessions)
 
 
 # ── GET /api/completed  (closed sessions) ─────────────────────────────────────
@@ -214,8 +244,10 @@ def completed_sessions():
            LIMIT ?""",
         (STATUS_CLOSED, STATUS_ABANDONED, STATUS_EXIT_ONLY, limit),
     ).fetchall()
+    sessions = [_session_dict(r) for r in rows]
+    _attach_operators(db, sessions)
     db.close()
-    return jsonify([_session_dict(r) for r in rows])
+    return jsonify(sessions)
 
 
 # ── GET /api/raw-reads/recent  (antenna + role + rssi feed) ───────────────────
@@ -414,6 +446,32 @@ def list_tags():
     ).fetchall()
     db.close()
     return jsonify([dict(r) for r in rows])
+
+
+# ── Sewio RTLS endpoints ──────────────────────────────────────────────────────
+
+@app.route("/api/rtls/health")
+def rtls_health():
+    sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+    from rtls_storage import get_live_state, rest_health
+    from sewio_client import is_running
+
+    rest = rest_health(SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL)
+    live = get_live_state()
+    return jsonify({
+        "enabled":           ENABLE_LIVE_INGESTION,
+        "client_running":    is_running(),
+        "websocket_connected": live.get("connected", False),
+        "last_message_at":   live.get("last_message_at"),
+        "rest":              rest,
+    })
+
+
+@app.route("/api/rtls/live")
+def rtls_live():
+    sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+    from rtls_storage import get_live_state
+    return jsonify(get_live_state())
 
 
 # ── Operator endpoints (read only — assignment logic deferred) ────────────────
@@ -791,6 +849,16 @@ if __name__ == "__main__":
     print(f"Station:   {STATION_NAME}")
     print(f"Reader:    {READER_NAME}")
     print(f"API URL:   http://localhost:5001")
+    if ENABLE_LIVE_INGESTION:
+        print(f"RTLS:      Sewio live ingest ENABLED")
     print("=" * 50)
+
+    sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+    from rtls_storage import set_change_callback
+    from sewio_client import start as start_sewio
+
+    set_change_callback(_direct_emit)
+    start_sewio(on_log=lambda msg: print(f"  [RTLS] {msg}"))
+
     threading.Thread(target=_background_poll, daemon=True, name="db-poller").start()
     socketio.run(app, host="0.0.0.0", port=5001, debug=False, allow_unsafe_werkzeug=True)
