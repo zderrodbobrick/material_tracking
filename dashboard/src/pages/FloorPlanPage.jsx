@@ -1,12 +1,15 @@
 import { useMemo, useState } from 'react'
 import { Map as MapIcon, Radio, Users, AlertCircle } from 'lucide-react'
 import { Panel } from '../components/Panel'
+import { LiveQueueTable } from '../components/LiveQueueTable'
 import { MachineOverlay } from '../components/MachineOverlay'
 import { StationDetailModal } from '../components/StationDetailModal'
 import { useRtlsLive } from '../hooks/useRtlsLive'
 import { FLOOR_PLAN, sewioToPercentClamped } from '../utils/floorPlanCoords'
 import { MACHINES, operatorsInMachineZone } from '../utils/machineRegions'
 import floorPlanImg from '../assets/floor_plan.png'
+
+const STATION_ORDER = ['Gannomat', 'Insert Station']
 
 const MARKER_COLORS = [
   { dot: 'bg-blue-500', ring: 'ring-blue-300', glow: 'shadow-blue-400/60' },
@@ -57,7 +60,7 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
   )
 }
 
-export function FloorPlanPage({ liveSessions = [] }) {
+export function FloorPlanPage({ liveSessions = [], onEndSession }) {
   const { rtls, health, error, fetchedAt } = useRtlsLive()
   const [selectedMachine, setSelectedMachine] = useState(null)
 
@@ -70,6 +73,12 @@ export function FloorPlanPage({ liveSessions = [] }) {
     }
     return grouped
   }, [liveSessions])
+
+  const stationNames = useMemo(() => {
+    const names = new Set(STATION_ORDER)
+    for (const name of Object.keys(sessionsByStation)) names.add(name)
+    return [...names]
+  }, [sessionsByStation])
 
   const zoneByTag = useMemo(() => {
     const lookup = new Map()
@@ -235,6 +244,15 @@ export function FloorPlanPage({ liveSessions = [] }) {
           </p>
         </div>
       </Panel>
+
+      {stationNames.map(stationName => (
+        <LiveQueueTable
+          key={stationName}
+          stationName={stationName}
+          sessions={sessionsByStation[stationName] ?? []}
+          onEndSession={onEndSession}
+        />
+      ))}
 
       {selectedMachine && (
         <StationDetailModal

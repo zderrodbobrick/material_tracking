@@ -86,13 +86,13 @@ export default function App() {
         {tab === 'live' && (
           <LiveDashboard
             summary={summary}
-            liveSessions={liveSessions}
             completedSessions={completedSessions}
             recentReads={recentReads}
-            onEndSession={handleEndSession}
           />
         )}
-        {tab === 'floorplan' && <FloorPlanPage liveSessions={liveSessions} />}
+        {tab === 'floorplan' && (
+          <FloorPlanPage liveSessions={liveSessions} onEndSession={handleEndSession} />
+        )}
         {tab === 'report' && <FullReport tick={tick} />}
         {tab === 'analytics' && <AnalyticsPage tick={tick} />}
       </main>
