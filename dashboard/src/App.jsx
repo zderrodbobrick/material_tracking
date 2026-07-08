@@ -92,7 +92,7 @@ export default function App() {
             onEndSession={handleEndSession}
           />
         )}
-        {tab === 'floorplan' && <FloorPlanPage />}
+        {tab === 'floorplan' && <FloorPlanPage liveSessions={liveSessions} />}
         {tab === 'report' && <FullReport tick={tick} />}
         {tab === 'analytics' && <AnalyticsPage tick={tick} />}
       </main>

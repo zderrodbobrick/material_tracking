@@ -1,8 +1,11 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Map as MapIcon, Radio, Users, AlertCircle } from 'lucide-react'
 import { Panel } from '../components/Panel'
+import { MachineOverlay } from '../components/MachineOverlay'
+import { StationDetailModal } from '../components/StationDetailModal'
 import { useRtlsLive } from '../hooks/useRtlsLive'
 import { FLOOR_PLAN, sewioToPercentClamped } from '../utils/floorPlanCoords'
+import { MACHINES, operatorsInMachineZone } from '../utils/machineRegions'
 import floorPlanImg from '../assets/floor_plan.png'
 
 const MARKER_COLORS = [
@@ -35,7 +38,7 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
       title={title}
     >
       <span
-        className={`relative flex items-center justify-center w-6 h-6 rounded-full
+        className={`relative flex items-center justify-center w-2 h-2 rounded-full
                     ring-2 ring-white/80 shadow-[0_0_12px_rgba(255,255,255,0.45)]
                     ${colors.dot}
                     ${offMap ? 'opacity-60' : ''}`}
@@ -44,9 +47,9 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
         <span className="relative w-2.5 h-2.5 rounded-full bg-white" />
       </span>
       <span
-        className="absolute left-1/2 top-full mt-1.5 -translate-x-1/2 whitespace-nowrap
-                   px-2 py-0.5 rounded text-[10px] font-semibold tracking-tight
-                   bg-black/80 text-white shadow-md border border-white/10"
+        className="absolute left-1/2 top-full mt-0.5 -translate-x-1/2 whitespace-nowrap
+                   px-1 py-px rounded text-[7px] font-medium tracking-tight leading-none
+                   bg-black/75 text-white/90 border border-white/10"
       >
         {op.operator_name || `#${op.tag_id}`}
       </span>
@@ -54,8 +57,19 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
   )
 }
 
-export function FloorPlanPage() {
+export function FloorPlanPage({ liveSessions = [] }) {
   const { rtls, health, error, fetchedAt } = useRtlsLive()
+  const [selectedMachine, setSelectedMachine] = useState(null)
+
+  const sessionsByStation = useMemo(() => {
+    const grouped = {}
+    for (const session of liveSessions) {
+      const name = session.station_name ?? 'Unknown'
+      if (!grouped[name]) grouped[name] = []
+      grouped[name].push(session)
+    }
+    return grouped
+  }, [liveSessions])
 
   const zoneByTag = useMemo(() => {
     const lookup = new Map()
@@ -186,6 +200,20 @@ export function FloorPlanPage() {
               draggable={false}
             />
             <div className="absolute inset-0 z-10 overflow-visible rounded-lg">
+              {MACHINES.map(machine => {
+                const parts = sessionsByStation[machine.station] ?? []
+                const zoneOps = operatorsInMachineZone(rtls, machine)
+                return (
+                  <MachineOverlay
+                    key={machine.id}
+                    machine={machine}
+                    partCount={parts.length}
+                    operatorCount={zoneOps.length}
+                    isActive={selectedMachine?.id === machine.id}
+                    onClick={() => setSelectedMachine(machine)}
+                  />
+                )
+              })}
               {operators.map((op, i) => {
                 const pos = sewioToPercentClamped(op.x, op.y)
                 return (
@@ -203,10 +231,19 @@ export function FloorPlanPage() {
           </div>
 
           <p className="mt-3 text-xs text-gray-500 dark:text-slate-400 text-center">
-            Origin at white rectangle top-left · +X right · +Y down · {FLOOR_PLAN.scalePxPerM} px/m
+            Click a machine for parts &amp; operators · Origin at white rectangle top-left · {FLOOR_PLAN.scalePxPerM} px/m
           </p>
         </div>
       </Panel>
+
+      {selectedMachine && (
+        <StationDetailModal
+          machine={selectedMachine}
+          sessions={sessionsByStation[selectedMachine.station] ?? []}
+          operatorsInZone={operatorsInMachineZone(rtls, selectedMachine)}
+          onClose={() => setSelectedMachine(null)}
+        />
+      )}
 
       {operators.length > 0 && (
         <Panel title="Operators" subtitle="Current positions" icon={Users}>
