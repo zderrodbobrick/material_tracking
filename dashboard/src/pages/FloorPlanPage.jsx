@@ -30,7 +30,7 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
         left: pos.left,
         top: pos.top,
         transform: 'translate(-50%, -50%)',
-        transition: 'left 0.35s ease-out, top 0.35s ease-out',
+        transition: 'left 80ms linear, top 80ms linear',
       }}
       title={title}
     >
@@ -40,7 +40,7 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
                     ${colors.dot}
                     ${offMap ? 'opacity-60' : ''}`}
       >
-        <span className="absolute inset-0 rounded-full animate-ping opacity-50 bg-sky-400" />
+        <span className="absolute inset-0 rounded-full animate-ping opacity-30 bg-sky-400 [animation-duration:1.5s]" />
         <span className="relative w-2.5 h-2.5 rounded-full bg-white" />
       </span>
       <span

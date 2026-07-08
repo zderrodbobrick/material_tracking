@@ -2,12 +2,21 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiFetch } from '../api'
 import { getSocket } from '../lib/socket'
 
-const BACKUP_POLL_MS = 5000
+const BACKUP_POLL_MS = 1000
+
+function mergePosition(prev, position) {
+  const base = prev ?? { positions: [], connected: true, enabled: true }
+  const positions = [...(base.positions ?? [])]
+  const idx = positions.findIndex(p => p.tag_id === position.tag_id)
+  if (idx >= 0) positions[idx] = position
+  else positions.push(position)
+  return { ...base, positions }
+}
 
 /**
  * Live RTLS state for the floor plan.
- * Primary: Socket.IO `rtls_update` pushes (instant marker moves).
- * Backup: HTTP poll every 5s in case a socket event is missed.
+ * Primary: Socket.IO `rtls_position` per-tag pushes (minimal latency).
+ * Backup: full `rtls_update` + HTTP poll every 1s.
  */
 export function useRtlsLive() {
   const [rtls, setRtls] = useState(null)
@@ -19,6 +28,15 @@ export function useRtlsLive() {
   const applyLive = useCallback((res) => {
     rtlsRef.current = res
     setRtls(res)
+    setError(null)
+    setFetchedAt(new Date())
+  }, [])
+
+  const applyPosition = useCallback((position) => {
+    if (!position?.tag_id) return
+    const next = mergePosition(rtlsRef.current, position)
+    rtlsRef.current = next
+    setRtls(next)
     setError(null)
     setFetchedAt(new Date())
   }, [])
@@ -47,6 +65,12 @@ export function useRtlsLive() {
     const pollId = setInterval(fetchLive, BACKUP_POLL_MS)
 
     const sock = getSocket()
+
+    const onRtlsPosition = (data) => {
+      if (!alive || !data?.position) return
+      applyPosition(data.position)
+    }
+
     const onRtlsUpdate = (data) => {
       if (!alive || !data?.positions) return
       applyLive({
@@ -60,14 +84,16 @@ export function useRtlsLive() {
       })
     }
 
+    sock.on('rtls_position', onRtlsPosition)
     sock.on('rtls_update', onRtlsUpdate)
 
     return () => {
       alive = false
       clearInterval(pollId)
+      sock.off('rtls_position', onRtlsPosition)
       sock.off('rtls_update', onRtlsUpdate)
     }
-  }, [applyLive])
+  }, [applyLive, applyPosition])
 
   return { rtls, health, error, fetchedAt }
 }

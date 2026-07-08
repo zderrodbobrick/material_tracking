@@ -1,4 +1,4 @@
-﻿# ===================================================================
+# ===================================================================
 #  RFID Gannomat Tracking System -- Launcher
 #  Usage:  .\start.ps1
 #  Ctrl+C  stops all services cleanly

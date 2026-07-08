@@ -26,7 +26,7 @@ from config import (
 from database.migrate import run_migrations
 from rtls_lookup import operator_name, operator_names, station_for_zone, zone_label
 
-_on_change: Optional[Callable[[str], None]] = None
+_on_change: Optional[Callable[..., None]] = None
 _lock = threading.Lock()
 _sweeper_thread: Optional[threading.Thread] = None
 _sweeper_stop = threading.Event()
@@ -92,15 +92,20 @@ def _accept_position(tag_id: int, at: str | None) -> bool:
     return True
 
 
-def set_change_callback(fn: Callable[[str], None]) -> None:
+def set_change_callback(fn: Callable[..., None]) -> None:
     global _on_change
     _on_change = fn
 
 
-def _notify(action: str) -> None:
+def _notify(action: str, **extra) -> None:
     if _on_change:
         try:
-            _on_change(action)
+            _on_change(action, **extra)
+        except TypeError:
+            try:
+                _on_change(action)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -507,17 +512,18 @@ def bootstrap_positions_from_rest() -> int:
 def record_position(tag_id: int, x: float, y: float, at: str | None, **extra) -> None:
     if not _accept_position(tag_id, at):
         return
+    pos = {
+        "tag_id": tag_id,
+        "operator_name": operator_name(tag_id),
+        "x": x,
+        "y": y,
+        "at": at,
+        **{k: v for k, v in extra.items() if v is not None},
+    }
     with _lock:
         _live_state["last_message_at"] = datetime.now(timezone.utc).isoformat()
-        _live_state["positions"][tag_id] = {
-            "tag_id": tag_id,
-            "operator_name": operator_name(tag_id),
-            "x": x,
-            "y": y,
-            "at": at,
-            **{k: v for k, v in extra.items() if v is not None},
-        }
-    _notify("rtls_position")
+        _live_state["positions"][tag_id] = pos
+    _notify("rtls_position", position=pos)
 
 
 def record_zone_event(

@@ -921,20 +921,24 @@ _bg_state = {"count": -1, "last_ts": ""}
 _last_direct_emit: float = 0.0
 
 
-def _direct_emit(action: str) -> None:
+def _direct_emit(action: str, **extra) -> None:
     global _last_direct_emit
     _last_direct_emit = _time.time()
     ts = _now_utc()
     socketio.emit("rfid_update", {"ts": ts, "action": action})
     if action == "rtls_position":
-        sys.path.insert(0, str(Path(__file__).parent / "tracking"))
-        from rtls_storage import get_live_state
-        live = get_live_state()
-        socketio.emit("rtls_update", {
-            "ts": ts,
-            "connected": live.get("connected", False),
-            "positions": live.get("positions", []),
-        })
+        pos = extra.get("position")
+        if pos:
+            socketio.emit("rtls_position", {"ts": ts, "position": pos})
+        else:
+            sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+            from rtls_storage import get_live_state
+            live = get_live_state()
+            socketio.emit("rtls_update", {
+                "ts": ts,
+                "connected": live.get("connected", False),
+                "positions": live.get("positions", []),
+            })
 
 
 def _background_poll():

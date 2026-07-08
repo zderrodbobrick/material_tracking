@@ -1,19 +1,31 @@
 /**
  * Maps Sewio RTLS coordinates (meters) to floor-plan image pixels.
  *
- * Origin: Sewio (7, 2.5) → top-left corner of the white rectangle (CS Hood area).
- * +X = right, +Y = down (matches image / screen coordinates).
+ * Calibrate via VITE_FLOOR_PLAN_* in the project-root .env, then:
+ *   cd dashboard && npm run build
+ * Hard-refresh the browser (Ctrl+Shift+R).
  *
- * Tune scale via VITE_FLOOR_PLAN_SCALE if markers don't align on the grid.
+ * Formula:
+ *   pixelX = originPixelX + (sewioX - originCoordX) * scale
+ *   pixelY = originPixelY + (sewioY - originCoordY) * scale
+ *
+ * +X = right, +Y = down.
  */
+function envNum(name, fallback) {
+  const raw = import.meta.env[name]
+  if (raw === undefined || raw === '') return fallback
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
+
 export const FLOOR_PLAN = {
   imageWidth: 958,
   imageHeight: 575,
-  originCoordX: 7,
-  originCoordY: 2.5,
-  originPixelX: 131,
-  originPixelY: 81,
-  scalePxPerM: Number(import.meta.env.VITE_FLOOR_PLAN_SCALE) || 18,
+  originCoordX: envNum('VITE_FLOOR_PLAN_ORIGIN_X', 12),
+  originCoordY: envNum('VITE_FLOOR_PLAN_ORIGIN_Y', 8.5),
+  originPixelX: envNum('VITE_FLOOR_PLAN_PIXEL_X', 131),
+  originPixelY: envNum('VITE_FLOOR_PLAN_PIXEL_Y', 81),
+  scalePxPerM: envNum('VITE_FLOOR_PLAN_SCALE', 18),
 }
 
 /** Sewio meters → pixel offsets from image top-left. */
