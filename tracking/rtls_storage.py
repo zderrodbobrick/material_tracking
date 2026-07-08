@@ -91,6 +91,166 @@ def _station_id(conn: sqlite3.Connection, station_name: str) -> int | None:
     return int(row["station_id"]) if row else None
 
 
+def _assign_operator_to_session(
+    conn: sqlite3.Connection,
+    session_id: int,
+    operator_id: int,
+    method: str,
+    assigned_at: str,
+) -> bool:
+    exists = conn.execute(
+        "SELECT 1 FROM part_operator_assignments WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if exists:
+        return False
+    conn.execute(
+        """INSERT INTO part_operator_assignments
+           (session_id, operator_id, assignment_method, confidence_score, assigned_at)
+           VALUES (?, ?, ?, 1.0, ?)""",
+        (session_id, operator_id, method, assigned_at),
+    )
+    return True
+
+
+def _upsert_current_zone(
+    conn: sqlite3.Connection,
+    operator_id: int,
+    zone_id: int,
+    station_name: str | None,
+    status: str,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO operator_current_zone
+           (operator_id, zone_id, station_name, zone_name, status, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(operator_id) DO UPDATE SET
+             zone_id = excluded.zone_id,
+             station_name = excluded.station_name,
+             zone_name = excluded.zone_name,
+             status = excluded.status,
+             updated_at = excluded.updated_at""",
+        (
+            operator_id,
+            zone_id,
+            station_name,
+            zone_label(zone_id),
+            status,
+            updated_at,
+        ),
+    )
+
+
+def find_operator_at_station(conn: sqlite3.Connection, station_id: int) -> int | None:
+    row = conn.execute(
+        """SELECT ocz.operator_id
+           FROM operator_current_zone ocz
+           JOIN stations s ON s.station_id = ?
+           WHERE ocz.status = 'in'
+             AND ocz.station_name = s.station_name
+           ORDER BY ocz.updated_at DESC
+           LIMIT 1""",
+        (station_id,),
+    ).fetchone()
+    return int(row["operator_id"]) if row else None
+
+
+def try_assign_on_session_open(session_id: int, station_id: int) -> bool:
+    """Link a newly opened part session to the operator currently at that station."""
+    conn = _conn()
+    try:
+        op_id = find_operator_at_station(conn, station_id)
+        if not op_id:
+            return False
+        assigned_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        assigned = _assign_operator_to_session(
+            conn, session_id, op_id, "session_open", assigned_at
+        )
+        conn.commit()
+        if assigned:
+            _notify("rtls_assignment")
+        return assigned
+    finally:
+        conn.close()
+
+
+def bootstrap_current_zones_from_rest() -> int:
+    """Seed operator_current_zone from Sewio REST (same source as rtls_viewer)."""
+    import httpx
+    from config import SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL
+
+    if not SEWIO_API_KEY:
+        return 0
+
+    try:
+        resp = httpx.get(
+            f"{SEWIO_REST_URL.rstrip('/')}/zones",
+            headers={"X-ApiKey": SEWIO_API_KEY, "Accept": "application/json"},
+            verify=SEWIO_VERIFY_SSL,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return 0
+        body = resp.json()
+        zones = body if isinstance(body, list) else body.get("results", [])
+    except Exception:
+        return 0
+
+    latest: dict[int, tuple[str, int, str, str]] = {}
+    for zone in zones:
+        try:
+            zid = int(zone["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        station_name = station_for_zone(zid)
+        zname = zone.get("name") or zone_label(zid)
+        for tag in zone.get("tags") or []:
+            if tag.get("status") != "in":
+                continue
+            try:
+                tid = int(tag["id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            at = str(tag.get("at") or datetime.now(timezone.utc).isoformat())
+            op_id = None
+            conn_probe = _conn()
+            try:
+                op_id = _operator_id(conn_probe, tid)
+            finally:
+                conn_probe.close()
+            if not op_id:
+                continue
+            if op_id not in latest or at > latest[op_id][0]:
+                latest[op_id] = (at, zid, station_name, zname)
+
+    if not latest:
+        return 0
+
+    conn = _conn()
+    count = 0
+    try:
+        for op_id, (at, zid, station_name, zname) in latest.items():
+            detected_at = _parse_sewio_ts(at)
+            conn.execute(
+                """INSERT INTO operator_current_zone
+                   (operator_id, zone_id, station_name, zone_name, status, updated_at)
+                   VALUES (?, ?, ?, ?, 'in', ?)
+                   ON CONFLICT(operator_id) DO UPDATE SET
+                     zone_id = excluded.zone_id,
+                     station_name = excluded.station_name,
+                     zone_name = excluded.zone_name,
+                     status = excluded.status,
+                     updated_at = excluded.updated_at""",
+                (op_id, zid, station_name, zname, detected_at),
+            )
+            count += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return count
+
+
 def record_position(tag_id: int, x: float, y: float, at: str | None, **extra) -> None:
     with _lock:
         _live_state["last_message_at"] = datetime.now(timezone.utc).isoformat()
@@ -142,7 +302,13 @@ def record_zone_event(
     conn = _conn()
     try:
         op_id = _operator_id(conn, tag_id)
-        st_id = _station_id(conn, station_name)
+        st_id = _station_id(conn, station_name) if station_name else None
+
+        if op_id:
+            _upsert_current_zone(
+                conn, op_id, zone_id, station_name, status, detected_at
+            )
+
         if op_id and st_id and status == "in":
             conn.execute(
                 """INSERT INTO operator_station_presence
@@ -151,7 +317,6 @@ def record_zone_event(
                 (op_id, st_id, detected_at, 1.0),
             )
 
-            # Assign operator to open sessions at this station without an assignment yet
             open_rows = conn.execute(
                 """SELECT s.session_id
                    FROM part_station_sessions s
@@ -164,13 +329,10 @@ def record_zone_event(
             ).fetchall()
 
             for row in open_rows:
-                conn.execute(
-                    """INSERT INTO part_operator_assignments
-                       (session_id, operator_id, assignment_method, confidence_score, assigned_at)
-                       VALUES (?, ?, 'rtls_zone', 1.0, ?)""",
-                    (row["session_id"], op_id, detected_at),
-                )
-                summary["assigned_sessions"] += 1
+                if _assign_operator_to_session(
+                    conn, row["session_id"], op_id, "rtls_zone", detected_at
+                ):
+                    summary["assigned_sessions"] += 1
 
         conn.commit()
     finally:

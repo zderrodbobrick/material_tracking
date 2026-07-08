@@ -28,7 +28,8 @@ DB_PATH = _db_path if _db_path.is_absolute() else BASE_DIR / _db_path
 ENTRY_ANTENNA = int(os.getenv("ENTRY_ANTENNA", "1"))
 EXIT_ANTENNA = int(os.getenv("EXIT_ANTENNA", "2"))
 THIRD_ANTENNA = int(os.getenv("THIRD_ANTENNA", "3"))
-THIRD_ANTENNA_NAME = os.getenv("THIRD_ANTENNA_NAME", "Third")
+THIRD_ANTENNA_NAME = os.getenv("THIRD_ANTENNA_NAME", "Insert Station")
+INSERT_STATION_NAME = os.getenv("INSERT_STATION_NAME", "Insert Station")
 
 # ── RSSI Filter ───────────────────────────────────────────────────────────────
 # Valid reads must satisfy: RSSI_MIN <= rssi <= 0
@@ -56,10 +57,9 @@ EPC_FILTER_PATTERN = os.getenv("EPC_FILTER_PATTERN", r".*IBUS.*" if CHECK_FOR_IB
 # Fast-moving tags: lower throttle for higher resolution, shorter timeouts
 RAW_THROTTLE_SEC = float(os.getenv("RAW_THROTTLE_SEC", "0.05"))     # 50ms between stored reads
 IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "60.0"))      # Idle (non-exit) before sweeper acts
-# After the last valid exit-antenna read (>= EXIT_RSSI_MIN), wait this long with no
-# new exit reads before closing. Keeps the session live while the tag passes ant 2;
-# exit_time stays the timestamp of that last valid read. Set to 0 to close immediately.
-EXIT_IDLE_TIMEOUT_SEC = float(os.getenv("EXIT_IDLE_TIMEOUT_SEC", "5.0"))
+# Deprecated: Gannomat sessions no longer auto-close after the last exit read.
+# They stay open until antenna 3 (Insert Station entry) confirms the 1→2→3 path.
+EXIT_IDLE_TIMEOUT_SEC = float(os.getenv("EXIT_IDLE_TIMEOUT_SEC", "0"))
 ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h — keep alive until antenna 2
 SWEEP_INTERVAL_SEC = float(os.getenv("SWEEP_INTERVAL_SEC", "1.0"))  # Check every second
 
@@ -114,6 +114,7 @@ SEWIO_REST_URL = os.getenv(
 )
 SEWIO_API_KEY = os.getenv("SEWIO_API_KEY", "")
 SEWIO_FEED_ID = os.getenv("SEWIO_FEED_ID", "").strip()
+RTLS_TEST_FEED_ID = os.getenv("RTLS_TEST_FEED_ID", "35").strip()
 SEWIO_LIVE_OFFSET_HOURS = int(os.getenv("SEWIO_LIVE_OFFSET_HOURS", "0"))
 SEWIO_VERIFY_SSL = _env_bool("SEWIO_VERIFY_SSL", False)
 

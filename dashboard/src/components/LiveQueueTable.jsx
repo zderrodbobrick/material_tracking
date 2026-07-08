@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { Search, Filter, Radio } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
+import { OperatorCell } from './OperatorCell'
 import { DwellTimer } from './DwellTimer'
 import { parseEpc } from '../utils/parseEpc'
 
@@ -18,13 +19,15 @@ function formatTime(isoStr) {
   }
 }
 
-export function LiveQueueTable({ sessions, onEndSession }) {
+export function LiveQueueTable({ sessions, onEndSession, stationName = 'All Stations', title }) {
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('ALL')
 
+  const displayTitle = title ?? `Live ${stationName} Queue`
+
   const filtered = useMemo(() => {
     return sessions.filter(s => {
-      const hay = `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''}`.toLowerCase()
+      const hay = `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''} ${s.operator_name ?? ''}`.toLowerCase()
       if (search && !hay.includes(search.toLowerCase())) return false
       if (statusFilter !== 'ALL' && s.status !== statusFilter) return false
       return true
@@ -49,10 +52,10 @@ export function LiveQueueTable({ sessions, onEndSession }) {
               <span className="absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75 animate-ping" />
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500" />
             </span>
-            Live Gannomat Queue
+            {displayTitle}
           </h2>
           <p className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">
-            {sessions.length} active session{sessions.length !== 1 ? 's' : ''} — sorted oldest first
+            {sessions.length} active session{sessions.length !== 1 ? 's' : ''} at {stationName}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -153,8 +156,8 @@ export function LiveQueueTable({ sessions, onEndSession }) {
                   <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-600 dark:text-slate-400">
                     {s.station_name ?? '—'}
                   </td>
-                  <td className="px-4 py-3 whitespace-nowrap text-xs text-gray-600 dark:text-slate-300">
-                    {s.operator_name ?? '—'}
+                  <td className="px-4 py-3 whitespace-nowrap text-xs">
+                    <OperatorCell session={s} />
                   </td>
                   <td className="px-4 py-3 whitespace-nowrap">
                     <StatusBadge status={s.status} />

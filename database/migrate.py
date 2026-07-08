@@ -317,6 +317,64 @@ def _m007_seed_operators(conn: sqlite3.Connection, **_) -> None:
             )
 
 
+def _m008_seed_insert_antenna(
+    conn: sqlite3.Connection,
+    reader_name: str = "FX9600-Gannomat",
+    third_antenna: int = 3,
+    insert_station_name: str = "Insert Station",
+    **_,
+) -> None:
+    """Seed antenna 3 on the Gannomat reader as Insert Station entry."""
+    conn.execute(
+        "INSERT OR IGNORE INTO stations (station_name, station_type) VALUES (?, ?)",
+        (insert_station_name, "Assembly"),
+    )
+    row = conn.execute(
+        "SELECT station_id FROM stations WHERE station_name = ?", (insert_station_name,)
+    ).fetchone()
+    if not row:
+        return
+    insert_station_id = row[0]
+
+    reader = conn.execute(
+        "SELECT reader_id FROM rfid_readers WHERE reader_name = ?", (reader_name,)
+    ).fetchone()
+    if not reader:
+        return
+    reader_id = reader[0]
+
+    exists = conn.execute(
+        "SELECT antenna_id FROM rfid_antennas WHERE reader_id = ? AND antenna_port = ?",
+        (reader_id, third_antenna),
+    ).fetchone()
+    if not exists:
+        conn.execute(
+            "INSERT INTO rfid_antennas (reader_id, antenna_port, antenna_name, antenna_role, station_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                reader_id,
+                third_antenna,
+                f"{insert_station_name} Entry Antenna",
+                "Entry",
+                insert_station_id,
+            ),
+        )
+
+
+def _m009_operator_current_zone(conn: sqlite3.Connection, **_) -> None:
+    """Track each operator's latest zone in/out for session assignment."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS operator_current_zone (
+            operator_id   INTEGER PRIMARY KEY REFERENCES operators(operator_id),
+            zone_id       INTEGER NOT NULL,
+            station_name  TEXT,
+            zone_name     TEXT,
+            status        TEXT NOT NULL CHECK (status IN ('in', 'out')),
+            updated_at    TEXT NOT NULL
+        )
+    """)
+
+
 # ── Migration registry ────────────────────────────────────────────────────────
 
 _MIGRATIONS: list[tuple[int, str, object]] = [
@@ -327,6 +385,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (5, "seed_stations",            _m005_seed_stations),
     (6, "seed_reader_and_antennas", _m006_seed_reader_and_antennas),
     (7, "seed_operators",            _m007_seed_operators),
+    (8, "seed_insert_antenna",      _m008_seed_insert_antenna),
+    (9, "operator_current_zone",    _m009_operator_current_zone),
 ]
 
 
@@ -341,6 +401,8 @@ def run_migrations(
     reader_ip: str = "",
     entry_antenna: int = 1,
     exit_antenna: int = 2,
+    third_antenna: int = 3,
+    insert_station_name: str = "Insert Station",
 ) -> None:
     """
     Run all pending migrations against `conn` in order.
@@ -364,6 +426,8 @@ def run_migrations(
         "reader_ip":        reader_ip,
         "entry_antenna":    entry_antenna,
         "exit_antenna":     exit_antenna,
+        "third_antenna":    third_antenna,
+        "insert_station_name": insert_station_name,
     }
 
     for version, name, fn in _MIGRATIONS:

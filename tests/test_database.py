@@ -68,8 +68,8 @@ indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type
 section("1. Migration system")
 check("schema_migrations table exists", "schema_migrations" in tables)
 applied = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-check("All 7 migrations applied", len(applied) == 7, f"applied: {applied}")
-for v in range(1, 8):
+check("All 9 migrations applied", len(applied) == 9, f"applied: {applied}")
+for v in range(1, 10):
     check(f"Migration v{v} applied", v in applied)
 
 # ── 2. Core tables (9) ────────────────────────────────────────────────────────
@@ -106,6 +106,8 @@ for c in ("entry_time", "exit_time", "dwell_seconds", "session_status",
     check(f"part_station_sessions.{c}", c in cols(conn, "part_station_sessions"))
 for c in ("employee_number", "operator_name", "rtls_badge_id", "is_active"):
     check(f"operators.{c}", c in cols(conn, "operators"))
+for c in ("zone_id", "station_name", "zone_name", "status", "updated_at"):
+    check(f"operator_current_zone.{c}", c in cols(conn, "operator_current_zone"))
 
 # ── 5. View ───────────────────────────────────────────────────────────────────
 
@@ -140,6 +142,14 @@ roles = {r[0]: r[1] for r in conn.execute(
 )}
 check("Entry antenna on port 1", roles.get(1) == "Entry", str(roles))
 check("Exit antenna on port 2", roles.get(2) == "Exit", str(roles))
+check("Insert entry antenna on port 3", roles.get(3) == "Entry", str(roles))
+
+insert_ant = conn.execute(
+    "SELECT a.station_id, s.station_name FROM rfid_antennas a "
+    "JOIN stations s ON a.station_id = s.station_id "
+    "WHERE a.antenna_port = 3"
+).fetchone()
+check("Antenna 3 bound to Insert Station", insert_ant is not None and insert_ant[1] == "Insert Station", str(insert_ant))
 
 op_count = conn.execute("SELECT COUNT(*) FROM operators").fetchone()[0]
 check("Operators seeded from RTLS map", op_count >= 10, f"count={op_count}")

@@ -14,14 +14,14 @@ Antenna role (Entry / Exit) is resolved per-station from rfid_antennas, so
 
 Session lifecycle
 -----------------
-  open      : first valid Entry read (after MIN_READS_FOR_SESSION threshold)
-  closed    : last valid Exit read on antenna 2 after idle -> dwell = exit_time - entry_time
-  abandoned : Entry seen but no Exit within ABANDON_TIMEOUT_SEC
+  open      : first valid Entry read at antenna 1 (after MIN_READS_FOR_SESSION threshold)
+  closed    : antenna 3 (Insert Station entry) after a valid 1→2→3 path; dwell = ant2 exit - ant1 entry
+  abandoned : Entry seen but no Exit within ABANDON_TIMEOUT_SEC, or exit seen but no ant 3 in time
   exit_only : Exit read with no prior Entry
 
-Exit time is the timestamp of the last valid read at the Exit antenna (antenna 2, rssi >= EXIT_RSSI_MIN).
-Weaker exit reads are stored in rfid_raw_reads but ignored for session close.
-After EXIT_IDLE_TIMEOUT_SEC with no new valid exit reads, the sweeper closes (exit_time = last valid read).
+Valid path is antenna 1 → 2 → 3. A direct 1 → 3 skip is ignored.
+After antenna 2, the Gannomat session stays open (no exit-idle timeout) until antenna 3
+confirms arrival at Insert Station.
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database.migrate import run_migrations
 from epc_type_map import format_tag_id, parse_tag_id
+from rtls_storage import try_assign_on_session_open
 from config import (
     RSSI_MIN,
     EXIT_RSSI_MIN,
@@ -63,6 +64,8 @@ from config import (
     READER_IP,
     ENTRY_ANTENNA,
     EXIT_ANTENNA,
+    THIRD_ANTENNA,
+    INSERT_STATION_NAME,
 )
 
 _DEFAULT_DB = DB_PATH
@@ -130,22 +133,24 @@ def _epc_matches_filter(epc: str) -> bool:
 # ── Open session in-memory state ──────────────────────────────────────────────
 
 class _Session:
-    """Tracks an open part_station_sessions row for one tag at this station."""
+    """Tracks an open part_station_sessions row for one tag at one station."""
     __slots__ = (
-        "session_id", "tag_id", "part_id", "epc",
+        "session_id", "tag_id", "part_id", "epc", "station_id",
         "entry_ts", "exit_ts", "exit_rssi", "last_seen_wall",
-        "last_exit_wall", "has_exit",
+        "last_exit_wall", "has_exit", "awaiting_insert",
     )
 
-    def __init__(self, session_id, tag_id, part_id, epc, entry_ts):
+    def __init__(self, session_id, tag_id, part_id, epc, station_id, entry_ts):
         self.session_id = session_id
         self.tag_id = tag_id
         self.part_id = part_id
         self.epc = epc
+        self.station_id = station_id
         self.entry_ts: Optional[datetime] = entry_ts
         self.exit_ts: Optional[datetime] = None
         self.exit_rssi: Optional[int] = None
         self.has_exit = False
+        self.awaiting_insert = False
         self.last_seen_wall = datetime.now(timezone.utc)
         self.last_exit_wall: Optional[datetime] = None
 
@@ -183,14 +188,18 @@ class DwellTracker:
             reader_ip=reader_ip,
             entry_antenna=ENTRY_ANTENNA,
             exit_antenna=EXIT_ANTENNA,
+            third_antenna=THIRD_ANTENNA,
+            insert_station_name=INSERT_STATION_NAME,
         )
 
         # Resolve this machine's station + reader + antenna roles
         self._station_id = self._lookup_station(station_name)
+        self._insert_station_id = self._lookup_station(INSERT_STATION_NAME)
         self._reader_id = self._lookup_reader(reader_name)
         self._antenna_roles = self._load_antenna_roles(self._reader_id)  # port -> (id, role)
 
-        self._open: dict[str, _Session] = {}       # epc -> _Session
+        self._open: dict[str, _Session] = {}        # epc -> Gannomat session
+        self._insert_open: dict[str, _Session] = {}   # epc -> Insert Station session
         self._last_raw: dict[tuple[str, int], float] = {}
         self._read_counts: dict[tuple[str, int], int] = {}
 
@@ -281,21 +290,38 @@ class DwellTracker:
     # ── recovery ──────────────────────────────────────────────────────────
 
     def _recover_open_sessions(self) -> None:
+        station_ids = [
+            sid for sid in (self._station_id, self._insert_station_id) if sid is not None
+        ]
+        if not station_ids:
+            return
+
+        placeholders = ",".join("?" * len(station_ids))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT s.session_id, s.tag_id, s.part_id, t.epc, "
-                "       s.entry_time, s.exit_time, s.session_status "
-                "FROM part_station_sessions s "
-                "JOIN rfid_tags t ON s.tag_id = t.tag_id "
-                "WHERE s.station_id = ? AND s.session_status IN (?, ?)",
-                (self._station_id, STATUS_OPEN, STATUS_EXIT_ONLY),
+                f"SELECT s.session_id, s.tag_id, s.part_id, t.epc, s.station_id, "
+                f"       s.entry_time, s.exit_time, s.session_status "
+                f"FROM part_station_sessions s "
+                f"JOIN rfid_tags t ON s.tag_id = t.tag_id "
+                f"WHERE s.station_id IN ({placeholders}) "
+                f"AND s.session_status IN (?, ?)",
+                (*station_ids, STATUS_OPEN, STATUS_EXIT_ONLY),
             ).fetchall()
 
-        for sid, tag_id, part_id, epc, entry_time, exit_time, status in rows:
-            sess = _Session(sid, tag_id, part_id, epc, _parse_ts(entry_time) if entry_time else None)
+        for sid, tag_id, part_id, epc, station_id, entry_time, exit_time, status in rows:
+            sess = _Session(
+                sid, tag_id, part_id, epc, station_id,
+                _parse_ts(entry_time) if entry_time else None,
+            )
             sess.exit_ts = _parse_ts(exit_time) if exit_time else None
             sess.has_exit = sess.exit_ts is not None
-            self._open[epc] = sess
+            sess.awaiting_insert = (
+                station_id == self._station_id and sess.has_exit
+            )
+            if station_id == self._insert_station_id:
+                self._insert_open[epc] = sess
+            else:
+                self._open[epc] = sess
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -403,11 +429,15 @@ class DwellTracker:
                     summary["raw_throttled"] += 1
                     self._read_counts[key] = self._read_counts.get(key, 0) + 1
 
-                # ── 4. event + session logic (role-based) ──────────────
-                if role == "Entry":
+                # ── 4. event + session logic (port-based) ──────────────
+                if antenna_port == ENTRY_ANTENNA:
                     self._handle_entry(epc, tag_id, part_id, reader_dt, reader_iso, key, summary)
-                elif role == "Exit":
+                elif antenna_port == EXIT_ANTENNA:
                     self._handle_exit(epc, tag_id, part_id, reader_dt, rssi, summary)
+                elif antenna_port == THIRD_ANTENNA:
+                    self._handle_insert_entry(
+                        epc, tag_id, part_id, reader_dt, reader_iso, key, summary
+                    )
 
         return summary
 
@@ -416,37 +446,42 @@ class DwellTracker:
     def _handle_entry(self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary):
         sess = self._open.get(epc)
         if sess is not None and not self._session_still_open(sess.session_id):
-            self._drop_stale_open(epc)
+            self._drop_stale_open(epc, self._open)
             sess = None
 
         # A new entry after a completed pass -> close the stale one first
         if sess is not None and sess.has_exit:
-            self._finalize(sess, STATUS_CLOSED)
+            self._finalize(sess, STATUS_CLOSED, self._open)
             summary["session_closed"] += 1
             sess = None
 
         if sess is None:
             if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
                 return
-            event_id = self._insert_event(part_id, tag_id, ENTER_EVENT, reader_iso)
+            event_id = self._insert_event(
+                part_id, tag_id, ENTER_EVENT, reader_iso, self._station_id
+            )
             cur = self._conn.execute(
                 "INSERT INTO part_station_sessions "
                 "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (part_id, tag_id, self._station_id, event_id, reader_iso, STATUS_OPEN),
             )
-            new_sess = _Session(cur.lastrowid, tag_id, part_id, epc, reader_dt)
+            new_sess = _Session(
+                cur.lastrowid, tag_id, part_id, epc, self._station_id, reader_dt
+            )
             self._open[epc] = new_sess
             summary["session_opened"] += 1
+            try_assign_on_session_open(new_sess.session_id, self._station_id)
         else:
             sess.last_seen_wall = datetime.now(timezone.utc)
             self._touch_session(sess.session_id)
 
     def _handle_exit(self, epc, tag_id, part_id, reader_dt, rssi, summary):
-        """Exit time = last valid read at the exit antenna (rssi >= EXIT_RSSI_MIN)."""
+        """Exit time = last valid read at antenna 2. Session stays open until antenna 3."""
         sess = self._open.get(epc)
         if sess is not None and not self._session_still_open(sess.session_id):
-            self._drop_stale_open(epc)
+            self._drop_stale_open(epc, self._open)
             sess = None
         if sess is None:
             return
@@ -458,6 +493,7 @@ class DwellTracker:
         now = datetime.now(timezone.utc)
         sess.last_seen_wall = now
         sess.has_exit = True
+        sess.awaiting_insert = True
         sess.last_exit_wall = now
 
         # Last valid exit read wins (reader time, then stronger RSSI on tie).
@@ -468,19 +504,75 @@ class DwellTracker:
         ):
             sess.exit_ts = reader_dt
             sess.exit_rssi = rssi
+            self._persist_exit_progress(sess)
 
         self._touch_session(sess.session_id)
 
+    def _handle_insert_entry(self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary):
+        """Antenna 3 opens Insert Station only after a valid 1→2→3 path."""
+        gannomat = self._open.get(epc)
+        if gannomat is not None and not self._session_still_open(gannomat.session_id):
+            self._drop_stale_open(epc, self._open)
+            gannomat = None
+
+        # Must have passed antenna 2 first — direct 1→3 is invalid.
+        if gannomat is None or not gannomat.has_exit:
+            return
+
+        if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
+            return
+
+        self._finalize(gannomat, STATUS_CLOSED, self._open)
+        summary["session_closed"] += 1
+
+        insert_sess = self._insert_open.get(epc)
+        if insert_sess is not None and not self._session_still_open(insert_sess.session_id):
+            self._drop_stale_open(epc, self._insert_open)
+            insert_sess = None
+
+        if insert_sess is None and self._insert_station_id is not None:
+            event_id = self._insert_event(
+                part_id, tag_id, ENTER_EVENT, reader_iso, self._insert_station_id
+            )
+            cur = self._conn.execute(
+                "INSERT INTO part_station_sessions "
+                "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    part_id, tag_id, self._insert_station_id,
+                    event_id, reader_iso, STATUS_OPEN,
+                ),
+            )
+            new_sess = _Session(
+                cur.lastrowid, tag_id, part_id, epc, self._insert_station_id, reader_dt
+            )
+            self._insert_open[epc] = new_sess
+            summary["session_opened"] += 1
+            try_assign_on_session_open(new_sess.session_id, self._insert_station_id)
+        elif insert_sess is not None:
+            insert_sess.last_seen_wall = datetime.now(timezone.utc)
+            self._touch_session(insert_sess.session_id)
+
     # ── DB write helpers ──────────────────────────────────────────────────
 
-    def _insert_event(self, part_id, tag_id, event_type, event_iso) -> int:
+    def _insert_event(self, part_id, tag_id, event_type, event_iso, station_id) -> int:
         cur = self._conn.execute(
             "INSERT INTO part_station_events "
             "(part_id, tag_id, station_id, event_type, event_time) "
             "VALUES (?, ?, ?, ?, ?)",
-            (part_id, tag_id, self._station_id, event_type, event_iso),
+            (part_id, tag_id, station_id, event_type, event_iso),
         )
         return cur.lastrowid
+
+    def _persist_exit_progress(self, sess: _Session) -> None:
+        """Write antenna-2 exit time while the Gannomat session waits for antenna 3."""
+        if sess.exit_ts is None:
+            return
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "UPDATE part_station_sessions SET exit_time = ?, updated_at = ? WHERE session_id = ?",
+            (sess.exit_ts.isoformat(), now_iso, sess.session_id),
+        )
 
     def _touch_session(self, session_id: int) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -497,13 +589,13 @@ class DwellTracker:
         ).fetchone()
         return row is not None and row[0] in (STATUS_OPEN, STATUS_EXIT_ONLY)
 
-    def _drop_stale_open(self, epc: str) -> None:
+    def _drop_stale_open(self, epc: str, bucket: dict[str, _Session]) -> None:
         """Forget an in-memory session that was closed externally (e.g. manual end via API)."""
-        self._open.pop(epc, None)
+        bucket.pop(epc, None)
 
     def open_session_count(self) -> int:
         with self._lock:
-            return len(self._open)
+            return len(self._open) + len(self._insert_open)
 
     def close(self) -> None:
         self._stop_evt.set()
@@ -532,32 +624,43 @@ class DwellTracker:
             for epc in list(self._open.keys()):
                 sess = self._open[epc]
                 if not self._session_still_open(sess.session_id):
-                    self._drop_stale_open(epc)
-                    continue
-
-                if sess.has_exit:
-                    ref = sess.last_exit_wall or sess.last_seen_wall
-                    idle = (now - ref).total_seconds()
-                    if idle >= self._exit_idle_timeout():
-                        self._finalize(sess, STATUS_CLOSED)
+                    self._drop_stale_open(epc, self._open)
                     continue
 
                 idle = (now - sess.last_seen_wall).total_seconds()
+
+                # Passed antenna 2 — wait for antenna 3 instead of exit-idle timeout.
+                if sess.awaiting_insert:
+                    if idle >= ABANDON_TIMEOUT_SEC:
+                        self._finalize(sess, STATUS_ABANDONED, self._open)
+                    continue
+
                 if sess.entry_ts is None:
                     if idle >= IDLE_TIMEOUT_SEC:
-                        self._finalize(sess, STATUS_EXIT_ONLY)
+                        self._finalize(sess, STATUS_EXIT_ONLY, self._open)
                 elif idle >= ABANDON_TIMEOUT_SEC:
-                    self._finalize(sess, STATUS_ABANDONED)
+                    self._finalize(sess, STATUS_ABANDONED, self._open)
+
+            for epc in list(self._insert_open.keys()):
+                sess = self._insert_open[epc]
+                if not self._session_still_open(sess.session_id):
+                    self._drop_stale_open(epc, self._insert_open)
+                    continue
+                idle = (now - sess.last_seen_wall).total_seconds()
+                if idle >= ABANDON_TIMEOUT_SEC:
+                    self._finalize(sess, STATUS_ABANDONED, self._insert_open)
 
     # ── finalize ──────────────────────────────────────────────────────────
 
-    def _finalize(self, sess: _Session, status: str) -> None:
-        """Close a session. Exit time/dwell come from the last exit-antenna read."""
+    def _finalize(self, sess: _Session, status: str, bucket: dict[str, _Session]) -> None:
+        """Close a session. Gannomat dwell uses antenna-2 exit minus antenna-1 entry."""
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if sess.has_exit and sess.exit_ts is not None:
             exit_iso = sess.exit_ts.isoformat()
-            event_id = self._insert_event(sess.part_id, sess.tag_id, EXIT_EVENT, exit_iso)
+            event_id = self._insert_event(
+                sess.part_id, sess.tag_id, EXIT_EVENT, exit_iso, sess.station_id
+            )
             if sess.entry_ts is not None:
                 dwell = int(round((sess.exit_ts - sess.entry_ts).total_seconds()))
                 final_status = STATUS_CLOSED
@@ -577,4 +680,4 @@ class DwellTracker:
                 "SET session_status = ?, updated_at = ? WHERE session_id = ?",
                 (status, now_iso, sess.session_id),
             )
-        self._open.pop(sess.epc, None)
+        bucket.pop(sess.epc, None)

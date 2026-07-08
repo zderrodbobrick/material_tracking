@@ -80,9 +80,29 @@ if (Wait-ForPort 5000 -Attempts 10) {
 }
 
 # ── Detect local IP for the reader config hint ───────────────────────
-$myIp = (Get-NetIPAddress -AddressFamily IPv4 |
-    Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet' } |
-    Select-Object -First 1).IPAddress
+# Prefer plant LAN (10.25.*) over link-local 169.254.* addresses.
+$myIp = (
+    Get-NetIPAddress -AddressFamily IPv4 |
+    Where-Object {
+        $_.IPAddress -notmatch '^127\.' -and
+        $_.IPAddress -notmatch '^169\.254\.' -and
+        $_.InterfaceAlias -notmatch 'Loopback|vEthernet'
+    } |
+    Sort-Object @{
+        Expression = {
+            if ($_.IPAddress -like '10.25.*') { 0 }
+            elseif ($_.IPAddress -like '10.*') { 1 }
+            else { 2 }
+        }
+    }, @{ Expression = 'IPAddress' } |
+    Select-Object -First 1
+).IPAddress
+
+if (-not $myIp) {
+    $myIp = (Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object { $_.IPAddress -notmatch '^127\.' } |
+        Select-Object -First 1).IPAddress
+}
 
 # ── Ready banner ─────────────────────────────────────────────────────
 Write-Host ""

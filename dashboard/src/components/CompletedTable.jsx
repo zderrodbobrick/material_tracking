@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { Search, CheckCircle } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
+import { OperatorCell } from './OperatorCell'
 import { formatDwell } from './DwellTimer'
 import { parseEpc } from '../utils/parseEpc'
 
@@ -25,7 +26,7 @@ export function CompletedTable({ sessions }) {
     if (!search) return sessions
     const q = search.toLowerCase()
     return sessions.filter(s =>
-      `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''}`.toLowerCase().includes(q)
+      `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''} ${s.operator_name ?? ''}`.toLowerCase().includes(q)
     )
   }, [sessions, search])
 
@@ -69,7 +70,7 @@ export function CompletedTable({ sessions }) {
             <thead>
               <tr className="text-left bg-gray-50 dark:bg-slate-900/40
                              border-b border-gray-200 dark:border-slate-700/60">
-                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Status', 'Entered', 'Exit', 'Dwell'].map((h, i) => (
+                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Operator', 'Status', 'Entered', 'Exit', 'Dwell'].map((h, i) => (
                   <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
                                          text-gray-600 dark:text-slate-400">
                     {h}
@@ -118,6 +119,9 @@ export function CompletedTable({ sessions }) {
                   })()}
                   <td className="px-4 py-2.5 whitespace-nowrap text-xs text-gray-600 dark:text-slate-400">
                     {s.station_name ?? '—'}
+                  </td>
+                  <td className="px-4 py-2.5 whitespace-nowrap text-xs">
+                    <OperatorCell session={s} />
                   </td>
                   <td className="px-4 py-2.5 whitespace-nowrap">
                     <StatusBadge status={s.status} />

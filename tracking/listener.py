@@ -128,13 +128,54 @@ def _print_reads(grouped: dict, stamp: str) -> None:
         suffix = f"  (x{g['count']})" if g["count"] > 1 else ""
         print(
             f"[{stamp}] {_tag_detail(epc_readable)}  "
-            f"{_antenna_label(antenna)}  RSSI:{g['best_rssi']}dBm{suffix}"
+            f"{_antenna_label(antenna)}  RSSI:{g['best_rssi']}dBm{suffix}",
+            flush=True,
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MODE 1 — HTTP POST listener (reader pushes events to us)
-# ══════════════════════════════════════════════════════════════════════════════
+def _summarize_batch(events: list) -> dict:
+    """Count raw antennas/RSSI in a batch before display filters."""
+    summary = {"total": 0, "antennas": {}}
+    for ev in events or []:
+        if not isinstance(ev, dict):
+            continue
+        d = ev.get("data") or ev
+        summary["total"] += 1
+        try:
+            antenna = int(d.get("antenna") or 0)
+        except (TypeError, ValueError):
+            antenna = 0
+        if antenna:
+            summary["antennas"][antenna] = summary["antennas"].get(antenna, 0) + 1
+    return summary
+
+
+def _local_post_urls() -> list[str]:
+    """Best-guess URLs the FX9600 reader should POST to."""
+    import socket
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(ip: str) -> None:
+        if ip and ip not in seen and not ip.startswith("127."):
+            seen.add(ip)
+            urls.append(f"http://{ip}:{LISTENER_PORT}/tags")
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            _add(s.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            _add(info[4][0])
+    except OSError:
+        pass
+
+    urls.sort(key=lambda u: (0 if ".25." in u or u.startswith("http://10.25.") else 1, u))
+    return urls
 
 def run_http():
     import time
@@ -150,6 +191,7 @@ def run_http():
         "batches_total":   0,
         "antenna_hits":    {str(ENTRY_ANTENNA): 0, str(EXIT_ANTENNA): 0, str(THIRD_ANTENNA): 0},
         "third_antenna_last_at": None,
+        "reader_source":   None,
     }
 
     def _bump_antenna_hit(antenna: int) -> None:
@@ -191,10 +233,19 @@ def run_http():
     @app.route("/tags", methods=["POST"])
     def receive_tags():
         raw = request.get_data(as_text=True)
+        stamp = ts()
 
         try:
             data = json.loads(raw)
             events = data if isinstance(data, list) else [data]
+            batch = _summarize_batch(events)
+
+            print(
+                f"[{stamp}] POST from {request.remote_addr}: "
+                f"{batch['total']} event(s)"
+                + (f"  antennas={batch['antennas']}" if batch["antennas"] else ""),
+                flush=True,
+            )
 
             for ev in events:
                 if not isinstance(ev, dict):
@@ -206,23 +257,36 @@ def run_http():
                 if antenna:
                     _bump_antenna_hit(antenna)
 
-            stamp = ts()
             grouped = _group_reads(events)
             _print_reads(grouped, stamp)
 
-            # Persist + dwell tracking (entry/exit logic unchanged — ant 3 not wired yet)
+            if batch["total"] and not grouped:
+                print(
+                    f"  (no reads passed filters — RSSI_MIN={RSSI_MIN}, "
+                    f"EPC_FILTER={EPC_FILTER_PATTERN or 'any known tag'})",
+                    flush=True,
+                )
+
+            # Persist + dwell tracking (1→2→3 path: Gannomat entry/exit, Insert Station entry)
             summary = tracker.ingest_batch(events)
             state["batches_total"] += 1
             state["events_total"]  += len(events)
             state["last_event_at"]  = time.time()
+            if state["reader_source"] is None:
+                state["reader_source"] = request.remote_addr
+                print(f"  Reader connected from {state['reader_source']}", flush=True)
             
-            if summary['raw_inserted'] > 0 or summary['session_opened'] > 0:
+            if summary['raw_inserted'] > 0 or summary['session_opened'] > 0 or summary['session_closed'] > 0:
                 print(f"  DB: +{summary['raw_inserted']} reads, "
                       f"+{summary['session_opened']} sessions, "
-                      f"+{summary['session_closed']} completed")
+                      f"+{summary['session_closed']} completed",
+                      flush=True)
 
         except Exception as exc:
-            print(f"\n  (body is not JSON or ingest failed: {exc})")
+            print(f"\n  [{stamp}] POST failed to parse/ingest: {exc}", flush=True)
+            if raw:
+                preview = raw[:200].replace("\n", " ")
+                print(f"  Body preview: {preview}", flush=True)
 
         return "OK", 200
 
@@ -231,9 +295,15 @@ def run_http():
     print(f"  Antennas: {_antenna_label(ENTRY_ANTENNA)}  |  "
           f"{_antenna_label(EXIT_ANTENNA)}  |  {_antenna_label(THIRD_ANTENNA)}")
     print(f"  Listening on  http://{LISTENER_HOST}:{LISTENER_PORT}/tags")
+    post_urls = _local_post_urls()
     print(f"  Point the reader's HTTP POST target to:")
-    print(f"  http://YOUR_PC_IP:{LISTENER_PORT}/tags")
-    print(f"\n  Waiting for tag events...\n")
+    if post_urls:
+        for url in post_urls:
+            print(f"    {url}")
+    else:
+        print(f"    http://YOUR_PC_IP:{LISTENER_PORT}/tags")
+    print(f"\n  Waiting for tag events...")
+    print(f"  Filters: RSSI_MIN={RSSI_MIN}  EPC={EPC_FILTER_PATTERN or 'any known tag'}\n", flush=True)
     app.run(host=LISTENER_HOST, port=LISTENER_PORT, debug=False)
 
 
@@ -293,6 +363,11 @@ def run_health_check() -> int:
 
 if __name__ == "__main__":
     import logging
+
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     
     # Check for verbose flag
     VERBOSE = "--verbose" in sys.argv or "-v" in sys.argv

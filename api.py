@@ -29,8 +29,7 @@ from config import (
     DB_PATH,
     STATION_NAME, STATION_TYPE, STATION_LOCATION,
     READER_NAME, READER_IP,
-    ENTRY_ANTENNA, EXIT_ANTENNA,
-    EXIT_IDLE_TIMEOUT_SEC,
+    ENTRY_ANTENNA, EXIT_ANTENNA, THIRD_ANTENNA, INSERT_STATION_NAME,
     STATUS_OPEN, STATUS_CLOSED, STATUS_ABANDONED, STATUS_EXIT_ONLY,
     ENABLE_LIVE_INGESTION,
     SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL,
@@ -67,6 +66,8 @@ def get_db() -> sqlite3.Connection:
             reader_ip=READER_IP,
             entry_antenna=ENTRY_ANTENNA,
             exit_antenna=EXIT_ANTENNA,
+            third_antenna=THIRD_ANTENNA,
+            insert_station_name=INSERT_STATION_NAME,
         )
         _migrations_applied = True
     return conn
@@ -140,6 +141,10 @@ def _session_dict(r: sqlite3.Row) -> dict:
         "dwell_time_display": _dwell_display(dwell),
         "status":             r["session_status"],
         "operator_name":      None,
+        "operator_id":        None,
+        "operator_zone":      None,
+        "assignment_method":  None,
+        "rtls_match":         None,
     }
 
 
@@ -149,20 +154,50 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
     ids = [s["session_id"] for s in sessions]
     placeholders = ",".join("?" * len(ids))
     rows = db.execute(
-        f"""SELECT poa.session_id, o.operator_name
+        f"""SELECT poa.session_id, poa.assignment_method, poa.assigned_at,
+                   o.operator_id, o.operator_name, o.rtls_badge_id,
+                   ocz.zone_name, ocz.station_name AS operator_station,
+                   ocz.status AS zone_status
             FROM part_operator_assignments poa
             JOIN operators o ON poa.operator_id = o.operator_id
+            LEFT JOIN operator_current_zone ocz ON ocz.operator_id = o.operator_id
             WHERE poa.session_id IN ({placeholders})
             ORDER BY poa.assigned_at DESC""",
         ids,
     ).fetchall()
-    by_session: dict[int, str] = {}
+
+    live_positions: dict[int, dict] = {}
+    if ENABLE_LIVE_INGESTION:
+        try:
+            sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+            from rtls_storage import get_live_state
+            for p in get_live_state().get("positions", []):
+                live_positions[int(p["tag_id"])] = p
+        except Exception:
+            pass
+
+    by_session: dict[int, sqlite3.Row] = {}
     for row in rows:
         sid = row["session_id"]
         if sid not in by_session:
-            by_session[sid] = row["operator_name"]
+            by_session[sid] = row
+
     for s in sessions:
-        s["operator_name"] = by_session.get(s["session_id"])
+        row = by_session.get(s["session_id"])
+        if row:
+            s["operator_name"] = row["operator_name"]
+            s["operator_id"] = row["operator_id"]
+            s["assignment_method"] = row["assignment_method"]
+            s["operator_zone"] = row["zone_name"]
+            s["rtls_match"] = True
+            badge = row["rtls_badge_id"]
+            if badge and str(badge).isdigit():
+                pos = live_positions.get(int(badge))
+                if pos:
+                    s["operator_x"] = pos.get("x")
+                    s["operator_y"] = pos.get("y")
+        elif s.get("status") == STATUS_OPEN:
+            s["rtls_match"] = False
     return sessions
 
 
@@ -367,7 +402,6 @@ def summary():
         "completed_today":             completed_today,
         "average_dwell_seconds_today": round(float(avg_dwell), 1) if avg_dwell else None,
         "average_dwell_display_today": _dwell_display(int(avg_dwell)) if avg_dwell else None,
-        "exit_idle_timeout_sec":       EXIT_IDLE_TIMEOUT_SEC,
         "missing_exit_count":          missing_exit,
         "active_alerts":               0,
         "last_rfid_read_time":         last_read,
@@ -597,11 +631,12 @@ def report_stations():
 
     out.sort(key=lambda s: s["station"])
     if not out:
-        out.append({
-            "station": STATION_NAME, "in_process": 0, "completed_today": 0,
-            "completed_total": 0, "exit_only": 0, "abandoned": 0, "total": 0,
-            "avg_dwell_seconds": None, "avg_dwell_display": None, "parts": [],
-        })
+        for name in (STATION_NAME, INSERT_STATION_NAME):
+            out.append({
+                "station": name, "in_process": 0, "completed_today": 0,
+                "completed_total": 0, "exit_only": 0, "abandoned": 0, "total": 0,
+                "avg_dwell_seconds": None, "avg_dwell_display": None, "parts": [],
+            })
     return jsonify({"stations": out})
 
 
@@ -799,7 +834,6 @@ def analytics():
         "busiest_hour":       busiest_hour,
         "dwell_distribution": distribution,
         "longest_parts":      longest_parts,
-        "exit_idle_timeout_sec": EXIT_IDLE_TIMEOUT_SEC,
     })
 
 
@@ -854,10 +888,13 @@ if __name__ == "__main__":
     print("=" * 50)
 
     sys.path.insert(0, str(Path(__file__).parent / "tracking"))
-    from rtls_storage import set_change_callback
+    from rtls_storage import bootstrap_current_zones_from_rest, set_change_callback
     from sewio_client import start as start_sewio
 
     set_change_callback(_direct_emit)
+    loaded = bootstrap_current_zones_from_rest()
+    if loaded:
+        print(f"  RTLS zone bootstrap: {loaded} operator(s) in zone")
     start_sewio(on_log=lambda msg: print(f"  [RTLS] {msg}"))
 
     threading.Thread(target=_background_poll, daemon=True, name="db-poller").start()

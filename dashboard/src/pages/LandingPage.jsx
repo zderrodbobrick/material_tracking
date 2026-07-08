@@ -71,7 +71,7 @@ export function LandingPage({ summary, wsStatus, onEnter, isDark, onToggleTheme 
         <p className="animate-float-up mt-4 text-lg text-slate-400 max-w-xl mx-auto"
            style={{ animationDelay: '200ms' }}>
           Real-time part tracking, dwell-time monitoring, and production analytics
-          for the Gannomat line.
+          across Gannomat and Insert Station.
         </p>
 
         {/* CTA */}
