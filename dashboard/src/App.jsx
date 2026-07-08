@@ -4,6 +4,7 @@ import { LandingPage } from './pages/LandingPage'
 import { LiveDashboard } from './pages/LiveDashboard'
 import { FullReport } from './pages/FullReport'
 import { AnalyticsPage } from './pages/AnalyticsPage'
+import { FloorPlanPage } from './pages/FloorPlanPage'
 import { useTheme } from './hooks/useTheme'
 import { useLiveSocket } from './hooks/useLiveSocket'
 import { apiFetch, apiPost } from './api'
@@ -91,6 +92,7 @@ export default function App() {
             onEndSession={handleEndSession}
           />
         )}
+        {tab === 'floorplan' && <FloorPlanPage />}
         {tab === 'report' && <FullReport tick={tick} />}
         {tab === 'analytics' && <AnalyticsPage tick={tick} />}
       </main>

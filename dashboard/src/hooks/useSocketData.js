@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
-import { socket } from '../lib/socket'
+import { getSocket } from '../lib/socket'
 
 export function useSocketData(fetcher) {
   const [data, setData]       = useState(null)
   const [error, setError]     = useState(null)
   const [loading, setLoading] = useState(true)
-  const [connected, setConnected] = useState(socket.connected)
+  const [connected, setConnected] = useState(() => getSocket().connected)
 
   const run = useCallback(async () => {
     try {
@@ -21,6 +21,7 @@ export function useSocketData(fetcher) {
 
   useEffect(() => {
     run()
+    const socket = getSocket()
 
     function onUpdate() { run() }
     function onConnect()    { setConnected(true) }

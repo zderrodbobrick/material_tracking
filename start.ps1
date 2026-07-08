@@ -51,16 +51,49 @@ Stop-Port 5001
 Stop-Port 5000
 Start-Sleep -Milliseconds 600
 
+# ── Helper: load .env into process environment ────────────────────────
+function Import-DotEnv {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    Get-Content $Path | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line -match '^([^=]+)=(.*)$') {
+            $name = $matches[1].Trim()
+            $val  = $matches[2].Trim()
+            [System.Environment]::SetEnvironmentVariable($name, $val, 'Process')
+        }
+    }
+}
+
+Import-DotEnv "$Root\.env"
+
 # ── Start API (port 5001) ────────────────────────────────────────────
 Write-Host "  Starting API server      (port 5001) ..." -ForegroundColor Green
 $api = Start-Job -ScriptBlock {
     param($root, $python)
     Set-Location $root
+    Get-Content "$root\.env" -ErrorAction SilentlyContinue | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith('#') -and $line -match '^([^=]+)=(.*)$') {
+            [System.Environment]::SetEnvironmentVariable($matches[1].Trim(), $matches[2].Trim(), 'Process')
+        }
+    }
     & $python "$root\api.py" 2>&1
 } -ArgumentList $Root, $Python
 
 if (Wait-ForPort 5001) {
     Write-Host "  API ready             -> http://localhost:5001" -ForegroundColor Green
+    try {
+        $rtls = Invoke-RestMethod "http://localhost:5001/api/rtls/health" -TimeoutSec 8
+        if ($rtls.enabled) {
+            $state = if ($rtls.websocket_connected) { "live" } else { "connecting" }
+            Write-Host "  RTLS ingest           -> ENABLED ($state)" -ForegroundColor Green
+        } else {
+            Write-Host "  RTLS ingest           -> DISABLED (ENABLE_LIVE_INGESTION=true in .env)" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  RTLS ingest           -> health check unavailable" -ForegroundColor DarkYellow
+    }
 } else {
     Write-Host "  API may not be ready -- check errors below"    -ForegroundColor Yellow
 }

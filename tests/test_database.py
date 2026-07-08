@@ -68,8 +68,8 @@ indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type
 section("1. Migration system")
 check("schema_migrations table exists", "schema_migrations" in tables)
 applied = [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
-check("All 9 migrations applied", len(applied) == 9, f"applied: {applied}")
-for v in range(1, 10):
+check("All 11 migrations applied", len(applied) == 11, f"applied: {applied}")
+for v in range(1, 12):
     check(f"Migration v{v} applied", v in applied)
 
 # ── 2. Core tables (9) ────────────────────────────────────────────────────────
@@ -108,6 +108,8 @@ for c in ("employee_number", "operator_name", "rtls_badge_id", "is_active"):
     check(f"operators.{c}", c in cols(conn, "operators"))
 for c in ("zone_id", "station_name", "zone_name", "status", "updated_at"):
     check(f"operator_current_zone.{c}", c in cols(conn, "operator_current_zone"))
+for c in ("session_id", "operator_id", "station_id", "entered_at", "confirmed_at", "left_at"):
+    check(f"session_operator_presence.{c}", c in cols(conn, "session_operator_presence"))
 
 # ── 5. View ───────────────────────────────────────────────────────────────────
 

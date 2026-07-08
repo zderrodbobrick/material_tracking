@@ -125,3 +125,6 @@ SEWIO_STATION_ZONE_IDS: set[int] = {
 }
 
 RTLS_DATA_DIR = Path(os.getenv("RTLS_DATA_DIR", BASE_DIR / "RTLS"))
+
+# Seconds an operator must be in-station zone before counting as "worked on" the part
+RTLS_OPERATOR_CONFIRM_SECS = float(os.getenv("RTLS_OPERATOR_CONFIRM_SECS", "10"))

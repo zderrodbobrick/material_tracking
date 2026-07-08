@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react'
-import { Radio, LayoutDashboard, FileBarChart, LineChart, Home } from 'lucide-react'
+import { Radio, LayoutDashboard, FileBarChart, LineChart, Map, Home } from 'lucide-react'
 import { ThemeToggle } from './ThemeToggle'
 
 const TABS = [
   { id: 'live',      label: 'Live Dashboard', icon: LayoutDashboard },
+  { id: 'floorplan', label: 'Floor Plan',     icon: Map },
   { id: 'report',    label: 'Full Report',    icon: FileBarChart },
   { id: 'analytics', label: 'Analytics',      icon: LineChart },
 ]

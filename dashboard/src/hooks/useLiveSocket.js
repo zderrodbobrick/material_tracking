@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react'
-import { io } from 'socket.io-client'
-import { API } from '../api'
+import { getSocket } from '../lib/socket'
 
 /**
  * Single shared Socket.IO connection for the whole app.
@@ -14,16 +13,30 @@ export function useLiveSocket() {
 
   useEffect(() => {
     const bump = () => setTick(t => t + 1)
-    const sock = io(API, { transports: ['polling', 'websocket'] })
+    const sock = getSocket()
+    const onConnect = () => { setWsStatus('live'); bump() }
+    const onDisconnect = () => setWsStatus('reconnecting')
+    const onError = () => setWsStatus('offline')
 
-    sock.on('connect', () => { setWsStatus('live'); bump() })
-    sock.on('disconnect', () => setWsStatus('reconnecting'))
-    sock.on('connect_error', () => setWsStatus('offline'))
+    sock.on('connect', onConnect)
+    sock.on('disconnect', onDisconnect)
+    sock.on('connect_error', onError)
     sock.on('rfid_update', bump)
 
     const fallback = setInterval(bump, 1000)
 
-    return () => { sock.disconnect(); clearInterval(fallback) }
+    if (sock.connected) {
+      setWsStatus('live')
+      bump()
+    }
+
+    return () => {
+      sock.off('connect', onConnect)
+      sock.off('disconnect', onDisconnect)
+      sock.off('connect_error', onError)
+      sock.off('rfid_update', bump)
+      clearInterval(fallback)
+    }
   }, [])
 
   return { wsStatus, tick }

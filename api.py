@@ -32,6 +32,7 @@ from config import (
     ENTRY_ANTENNA, EXIT_ANTENNA, THIRD_ANTENNA, INSERT_STATION_NAME,
     STATUS_OPEN, STATUS_CLOSED, STATUS_ABANDONED, STATUS_EXIT_ONLY,
     ENABLE_LIVE_INGESTION,
+    RTLS_OPERATOR_CONFIRM_SECS,
     SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL,
 )
 from database.migrate import run_migrations
@@ -145,7 +146,43 @@ def _session_dict(r: sqlite3.Row) -> dict:
         "operator_zone":      None,
         "assignment_method":  None,
         "rtls_match":         None,
+        "operators_present":  [],
+        "operators_worked":   [],
     }
+
+
+def _operator_dict(
+    row: sqlite3.Row,
+    *,
+    live_positions: dict[int, dict],
+    entered_at: str | None = None,
+    confirmed: bool = False,
+    seconds_in_zone: float | None = None,
+) -> dict:
+    badge = row["rtls_badge_id"]
+    op: dict = {
+        "operator_id":   row["operator_id"],
+        "operator_name": row["operator_name"],
+        "zone_name":     row["zone_name"],
+        "station_name":  row["station_name"] if "station_name" in row.keys() else None,
+        "confirmed":     confirmed,
+    }
+    if entered_at:
+        op["entered_at"] = entered_at
+    if seconds_in_zone is not None:
+        op["seconds_in_zone"] = round(seconds_in_zone, 1)
+        remaining = max(0.0, min(RTLS_OPERATOR_CONFIRM_SECS, RTLS_OPERATOR_CONFIRM_SECS - seconds_in_zone))
+        op["seconds_until_confirmed"] = round(remaining, 1)
+        op["confirm_seconds"] = RTLS_OPERATOR_CONFIRM_SECS
+    if badge and str(badge).isdigit():
+        pos = live_positions.get(int(badge))
+        if pos:
+            op["x"] = pos.get("x")
+            op["y"] = pos.get("y")
+    if confirmed and row["assigned_at"]:
+        op["assigned_at"] = row["assigned_at"]
+        op["assignment_method"] = row["assignment_method"]
+    return op
 
 
 def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict]:
@@ -153,16 +190,40 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
         return sessions
     ids = [s["session_id"] for s in sessions]
     placeholders = ",".join("?" * len(ids))
-    rows = db.execute(
+    now = datetime.now(timezone.utc)
+
+    worked_rows = db.execute(
         f"""SELECT poa.session_id, poa.assignment_method, poa.assigned_at,
                    o.operator_id, o.operator_name, o.rtls_badge_id,
-                   ocz.zone_name, ocz.station_name AS operator_station,
-                   ocz.status AS zone_status
+                   COALESCE(poa.zone_name, ocz.zone_name) AS zone_name,
+                   COALESCE(poa.station_name, st.station_name) AS station_name
             FROM part_operator_assignments poa
             JOIN operators o ON poa.operator_id = o.operator_id
-            LEFT JOIN operator_current_zone ocz ON ocz.operator_id = o.operator_id
+            JOIN part_station_sessions s ON poa.session_id = s.session_id
+            JOIN stations st ON s.station_id = st.station_id
+            LEFT JOIN operator_current_zone ocz
+              ON ocz.operator_id = o.operator_id
+             AND ocz.station_name = st.station_name
             WHERE poa.session_id IN ({placeholders})
-            ORDER BY poa.assigned_at DESC""",
+            ORDER BY poa.assigned_at ASC""",
+        ids,
+    ).fetchall()
+
+    present_rows = db.execute(
+        f"""SELECT sop.session_id, sop.entered_at, sop.confirmed_at,
+                   o.operator_id, o.operator_name, o.rtls_badge_id,
+                   ocz.zone_name, st.station_name, ocz.status AS zone_status
+            FROM session_operator_presence sop
+            JOIN operators o ON sop.operator_id = o.operator_id
+            JOIN stations st ON sop.station_id = st.station_id
+            LEFT JOIN operator_current_zone ocz
+              ON ocz.operator_id = o.operator_id
+             AND ocz.station_name = st.station_name
+             AND ocz.status = 'in'
+            WHERE sop.session_id IN ({placeholders})
+              AND sop.left_at IS NULL
+              AND sop.confirmed_at IS NULL
+            ORDER BY sop.entered_at ASC""",
         ids,
     ).fetchall()
 
@@ -176,26 +237,52 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
         except Exception:
             pass
 
-    by_session: dict[int, sqlite3.Row] = {}
-    for row in rows:
-        sid = row["session_id"]
-        if sid not in by_session:
-            by_session[sid] = row
+    worked_by_session: dict[int, list] = {}
+    for row in worked_rows:
+        worked_by_session.setdefault(row["session_id"], []).append(
+            _operator_dict(row, live_positions=live_positions, confirmed=True)
+        )
+
+    present_by_session: dict[int, list] = {}
+    for row in present_rows:
+        entered = _parse_ts(row["entered_at"])
+        secs = max(0.0, (now - entered).total_seconds()) if entered else 0.0
+        present_by_session.setdefault(row["session_id"], []).append(
+            _operator_dict(
+                row,
+                live_positions=live_positions,
+                entered_at=row["entered_at"],
+                confirmed=False,
+                seconds_in_zone=secs,
+            )
+        )
 
     for s in sessions:
-        row = by_session.get(s["session_id"])
-        if row:
-            s["operator_name"] = row["operator_name"]
-            s["operator_id"] = row["operator_id"]
-            s["assignment_method"] = row["assignment_method"]
-            s["operator_zone"] = row["zone_name"]
+        sid = s["session_id"]
+        worked = worked_by_session.get(sid, [])
+        present = present_by_session.get(sid, [])
+        s["operators_worked"] = worked
+        s["operators_present"] = present
+
+        if worked:
+            primary = worked[-1]
+            s["operator_name"] = primary["operator_name"]
+            s["operator_id"] = primary["operator_id"]
+            s["operator_zone"] = primary.get("zone_name")
+            s["assignment_method"] = primary.get("assignment_method")
             s["rtls_match"] = True
-            badge = row["rtls_badge_id"]
-            if badge and str(badge).isdigit():
-                pos = live_positions.get(int(badge))
-                if pos:
-                    s["operator_x"] = pos.get("x")
-                    s["operator_y"] = pos.get("y")
+            if primary.get("x") is not None:
+                s["operator_x"] = primary["x"]
+                s["operator_y"] = primary["y"]
+        elif present:
+            primary = present[0]
+            s["operator_name"] = primary["operator_name"]
+            s["operator_id"] = primary["operator_id"]
+            s["operator_zone"] = primary.get("zone_name")
+            s["rtls_match"] = None  # pending, not confirmed
+            if primary.get("x") is not None:
+                s["operator_x"] = primary["x"]
+                s["operator_y"] = primary["y"]
         elif s.get("status") == STATUS_OPEN:
             s["rtls_match"] = False
     return sessions
@@ -238,15 +325,6 @@ def index():
 @app.route("/assets/<path:filename>")
 def serve_assets(filename):
     return send_from_directory(str(DASH_DIST / "assets"), filename)
-
-
-@app.route("/<path:filename>")
-def serve_static(filename):
-    if DASH_DIST.exists():
-        p = DASH_DIST / filename
-        if p.exists():
-            return send_from_directory(str(DASH_DIST), filename)
-    return jsonify({"error": "not found"}), 404
 
 
 # ── GET /api/live  (open sessions) ────────────────────────────────────────────
@@ -846,7 +924,17 @@ _last_direct_emit: float = 0.0
 def _direct_emit(action: str) -> None:
     global _last_direct_emit
     _last_direct_emit = _time.time()
-    socketio.emit("rfid_update", {"ts": _now_utc(), "action": action})
+    ts = _now_utc()
+    socketio.emit("rfid_update", {"ts": ts, "action": action})
+    if action == "rtls_position":
+        sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+        from rtls_storage import get_live_state
+        live = get_live_state()
+        socketio.emit("rtls_update", {
+            "ts": ts,
+            "connected": live.get("connected", False),
+            "positions": live.get("positions", []),
+        })
 
 
 def _background_poll():
@@ -875,6 +963,16 @@ def _background_poll():
             pass
 
 
+@app.route("/<path:filename>")
+def serve_static(filename):
+    """Serve dashboard static files (bobrick-logo.png, favicon, etc.). Must be last."""
+    if DASH_DIST.exists():
+        p = DASH_DIST / filename
+        if p.exists():
+            return send_from_directory(str(DASH_DIST), filename)
+    return jsonify({"error": "not found"}), 404
+
+
 if __name__ == "__main__":
     print("=" * 50)
     print("RFID Tracking API Server")
@@ -885,16 +983,22 @@ if __name__ == "__main__":
     print(f"API URL:   http://localhost:5001")
     if ENABLE_LIVE_INGESTION:
         print(f"RTLS:      Sewio live ingest ENABLED")
+    else:
+        print(f"RTLS:      Sewio live ingest DISABLED (ENABLE_LIVE_INGESTION in .env)")
     print("=" * 50)
 
     sys.path.insert(0, str(Path(__file__).parent / "tracking"))
-    from rtls_storage import bootstrap_current_zones_from_rest, set_change_callback
+    from rtls_storage import bootstrap_positions_from_rest, bootstrap_current_zones_from_rest, set_change_callback, start_presence_sweeper
     from sewio_client import start as start_sewio
 
     set_change_callback(_direct_emit)
     loaded = bootstrap_current_zones_from_rest()
     if loaded:
         print(f"  RTLS zone bootstrap: {loaded} operator(s) in zone")
+    pos_loaded = bootstrap_positions_from_rest()
+    if pos_loaded:
+        print(f"  RTLS position bootstrap: {pos_loaded} operator(s) on map")
+    start_presence_sweeper()
     start_sewio(on_log=lambda msg: print(f"  [RTLS] {msg}"))
 
     threading.Thread(target=_background_poll, daemon=True, name="db-poller").start()

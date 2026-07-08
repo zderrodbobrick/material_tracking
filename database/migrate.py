@@ -375,6 +375,43 @@ def _m009_operator_current_zone(conn: sqlite3.Connection, **_) -> None:
     """)
 
 
+def _m010_session_operator_presence(conn: sqlite3.Connection, **_) -> None:
+    """Track live operator presence at a part session; confirm after dwell threshold."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS session_operator_presence (
+            presence_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id    INTEGER NOT NULL REFERENCES part_station_sessions(session_id),
+            operator_id   INTEGER NOT NULL REFERENCES operators(operator_id),
+            station_id    INTEGER NOT NULL REFERENCES stations(station_id),
+            entered_at    TEXT NOT NULL,
+            confirmed_at  TEXT,
+            left_at       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS IX_session_op_presence_session
+            ON session_operator_presence (session_id, left_at);
+        CREATE INDEX IF NOT EXISTS IX_session_op_presence_active
+            ON session_operator_presence (session_id, operator_id)
+            WHERE left_at IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS UX_session_op_presence_active
+            ON session_operator_presence (session_id, operator_id)
+            WHERE left_at IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS UX_part_operator_session_op
+            ON part_operator_assignments (session_id, operator_id);
+    """)
+
+
+def _m011_assignment_zone_snapshot(conn: sqlite3.Connection, **_) -> None:
+    """Store zone/station at confirmation time (not operator's current location)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(part_operator_assignments)")}
+    for col, typ in (
+        ("zone_id", "INTEGER"),
+        ("zone_name", "TEXT"),
+        ("station_name", "TEXT"),
+    ):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE part_operator_assignments ADD COLUMN {col} {typ}")
+
+
 # ── Migration registry ────────────────────────────────────────────────────────
 
 _MIGRATIONS: list[tuple[int, str, object]] = [
@@ -387,6 +424,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (7, "seed_operators",            _m007_seed_operators),
     (8, "seed_insert_antenna",      _m008_seed_insert_antenna),
     (9, "operator_current_zone",    _m009_operator_current_zone),
+    (10, "session_operator_presence", _m010_session_operator_presence),
+    (11, "assignment_zone_snapshot", _m011_assignment_zone_snapshot),
 ]
 
 

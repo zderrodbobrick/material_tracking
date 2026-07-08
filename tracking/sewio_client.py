@@ -18,12 +18,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (
     ENABLE_LIVE_INGESTION,
+    RTLS_TEST_FEED_ID,
     SEWIO_API_KEY,
     SEWIO_FEED_ID,
     SEWIO_VERIFY_SSL,
     SEWIO_WS_URL,
 )
-from rtls_storage import record_position, record_zone_event, set_connected
+from rtls_lookup import operator_names
+from rtls_storage import (
+    bootstrap_positions_from_rest,
+    record_position,
+    record_zone_event,
+    set_connected,
+)
 
 log = logging.getLogger("sewio")
 
@@ -32,14 +39,9 @@ _backoff_max = 60.0
 _thread: Optional[threading.Thread] = None
 
 
-def parse_position_message(msg: dict) -> dict | None:
-    resource = msg.get("resource", "")
-    if not resource.startswith("/feeds"):
-        return None
-
-    body = msg.get("body") or {}
+def _parse_feed_body(body: dict) -> dict | None:
     try:
-        tag_id = int(body.get("id") or resource.split("/")[-1])
+        tag_id = int(body.get("id"))
     except (TypeError, ValueError):
         return None
 
@@ -61,6 +63,28 @@ def parse_position_message(msg: dict) -> dict | None:
         }
     except (TypeError, ValueError, KeyError):
         return None
+
+
+def parse_feed_tag(feed: dict) -> dict | None:
+    """Parse a Sewio REST /feeds tag object into a position dict."""
+    if feed.get("type") != "tag":
+        return None
+    return _parse_feed_body(feed)
+
+
+def parse_position_message(msg: dict) -> dict | None:
+    resource = msg.get("resource", "")
+    if not resource.startswith("/feeds"):
+        return None
+
+    body = msg.get("body") or {}
+    try:
+        tag_id = int(body.get("id") or resource.split("/")[-1])
+    except (TypeError, ValueError):
+        return None
+
+    pos = _parse_feed_body({**body, "id": tag_id})
+    return pos
 
 
 def parse_zone_message(msg: dict) -> dict | None:
@@ -90,15 +114,40 @@ def _ssl_context() -> ssl.SSLContext | None:
     return ctx
 
 
+def _operator_feed_ids() -> list[int]:
+    """Known operator badge IDs — subscribe per-feed for live position streams."""
+    ids = {int(k) for k in operator_names() if str(k).isdigit()}
+    for raw in (RTLS_TEST_FEED_ID, SEWIO_FEED_ID):
+        if raw and str(raw).isdigit():
+            ids.add(int(raw))
+    test_first = sorted(
+        tid for tid in ids
+        if "TEST" in operator_names().get(str(tid), "").upper()
+        or (RTLS_TEST_FEED_ID and str(tid) == str(RTLS_TEST_FEED_ID))
+    )
+    return test_first + sorted(ids - set(test_first))
+
+
 async def _subscribe(ws) -> None:
-    feeds_resource = f"/feeds/{SEWIO_FEED_ID}" if SEWIO_FEED_ID else "/feeds/"
-    for resource in (feeds_resource, "/zones/"):
+    if SEWIO_FEED_ID:
+        feed_ids = [int(SEWIO_FEED_ID)]
+    else:
+        feed_ids = _operator_feed_ids()
+
+    for fid in feed_ids:
         await ws.send(json.dumps({
             "headers": {"X-ApiKey": SEWIO_API_KEY},
             "method": "subscribe",
-            "resource": resource,
+            "resource": f"/feeds/{fid}",
         }))
-        log.info("subscribed %s", resource)
+        log.info("subscribed /feeds/%s", fid)
+
+    await ws.send(json.dumps({
+        "headers": {"X-ApiKey": SEWIO_API_KEY},
+        "method": "subscribe",
+        "resource": "/zones/",
+    }))
+    log.info("subscribed /zones/")
 
 
 async def _handle_message(raw: str, on_log: Callable[[str], None] | None) -> None:
@@ -123,7 +172,7 @@ async def _handle_message(raw: str, on_log: Callable[[str], None] | None) -> Non
             on_log(
                 f"ZONE  {summary['operator_name']} ({summary['tag_id']}) "
                 f"{summary['status']} {summary['zone_name']} "
-                f"[assigned={summary['assigned_sessions']}]"
+                f"[presence={summary.get('presence_started', 0)}]"
             )
 
 
@@ -145,6 +194,9 @@ async def _run_loop(on_log: Callable[[str], None] | None) -> None:
                 _backoff = 2.0
                 log.info("connected to %s", url)
                 await _subscribe(ws)
+                reloaded = bootstrap_positions_from_rest()
+                if reloaded and on_log:
+                    on_log(f"BOOTSTRAP  {reloaded} position(s) from REST")
 
                 async for raw in ws:
                     await _handle_message(raw, on_log)
