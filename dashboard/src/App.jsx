@@ -4,7 +4,6 @@ import { LandingPage } from './pages/LandingPage'
 import { LiveDashboard } from './pages/LiveDashboard'
 import { FullReport } from './pages/FullReport'
 import { AnalyticsPage } from './pages/AnalyticsPage'
-import { FloorPlanPage } from './pages/FloorPlanPage'
 import { useTheme } from './hooks/useTheme'
 import { useLiveSocket } from './hooks/useLiveSocket'
 import { apiFetch, apiPost } from './api'
@@ -19,23 +18,17 @@ export default function App() {
   const [tab, setTab] = useState('live')
 
   // Live dashboard data (also powers the landing teaser)
-  const [summary, setSummary]             = useState(null)
-  const [liveSessions, setLiveSessions]   = useState([])
-  const [completedSessions, setCompleted] = useState([])
-  const [recentReads, setRecentReads]     = useState([])
-  const [lastUpdated, setLastUpdated]     = useState(null)
+  const [summary, setSummary]           = useState(null)
+  const [liveSessions, setLiveSessions] = useState([])
+  const [lastUpdated, setLastUpdated]   = useState(null)
 
   const fetchLive = useCallback(async () => {
-    const [sum, live, done, reads] = await Promise.allSettled([
+    const [sum, live] = await Promise.allSettled([
       apiFetch('/api/summary'),
       apiFetch('/api/live'),
-      apiFetch('/api/completed'),
-      apiFetch('/api/raw-reads/recent?limit=20'),
     ])
     if (sum.status === 'fulfilled') setSummary(sum.value)
     if (live.status === 'fulfilled') setLiveSessions(live.value)
-    if (done.status === 'fulfilled') setCompleted(done.value)
-    if (reads.status === 'fulfilled') setRecentReads(reads.value)
     setLastUpdated(new Date())
   }, [])
 
@@ -84,14 +77,7 @@ export default function App() {
       />
       <main className="max-w-screen-2xl mx-auto px-4 py-6">
         {tab === 'live' && (
-          <LiveDashboard
-            summary={summary}
-            completedSessions={completedSessions}
-            recentReads={recentReads}
-          />
-        )}
-        {tab === 'floorplan' && (
-          <FloorPlanPage liveSessions={liveSessions} onEndSession={handleEndSession} />
+          <LiveDashboard liveSessions={liveSessions} onEndSession={handleEndSession} />
         )}
         {tab === 'report' && <FullReport tick={tick} />}
         {tab === 'analytics' && <AnalyticsPage tick={tick} />}

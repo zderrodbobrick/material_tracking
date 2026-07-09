@@ -27,7 +27,14 @@ export function LiveQueueTable({ sessions, onEndSession, stationName = 'All Stat
 
   const filtered = useMemo(() => {
     return sessions.filter(s => {
-      const hay = `${s.epc ?? ''} ${s.ibus_number ?? ''} ${s.part_name ?? ''} ${s.operator_name ?? ''}`.toLowerCase()
+      const p = parseEpc(s.epc)
+      const hay = [
+        s.epc,
+        s.ibus_number,
+        p.ibusNumber,
+        s.part_name,
+        s.operator_name,
+      ].filter(Boolean).join(' ').toLowerCase()
       if (search && !hay.includes(search.toLowerCase())) return false
       if (statusFilter !== 'ALL' && s.status !== statusFilter) return false
       return true
@@ -63,7 +70,7 @@ export function LiveQueueTable({ sessions, onEndSession, stationName = 'All Stat
             <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-gray-400 dark:text-slate-500 pointer-events-none" />
             <input
               type="text"
-              placeholder="Search part / EPC..."
+              placeholder="Search IBUS / part..."
               value={search}
               onChange={e => setSearch(e.target.value)}
               className={inputCls}
@@ -103,7 +110,7 @@ export function LiveQueueTable({ sessions, onEndSession, stationName = 'All Stat
             <thead>
               <tr className="text-left bg-gray-50 dark:bg-slate-900/40
                              border-b border-gray-200 dark:border-slate-700/60">
-                {['Qty', 'Part #', 'Type', 'WO #', 'Full EPC', 'Station', 'Operator', 'Status', 'Entered', 'Current Dwell', ''].map((h, i) => (
+                {['IBUS #', 'Station', 'Operator', 'Status', 'Entered', 'Current Dwell', ''].map((h, i) => (
                   <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap
                                          text-gray-600 dark:text-slate-400">
                     {h}
@@ -123,33 +130,10 @@ export function LiveQueueTable({ sessions, onEndSession, stationName = 'All Stat
                 >
                   {(() => {
                     const p = parseEpc(s.epc)
-                    const type = s.part_type ?? p.typeLabel
-                    const partNo = s.part_name ?? s.part_number ?? p.partNumber
-                    const wo = s.work_order ?? p.workOrder
-                    return p.isKnown ? (
-                      <>
-                        <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
-                          {p.qty}
-                        </td>
-                        <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
-                          {partNo}
-                        </td>
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold
-                                           bg-blue-100 text-blue-800 dark:bg-blue-500/20 dark:text-blue-300">
-                            {type}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
-                          {wo}
-                        </td>
-                        <td className="px-4 py-3 font-mono text-xs whitespace-nowrap text-gray-400 dark:text-slate-500">
-                          {p.formatted}
-                        </td>
-                      </>
-                    ) : (
-                      <td colSpan={5} className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
-                        {s.epc ?? s.ibus_number}
+                    const ibus = p.ibusNumber ?? s.ibus_number ?? s.epc ?? '—'
+                    return (
+                      <td className="px-4 py-3 font-mono font-semibold whitespace-nowrap text-slate-800 dark:text-slate-100">
+                        {ibus}
                       </td>
                     )
                   })()}
@@ -179,7 +163,7 @@ export function LiveQueueTable({ sessions, onEndSession, stationName = 'All Stat
                       <button
                         onClick={() => {
                           const p = parseEpc(s.epc)
-                          const label = p.isKnown ? `${s.part_type ?? p.typeLabel} WO#${s.work_order ?? p.workOrder}` : (s.epc ?? s.ibus_number)
+                          const label = p.ibusNumber ?? s.ibus_number ?? s.epc
                           if (window.confirm(`End session for ${label}?`)) {
                             onEndSession(s.id)
                           }

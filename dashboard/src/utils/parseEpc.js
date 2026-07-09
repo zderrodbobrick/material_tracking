@@ -14,6 +14,7 @@
  *   typeCode    = "0"
  *   typeLabel   = "IBUS"
  *   workOrder   = "463947"
+ *   ibusNumber  = "1-D4-IBUS463947"
  *
  * Add new type codes to EPC_TYPE_CODES as they are discovered.
  */
@@ -35,6 +36,8 @@ const EPC_TYPE_CODES = {
  *   typeLabel: string|null,
  *   workOrder: string|null,
  *   raw: string,
+ *   formatted: string,
+ *   ibusNumber: string|null,
  *   isKnown: boolean
  * }}
  */
@@ -47,6 +50,8 @@ export function parseEpc(raw) {
       typeLabel: null,
       workOrder: null,
       raw: raw ?? '',
+      formatted: raw ?? '',
+      ibusNumber: null,
       isKnown: false,
     }
   }
@@ -60,6 +65,9 @@ export function parseEpc(raw) {
   const formatted  = typeLabel !== null
     ? `${qty}${partNumber}${label}${workOrder}`
     : raw
+  const ibusNumber = typeLabel !== null
+    ? `${qty}-${partNumber}-${label}${workOrder}`
+    : null
 
   return {
     qty,
@@ -69,6 +77,7 @@ export function parseEpc(raw) {
     workOrder,
     raw,
     formatted,
+    ibusNumber,
     isKnown: typeLabel !== null,
   }
 }

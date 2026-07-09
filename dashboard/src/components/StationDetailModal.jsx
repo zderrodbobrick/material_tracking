@@ -7,12 +7,7 @@ import { parseEpc } from '../utils/parseEpc'
 
 function partLabel(session) {
   const p = parseEpc(session.epc ?? session.ibus_number)
-  if (p.isKnown) {
-    const partNo = session.part_name ?? session.part_number ?? p.partNumber
-    const wo = session.work_order ?? p.workOrder
-    return `${partNo} · WO#${wo}`
-  }
-  return session.epc ?? session.ibus_number ?? '—'
+  return p.ibusNumber ?? session.ibus_number ?? session.epc ?? '—'
 }
 
 function formatTime(isoStr) {
