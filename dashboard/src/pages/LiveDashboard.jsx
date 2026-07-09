@@ -1,15 +1,42 @@
-import { useMemo, useState } from 'react'
-import { Map as MapIcon, Radio, Users, AlertCircle } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Map as MapIcon, Radio, Users, AlertCircle, X, Pin, Factory } from 'lucide-react'
 import { Panel } from '../components/Panel'
 import { LiveQueueTable } from '../components/LiveQueueTable'
 import { MachineOverlay } from '../components/MachineOverlay'
+import { MachineStatusTable } from '../components/MachineStatusPanel'
 import { StationDetailModal } from '../components/StationDetailModal'
 import { useRtlsLive } from '../hooks/useRtlsLive'
 import { FLOOR_PLAN, sewioToPercentClamped } from '../utils/floorPlanCoords'
-import { MACHINES, operatorsInMachineZone } from '../utils/machineRegions'
+import {
+  MACHINES,
+  PINNABLE_STATIONS,
+  PRODUCTION_LINE_ORDER,
+  PRODUCTION_LINE_STATIONS,
+  operatorsInMachineZone,
+} from '../utils/machineRegions'
+import { getAllStationStatuses } from '../utils/stationStatus'
 import floorPlanImg from '../assets/floor_plan.png'
 
-const STATION_ORDER = ['Gannomat', 'Insert Station']
+const MAX_PINNED = PINNABLE_STATIONS.length
+const PINNED_STORAGE_KEY = 'liveDashboard.pinnedStations'
+const VISIBLE_MACHINES_KEY = 'liveDashboard.visibleMachines'
+
+function defaultVisibleMachines() {
+  return PRODUCTION_LINE_STATIONS.map(s => s.station)
+}
+
+function loadVisibleMachines() {
+  try {
+    const raw = localStorage.getItem(VISIBLE_MACHINES_KEY)
+    if (!raw) return defaultVisibleMachines()
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return defaultVisibleMachines()
+    const valid = parsed.filter(s => PRODUCTION_LINE_STATIONS.some(st => st.station === s))
+    return valid.length > 0 ? valid : defaultVisibleMachines()
+  } catch {
+    return defaultVisibleMachines()
+  }
+}
 
 const MARKER_COLORS = [
   { dot: 'bg-blue-500', ring: 'ring-blue-300', glow: 'shadow-blue-400/60' },
@@ -19,6 +46,29 @@ const MARKER_COLORS = [
   { dot: 'bg-rose-500', ring: 'ring-rose-300', glow: 'shadow-rose-400/60' },
   { dot: 'bg-cyan-500', ring: 'ring-cyan-300', glow: 'shadow-cyan-400/60' },
 ]
+
+function stationSortIndex(name) {
+  const idx = PRODUCTION_LINE_ORDER.indexOf(name)
+  return idx === -1 ? PRODUCTION_LINE_ORDER.length : idx
+}
+
+function sortByStationOrder(stations) {
+  return [...stations].sort((a, b) => stationSortIndex(a) - stationSortIndex(b))
+}
+
+function loadPinnedStations() {
+  try {
+    const raw = localStorage.getItem(PINNED_STORAGE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return sortByStationOrder(
+      parsed.filter(s => typeof s === 'string' && PINNABLE_STATIONS.includes(s)),
+    ).slice(0, MAX_PINNED)
+  } catch {
+    return []
+  }
+}
 
 function OperatorMarker({ op, colors, zone, offMap, pos }) {
   const title = [
@@ -60,9 +110,80 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
   )
 }
 
+function FloorPlanMap({
+  rtls,
+  sessionsByStation,
+  operators,
+  zoneByTag,
+  selectedMachine,
+  pinnedSet,
+  onMachineClick,
+}) {
+  return (
+    <div
+      className="relative w-full h-full min-h-0 rounded-lg bg-black shadow-inner ring-1 ring-gray-200 dark:ring-slate-700"
+      style={{ aspectRatio: `${FLOOR_PLAN.imageWidth} / ${FLOOR_PLAN.imageHeight}` }}
+    >
+      <img
+        src={floorPlanImg}
+        alt="Machine floor plan"
+        className="absolute inset-0 w-full h-full object-fill select-none rounded-lg"
+        draggable={false}
+      />
+      <div className="absolute inset-0 z-10 overflow-visible rounded-lg">
+        {MACHINES.map(machine => {
+          const parts = sessionsByStation[machine.station] ?? []
+          const zoneOps = operatorsInMachineZone(rtls, machine)
+          return (
+            <MachineOverlay
+              key={machine.id}
+              machine={machine}
+              partCount={parts.length}
+              operatorCount={zoneOps.length}
+              isActive={selectedMachine?.id === machine.id}
+              isPinned={pinnedSet.has(machine.station)}
+              onClick={e => onMachineClick(machine, e)}
+            />
+          )
+        })}
+        {operators.map((op, i) => {
+          const pos = sewioToPercentClamped(op.x, op.y)
+          return (
+            <OperatorMarker
+              key={op.tag_id}
+              op={op}
+              pos={pos}
+              zone={zoneByTag.get(op.tag_id)}
+              offMap={pos.offMap}
+              colors={MARKER_COLORS[i % MARKER_COLORS.length]}
+            />
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 export function LiveDashboard({ liveSessions = [], onEndSession }) {
   const { rtls, health, error, fetchedAt } = useRtlsLive()
   const [selectedMachine, setSelectedMachine] = useState(null)
+  const [pinnedStations, setPinnedStations] = useState(loadPinnedStations)
+  const [visibleMachines, setVisibleMachines] = useState(loadVisibleMachines)
+  const [pinLimitMessage, setPinLimitMessage] = useState(null)
+
+  useEffect(() => {
+    localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(pinnedStations))
+  }, [pinnedStations])
+
+  useEffect(() => {
+    localStorage.setItem(VISIBLE_MACHINES_KEY, JSON.stringify(visibleMachines))
+  }, [visibleMachines])
+
+  useEffect(() => {
+    if (!pinLimitMessage) return
+    const t = setTimeout(() => setPinLimitMessage(null), 3500)
+    return () => clearTimeout(t)
+  }, [pinLimitMessage])
 
   const sessionsByStation = useMemo(() => {
     const grouped = {}
@@ -74,11 +195,56 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
     return grouped
   }, [liveSessions])
 
-  const stationNames = useMemo(() => {
-    const names = new Set(STATION_ORDER)
-    for (const name of Object.keys(sessionsByStation)) names.add(name)
-    return [...names]
-  }, [sessionsByStation])
+  const pinnedSet = useMemo(() => new Set(pinnedStations), [pinnedStations])
+  const orderedPinnedStations = useMemo(
+    () => sortByStationOrder(pinnedStations),
+    [pinnedStations],
+  )
+  const pinLimitReached = pinnedStations.length >= MAX_PINNED
+
+  const togglePinStation = useCallback((stationName) => {
+    if (!PINNABLE_STATIONS.includes(stationName)) return
+
+    setPinnedStations(prev => {
+      if (prev.includes(stationName)) {
+        return prev.filter(s => s !== stationName)
+      }
+      if (prev.length >= MAX_PINNED) {
+        setPinLimitMessage(`You can pin up to ${MAX_PINNED} station queues at once.`)
+        return prev
+      }
+      return sortByStationOrder([...prev, stationName])
+    })
+  }, [])
+
+  const unpinStation = useCallback((stationName) => {
+    setPinnedStations(prev => prev.filter(s => s !== stationName))
+  }, [])
+
+  const visibleMachineSet = useMemo(() => new Set(visibleMachines), [visibleMachines])
+  const hasVisibleMachines = visibleMachines.length > 0
+
+  const toggleMachineVisibility = useCallback((stationKey) => {
+    setVisibleMachines(prev => {
+      if (prev.includes(stationKey)) {
+        return prev.filter(s => s !== stationKey)
+      }
+      return sortByStationOrder([...prev, stationKey])
+    })
+  }, [])
+
+  const hideAllMachines = useCallback(() => {
+    setVisibleMachines([])
+  }, [])
+
+  const handleMachineClick = useCallback((machine, e) => {
+    if (e.shiftKey) {
+      e.preventDefault()
+      togglePinStation(machine.station)
+      return
+    }
+    setSelectedMachine(machine)
+  }, [togglePinStation])
 
   const zoneByTag = useMemo(() => {
     const lookup = new Map()
@@ -88,7 +254,6 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
     return lookup
   }, [rtls])
 
-  // Trust the API — backend already filters stale Sewio snapshots.
   const operators = useMemo(() => {
     return (rtls?.positions ?? [])
       .filter(p => p.x != null && p.y != null)
@@ -106,6 +271,19 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   const showConfigWarning = health != null && !health.enabled
   const showDisconnected = rtlsEnabled && !connected && operators.length === 0
   const showNoPositions = rtlsEnabled && connected && operators.length === 0
+  const hasPinnedQueues = orderedPinnedStations.length > 0
+  const allMachineStatuses = useMemo(
+    () => getAllStationStatuses(PRODUCTION_LINE_STATIONS, PRODUCTION_LINE_ORDER, sessionsByStation, rtls),
+    [sessionsByStation, rtls],
+  )
+  const visibleMachineStatuses = useMemo(
+    () => allMachineStatuses.filter(s => visibleMachineSet.has(s.stationKey)),
+    [allMachineStatuses, visibleMachineSet],
+  )
+  const machinesInUseCount = useMemo(
+    () => allMachineStatuses.filter(s => s.inUse).length,
+    [allMachineStatuses],
+  )
 
   return (
     <div className="space-y-4">
@@ -197,62 +375,174 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           </div>
         )}
 
-        <div className="p-4 sm:p-5">
-          <div
-            className="relative w-full rounded-lg bg-black shadow-inner ring-1 ring-gray-200 dark:ring-slate-700"
-            style={{ aspectRatio: `${FLOOR_PLAN.imageWidth} / ${FLOOR_PLAN.imageHeight}` }}
-          >
-            <img
-              src={floorPlanImg}
-              alt="Machine floor plan"
-              className="absolute inset-0 w-full h-full object-fill select-none rounded-lg"
-              draggable={false}
-            />
-            <div className="absolute inset-0 z-10 overflow-visible rounded-lg">
-              {MACHINES.map(machine => {
-                const parts = sessionsByStation[machine.station] ?? []
-                const zoneOps = operatorsInMachineZone(rtls, machine)
-                return (
-                  <MachineOverlay
-                    key={machine.id}
-                    machine={machine}
-                    partCount={parts.length}
-                    operatorCount={zoneOps.length}
-                    isActive={selectedMachine?.id === machine.id}
-                    onClick={() => setSelectedMachine(machine)}
-                  />
-                )
-              })}
-              {operators.map((op, i) => {
-                const pos = sewioToPercentClamped(op.x, op.y)
-                return (
-                  <OperatorMarker
-                    key={op.tag_id}
-                    op={op}
-                    pos={pos}
-                    zone={zoneByTag.get(op.tag_id)}
-                    offMap={pos.offMap}
-                    colors={MARKER_COLORS[i % MARKER_COLORS.length]}
-                  />
-                )
-              })}
-            </div>
+        {pinLimitMessage && (
+          <div className="mx-5 mt-4 flex items-center gap-2 text-sm text-amber-700 dark:text-amber-300
+                          bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20
+                          rounded-lg px-3 py-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            {pinLimitMessage}
+          </div>
+        )}
+
+        <div className="px-4 sm:px-5 pt-4 space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1">
+              <Pin className="w-3 h-3" />
+              Live queues:
+            </span>
+            {PINNABLE_STATIONS.map(name => {
+              const pinned = pinnedSet.has(name)
+              const count = sessionsByStation[name]?.length ?? 0
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => togglePinStation(name)}
+                  disabled={!pinned && pinLimitReached}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
+                              border transition-colors
+                    ${pinned
+                      ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 dark:bg-blue-500/15 dark:text-blue-300 dark:border-blue-500/30 dark:hover:bg-blue-500/25'
+                      : pinLimitReached
+                        ? 'bg-gray-50 text-gray-400 border-gray-200 cursor-not-allowed dark:bg-slate-800 dark:text-slate-500 dark:border-slate-700'
+                        : 'bg-white text-gray-600 border-gray-200 hover:border-violet-300 hover:text-violet-700 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600 dark:hover:border-violet-500/40'
+                    }`}
+                  title={pinned ? `Unpin ${name} queue` : `Pin ${name} queue`}
+                >
+                  {name}
+                  {count > 0 && (
+                    <span className={`tabular-nums ${pinned ? 'text-blue-500' : 'text-gray-400 dark:text-slate-500'}`}>
+                      ({count})
+                    </span>
+                  )}
+                  {pinned && <X className="w-3 h-3 opacity-70" />}
+                </button>
+              )
+            })}
           </div>
 
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1">
+              <Factory className="w-3 h-3" />
+              Machines:
+            </span>
+            {PRODUCTION_LINE_STATIONS.map(st => {
+              const visible = visibleMachineSet.has(st.station)
+              const status = allMachineStatuses.find(s => s.stationKey === st.station)
+              const inUse = status?.inUse
+              const light = status?.light
+              return (
+                <button
+                  key={st.id}
+                  type="button"
+                  onClick={() => toggleMachineVisibility(st.station)}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
+                              border transition-colors
+                    ${visible
+                      ? inUse
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 dark:bg-emerald-500/15 dark:text-emerald-300 dark:border-emerald-500/30 dark:hover:bg-emerald-500/25'
+                        : light === 'amber'
+                          ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/30'
+                          : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-600 dark:hover:bg-slate-700'
+                      : 'bg-gray-50 text-gray-400 border-gray-200 hover:border-gray-300 dark:bg-slate-900 dark:text-slate-500 dark:border-slate-700'
+                    }`}
+                  title={visible ? `Hide ${st.name}` : `Show ${st.name}`}
+                >
+                  {visible && light && light !== 'idle' && (
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0
+                      ${light === 'green'
+                        ? 'bg-green-500'
+                        : light === 'amber'
+                          ? 'bg-amber-500'
+                          : 'bg-slate-400 dark:bg-slate-500'
+                      }`}
+                    />
+                  )}
+                  {st.name}
+                  {visible && <X className="w-3 h-3 opacity-50" />}
+                </button>
+              )
+            })}
+            {hasVisibleMachines && (
+              <button
+                type="button"
+                onClick={hideAllMachines}
+                className="text-xs text-gray-400 hover:text-gray-600 dark:text-slate-500 dark:hover:text-slate-300 px-1"
+                title="Hide all machines"
+              >
+                Hide all
+              </button>
+            )}
+            {!hasVisibleMachines && (
+              <button
+                type="button"
+                onClick={() => setVisibleMachines(defaultVisibleMachines())}
+                className="text-xs text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 px-1"
+              >
+                Show all
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="p-4 sm:p-5">
+          <div
+            className={
+              hasPinnedQueues
+                ? 'grid grid-cols-1 lg:grid-cols-[minmax(0,1.5fr)_minmax(260px,1fr)] gap-4 items-stretch'
+                : ''
+            }
+          >
+            <div className={hasPinnedQueues ? 'min-w-0 flex items-start' : ''}>
+              <FloorPlanMap
+                rtls={rtls}
+                sessionsByStation={sessionsByStation}
+                operators={operators}
+                zoneByTag={zoneByTag}
+                selectedMachine={selectedMachine}
+                pinnedSet={pinnedSet}
+                onMachineClick={handleMachineClick}
+              />
+            </div>
+
+            {hasPinnedQueues && (
+              <div className="flex flex-col gap-3 min-w-0 min-h-0">
+                {orderedPinnedStations.map(stationName => (
+                  <div key={stationName} className="flex-1 min-h-0 flex flex-col">
+                    <LiveQueueTable
+                      compact
+                      stacked
+                      stationName={stationName}
+                      sessions={sessionsByStation[stationName] ?? []}
+                      onEndSession={onEndSession}
+                      onUnpin={() => unpinStation(stationName)}
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {hasVisibleMachines && (
+            <div className="mt-4">
+              <MachineStatusTable
+                statuses={visibleMachineStatuses}
+                onClose={hideAllMachines}
+              />
+            </div>
+          )}
+
           <p className="mt-3 text-xs text-gray-500 dark:text-slate-400 text-center">
-            Click a machine for parts &amp; operators · Origin at white rectangle top-left · {FLOOR_PLAN.scalePxPerM} px/m
+            {hasPinnedQueues
+              ? 'Queues stack in line order (Gannomat above Insert) · Shift+click a machine to pin or unpin · Click for details'
+              : 'Shift+click a machine on the map to show its live queue · Click for details'}
+            {hasVisibleMachines
+              ? ` · ${visibleMachineStatuses.length} machine${visibleMachineStatuses.length !== 1 ? 's' : ''} shown (${machinesInUseCount} in use)`
+              : ''}
+            {' · '}Origin at white rectangle top-left · {FLOOR_PLAN.scalePxPerM} px/m
           </p>
         </div>
       </Panel>
-
-      {stationNames.map(stationName => (
-        <LiveQueueTable
-          key={stationName}
-          stationName={stationName}
-          sessions={sessionsByStation[stationName] ?? []}
-          onEndSession={onEndSession}
-        />
-      ))}
 
       {selectedMachine && (
         <StationDetailModal
@@ -260,44 +550,10 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           sessions={sessionsByStation[selectedMachine.station] ?? []}
           operatorsInZone={operatorsInMachineZone(rtls, selectedMachine)}
           onClose={() => setSelectedMachine(null)}
+          isPinned={pinnedSet.has(selectedMachine.station)}
+          pinLimitReached={pinLimitReached}
+          onTogglePin={() => togglePinStation(selectedMachine.station)}
         />
-      )}
-
-      {operators.length > 0 && (
-        <Panel title="Operators" subtitle="Current positions" icon={Users}>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-xs uppercase tracking-wider text-gray-500 dark:text-slate-400
-                               border-b border-gray-200 dark:border-slate-700">
-                  <th className="px-5 py-3 font-semibold">Name</th>
-                  <th className="px-5 py-3 font-semibold">X (m)</th>
-                  <th className="px-5 py-3 font-semibold">Y (m)</th>
-                  <th className="px-5 py-3 font-semibold">Zone</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100 dark:divide-slate-700/60">
-                {operators.map(op => {
-                  const zone = zoneByTag.get(op.tag_id)
-                  return (
-                    <tr key={op.tag_id} className="text-gray-800 dark:text-slate-200">
-                      <td className="px-5 py-2.5 font-medium">{op.operator_name || `Tag ${op.tag_id}`}</td>
-                      <td className="px-5 py-2.5 font-mono text-gray-600 dark:text-slate-400">
-                        {Number(op.x).toFixed(2)}
-                      </td>
-                      <td className="px-5 py-2.5 font-mono text-gray-600 dark:text-slate-400">
-                        {Number(op.y).toFixed(2)}
-                      </td>
-                      <td className="px-5 py-2.5 text-gray-600 dark:text-slate-400">
-                        {zone?.zone_name || '—'}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
       )}
     </div>
   )

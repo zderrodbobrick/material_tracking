@@ -1,17 +1,13 @@
 """
 Sewio RTLS — Live operator position viewer (WebSocket)
 
-Connects directly to the Sewio server and prints operator X/Y positions
-and zone enter/exit events as they arrive. Does not require api.py.
+Uses the same live state module as the dashboard API (rtls_live.py).
 
 Usage:
     python rtls_viewer.py              # known operators (16 badges)
     python rtls_viewer.py --feed 35    # one badge only
     python rtls_viewer.py --all-tags   # every Sewio tag (noisy / stale)
     python rtls_viewer.py --health     # Sewio REST connectivity check
-
-Requirements:
-    pip install websockets httpx python-dotenv
 """
 
 from __future__ import annotations
@@ -33,7 +29,6 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from config import (  # noqa: E402
-    RTLS_TEST_FEED_ID,
     SEWIO_API_KEY,
     SEWIO_FEED_ID,
     SEWIO_REST_URL,
@@ -41,7 +36,8 @@ from config import (  # noqa: E402
     SEWIO_WS_URL,
     STATION_NAME,
 )
-from rtls_lookup import operator_name, operator_names, station_for_zone, zone_label  # noqa: E402
+import rtls_live  # noqa: E402
+from rtls_lookup import operator_name, operator_names  # noqa: E402
 from sewio_client import parse_position_message, parse_zone_message  # noqa: E402
 
 
@@ -57,158 +53,19 @@ def divider(label: str = "") -> None:
         print(line)
 
 
-# ── In-memory snapshot (latest position per tag) ─────────────────────────────
-
-_positions: dict[int, dict] = {}
-_zone_presence: dict[int, dict] = {}
-
-
-# Ignore bulk /feeds/ snapshots older than this (seconds)
-STALE_POSITION_SECS = 90
-
-
-def _position_at_ts(at: str | None) -> float:
-    """Parse Sewio position timestamp to epoch seconds (naive local)."""
-    if not at:
-        return 0.0
-    raw = at.strip()
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-    ):
-        try:
-            return datetime.strptime(raw, fmt).timestamp()
-        except ValueError:
-            continue
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
-
-
-def _test_feed_ids() -> set[int]:
-    """Badge IDs always subscribed with priority (RTLS TEST + env overrides)."""
-    ids: set[int] = set()
-    for raw in (RTLS_TEST_FEED_ID, SEWIO_FEED_ID):
-        if raw and str(raw).isdigit():
-            ids.add(int(raw))
-    for tid, name in operator_names().items():
-        if "TEST" in name.upper() and str(tid).isdigit():
-            ids.add(int(tid))
-    return ids
-
-
-def _operator_feed_ids() -> list[int]:
-    ids = {int(k) for k in operator_names() if str(k).isdigit()}
-    ids |= _test_feed_ids()
-    test_first = sorted(_test_feed_ids())
-    rest = sorted(ids - set(test_first))
-    return test_first + rest
-
-
-def _accept_position(tag_id: int, pos: dict) -> bool:
-    """Drop stale bulk snapshots; keep only the newest update per tag."""
-    new_ts = _position_at_ts(pos.get("at"))
-    pos["_at_ts"] = new_ts
-    is_test = tag_id in _test_feed_ids()
-
-    if not is_test and new_ts > 0:
-        age = datetime.now().timestamp() - new_ts
-        if age > STALE_POSITION_SECS:
-            return False
-
-    prev = _positions.get(tag_id)
-    if prev and new_ts > 0:
-        prev_ts = prev.get("_at_ts") or _position_at_ts(prev.get("at"))
-        if new_ts < prev_ts:
-            return False
-
-    return True
-
-
-def _set_zone_presence(
-    tag_id: int,
-    zone_id: int,
-    status: str,
-    *,
-    zone_name: str | None = None,
-) -> None:
-    _zone_presence[tag_id] = {
-        "status": status,
-        "zone_name": zone_name or zone_label(zone_id),
-        "zone_id": zone_id,
-    }
-
-
-def _bootstrap_zones_from_rest(feed_filter: int | None) -> int:
-    """Load current zone occupancy from Sewio REST (WebSocket only sends changes)."""
-    import httpx
-
-    try:
-        resp = httpx.get(
-            f"{SEWIO_REST_URL.rstrip('/')}/zones",
-            headers={"X-ApiKey": SEWIO_API_KEY, "Accept": "application/json"},
-            verify=SEWIO_VERIFY_SSL,
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return 0
-        body = resp.json()
-        zones = body if isinstance(body, list) else body.get("results", [])
-    except Exception:
-        return 0
-
-    # tag_id -> (at, zone_id, zone_name) — keep most recent if listed in multiple zones
-    latest: dict[int, tuple[str, int, str]] = {}
-    for zone in zones:
-        try:
-            zid = int(zone["id"])
-        except (TypeError, ValueError, KeyError):
-            continue
-        zname = zone.get("name") or zone_label(zid)
-        for tag in zone.get("tags") or []:
-            if tag.get("status") != "in":
-                continue
-            try:
-                tid = int(tag["id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            if feed_filter is not None and tid != feed_filter:
-                continue
-            at = str(tag.get("at") or "")
-            if tid not in latest or at > latest[tid][0]:
-                latest[tid] = (at, zid, zname)
-
-    for tid, (_, zid, zname) in latest.items():
-        _set_zone_presence(tid, zid, "in", zone_name=zname)
-
-    return len(latest)
-
-
-def _format_zone(tag_id: int) -> str:
-    zp = _zone_presence.get(tag_id)
-    if not zp:
-        return "—"
-    arrow = "IN" if zp.get("status") == "in" else "OUT"
-    zname = zp.get("zone_name", "")
-    station = station_for_zone(zp.get("zone_id", 0))
-    if arrow == "IN" and station:
-        return f"{arrow} {zname} -> {station}"
-    return f"{arrow} {zname}"
-
-
 def _print_snapshot() -> None:
-    if not _positions:
+    snap = rtls_live.get_snapshot()
+    positions = {p["tag_id"]: p for p in snap["positions"]}
+
+    if not positions:
         print("  (no positions yet — move a badge into range)")
         return
 
     print(f"  {'Operator':<22} {'Tag':>4}  {'X':>7}  {'Y':>7}  {'Clr':>5}  {'Anch':>4}  Zone")
     print(f"  {'-' * 22} {'-' * 4}  {'-' * 7}  {'-' * 7}  {'-' * 5}  {'-' * 4}  {'-' * 28}")
-    for tag_id in sorted(_positions, key=lambda t: _positions[t].get("operator_name", "")):
-        p = _positions[tag_id]
-        zone = _format_zone(tag_id)
+    for tag_id in sorted(positions, key=lambda t: positions[t].get("operator_name", "")):
+        p = positions[tag_id]
+        zone = rtls_live.format_zone(tag_id)
         clr = p.get("clr")
         clr_s = f"{clr:.2f}" if clr is not None else "  —"
         anchors = p.get("anchors")
@@ -220,73 +77,11 @@ def _print_snapshot() -> None:
         )
 
 
-def _handle_position(
-    pos: dict,
-    feed_filter: int | None,
-    *,
-    tracked_ids: set[int] | None = None,
-    verbose: bool = True,
-) -> None:
-    tag_id = pos["tag_id"]
-    if feed_filter is not None and tag_id != feed_filter:
-        return
-    if tracked_ids is not None and tag_id not in tracked_ids:
-        return
-
-    if not _accept_position(tag_id, pos):
-        return
-
-    name = operator_name(tag_id)
-    pos["operator_name"] = name
-    _positions[tag_id] = pos
-
-    if not verbose:
-        return
-
-    clr = pos.get("clr")
-    clr_s = f"{clr:.2f}" if clr is not None else "—"
-    anc = pos.get("anchors")
-    anc_s = str(anc) if anc is not None else "—"
-    zone_s = _format_zone(tag_id)
-    print(
-        f"[{ts()}] POSITION  {name} ({tag_id})  "
-        f"x={pos['x']:.2f}  y={pos['y']:.2f}  clr={clr_s}  anchors={anc_s}  "
-        f"zone={zone_s}",
-        flush=True,
-    )
-
-
-def _handle_zone(
-    zone: dict,
-    feed_filter: int | None,
-    *,
-    tracked_ids: set[int] | None = None,
-) -> None:
-    tag_id = zone["tag_id"]
-    if feed_filter is not None and tag_id != feed_filter:
-        return
-    if tracked_ids is not None and tag_id not in tracked_ids:
-        return
-
-    name = operator_name(tag_id)
-    zid = zone["zone_id"]
-    zname = zone_label(zid)
-    station = station_for_zone(zid)
-    status = zone["status"].upper()
-
-    _set_zone_presence(tag_id, zid, zone["status"], zone_name=zname)
-
-    station_note = f"  -> {station}" if station else ""
-    print(
-        f"[{ts()}] ZONE      {name} ({tag_id})  {status}  {zname}{station_note}",
-        flush=True,
-    )
-
-
 async def _summary_loop(interval: float) -> None:
     while True:
         await asyncio.sleep(interval)
-        divider(f"LIVE SNAPSHOT  ({len(_positions)} tags)  station={STATION_NAME}")
+        snap = rtls_live.get_snapshot()
+        divider(f"LIVE SNAPSHOT  ({len(snap['positions'])} tags)  station={STATION_NAME}")
         _print_snapshot()
         print(flush=True)
 
@@ -315,7 +110,7 @@ async def _run_viewer(
         feed_ids = None
         mode = "all Sewio tags (may include stale snapshots)"
     else:
-        feed_ids = _operator_feed_ids()
+        feed_ids = rtls_live.operator_feed_ids()
         mode = f"{len(feed_ids)} known operators"
 
     tracked_ids = set(feed_ids) if feed_ids else None
@@ -324,7 +119,7 @@ async def _run_viewer(
     print(f"\n  WebSocket : {SEWIO_WS_URL}")
     if feed_ids:
         print(f"  Subscribe : {len(feed_ids)} operator feed(s) + /zones/")
-        test_ids = sorted(_test_feed_ids() & set(feed_ids))
+        test_ids = sorted(rtls_live.test_feed_ids() & set(feed_ids))
         if test_ids:
             labels = ", ".join(f"{operator_name(t)} ({t})" for t in test_ids)
             print(f"  Test      : {labels}")
@@ -333,8 +128,8 @@ async def _run_viewer(
     print(f"  Mode      : {mode}")
     print(f"  Station   : {STATION_NAME}")
 
-    zone_filter = feed_filter  # zone bootstrap respects single-tag mode only
-    loaded = _bootstrap_zones_from_rest(zone_filter)
+    zone_filter = feed_filter
+    loaded = rtls_live.bootstrap_zones_from_rest(zone_filter)
     if loaded:
         print(f"  Zones     : loaded current occupancy for {loaded} tag(s) via REST")
     else:
@@ -343,6 +138,7 @@ async def _run_viewer(
     print(f"\n  Waiting for position updates ...  (Ctrl+C to stop)\n", flush=True)
 
     summary_task = asyncio.create_task(_summary_loop(summary_secs))
+    last_zone_refresh = asyncio.get_event_loop().time()
 
     async def _subscribe(ws) -> None:
         if feed_ids:
@@ -375,14 +171,25 @@ async def _run_viewer(
                     await _subscribe(ws)
                     print(f"[{ts()}] CONNECTED\n", flush=True)
 
-                    reloaded = _bootstrap_zones_from_rest(zone_filter)
+                    reloaded = rtls_live.bootstrap_zones_from_rest(zone_filter)
                     if reloaded:
                         print(
                             f"[{ts()}] BOOTSTRAP  refreshed zone state for {reloaded} tag(s)\n",
                             flush=True,
                         )
+                    last_zone_refresh = asyncio.get_event_loop().time()
 
                     async for raw in ws:
+                        now = asyncio.get_event_loop().time()
+                        if now - last_zone_refresh >= rtls_live.ZONE_REFRESH_SECS:
+                            refreshed = rtls_live.bootstrap_zones_from_rest(zone_filter)
+                            last_zone_refresh = now
+                            if refreshed and verbose:
+                                print(
+                                    f"[{ts()}] REFRESH  zone state for {refreshed} tag(s)",
+                                    flush=True,
+                                )
+
                         try:
                             msg = json.loads(raw)
                         except json.JSONDecodeError:
@@ -390,15 +197,41 @@ async def _run_viewer(
 
                         pos = parse_position_message(msg)
                         if pos:
-                            _handle_position(
-                                pos, feed_filter,
-                                tracked_ids=tracked_ids, verbose=verbose,
+                            tag_id = pos["tag_id"]
+                            if feed_filter is not None and tag_id != feed_filter:
+                                continue
+                            if tracked_ids is not None and tag_id not in tracked_ids:
+                                continue
+                            recorded = rtls_live.record_position(**pos)
+                            if not recorded or not verbose:
+                                continue
+                            clr = pos.get("clr")
+                            clr_s = f"{clr:.2f}" if clr is not None else "—"
+                            anc = pos.get("anchors")
+                            anc_s = str(anc) if anc is not None else "—"
+                            print(
+                                f"[{ts()}] POSITION  {operator_name(tag_id)} ({tag_id})  "
+                                f"x={pos['x']:.2f}  y={pos['y']:.2f}  clr={clr_s}  "
+                                f"anchors={anc_s}  zone={rtls_live.format_zone(tag_id)}",
+                                flush=True,
                             )
                             continue
 
                         zone = parse_zone_message(msg)
                         if zone:
-                            _handle_zone(zone, feed_filter, tracked_ids=tracked_ids)
+                            tag_id = zone["tag_id"]
+                            if feed_filter is not None and tag_id != feed_filter:
+                                continue
+                            if tracked_ids is not None and tag_id not in tracked_ids:
+                                continue
+                            entry = rtls_live.record_zone_event(**zone)
+                            station = entry.get("station_name")
+                            station_note = f"  -> {station}" if station else ""
+                            print(
+                                f"[{ts()}] ZONE      {operator_name(tag_id)} ({tag_id})  "
+                                f"{zone['status'].upper()}  {entry['zone_name']}{station_note}",
+                                flush=True,
+                            )
 
             except asyncio.CancelledError:
                 raise
@@ -491,7 +324,8 @@ def main() -> int:
             verbose=not args.quiet,
         ))
     except KeyboardInterrupt:
-        divider(f"FINAL SNAPSHOT  ({len(_positions)} tags)")
+        snap = rtls_live.get_snapshot()
+        divider(f"FINAL SNAPSHOT  ({len(snap['positions'])} tags)")
         _print_snapshot()
         print("\n  Stopped.\n", flush=True)
     return 0

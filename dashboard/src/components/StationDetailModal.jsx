@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { X, Factory, Users, Package } from 'lucide-react'
+import { X, Factory, Users, Package, Pin, PinOff } from 'lucide-react'
 import { StatusBadge } from './StatusBadge'
 import { OperatorCell } from './OperatorCell'
 import { DwellTimer } from './DwellTimer'
@@ -21,7 +21,7 @@ function formatTime(isoStr) {
   }
 }
 
-export function StationDetailModal({ machine, sessions, operatorsInZone, onClose }) {
+export function StationDetailModal({ machine, sessions, operatorsInZone, onClose, isPinned, onTogglePin, pinLimitReached }) {
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
@@ -68,16 +68,36 @@ export function StationDetailModal({ machine, sessions, operatorsInZone, onClose
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-2 rounded-lg text-gray-500 hover:text-gray-800 hover:bg-gray-200
-                       dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-700
-                       transition-colors shrink-0"
-            aria-label="Close"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-1 shrink-0">
+            {onTogglePin && (
+              <button
+                type="button"
+                onClick={onTogglePin}
+                disabled={!isPinned && pinLimitReached}
+                title={isPinned ? 'Unpin live queue' : pinLimitReached ? 'Maximum pinned queues reached' : 'Pin live queue beside map'}
+                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors
+                  ${isPinned
+                    ? 'text-blue-700 bg-blue-50 hover:bg-blue-100 dark:text-blue-300 dark:bg-blue-500/15 dark:hover:bg-blue-500/25'
+                    : pinLimitReached
+                      ? 'text-gray-400 bg-gray-100 cursor-not-allowed dark:text-slate-500 dark:bg-slate-800'
+                      : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200 dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-700'
+                  }`}
+              >
+                {isPinned ? <PinOff className="w-3.5 h-3.5" /> : <Pin className="w-3.5 h-3.5" />}
+                {isPinned ? 'Unpin' : 'Pin queue'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-2 rounded-lg text-gray-500 hover:text-gray-800 hover:bg-gray-200
+                         dark:text-slate-400 dark:hover:text-slate-100 dark:hover:bg-slate-700
+                         transition-colors shrink-0"
+              aria-label="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         <div className="overflow-y-auto max-h-[calc(85vh-4.5rem)]">
@@ -154,7 +174,7 @@ export function StationDetailModal({ machine, sessions, operatorsInZone, onClose
                       <p className="text-[10px] uppercase tracking-wide text-gray-400 dark:text-slate-500 mb-1">
                         Operators on part
                       </p>
-                      <OperatorCell session={session} />
+                      <OperatorCell session={session} liveFeed />
                     </div>
                   </div>
                 ))}

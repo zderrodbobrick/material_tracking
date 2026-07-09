@@ -25,7 +25,9 @@ from config import (
     SEWIO_WS_URL,
 )
 from rtls_lookup import operator_names
+import rtls_live
 from rtls_storage import (
+    bootstrap_current_zones_from_rest,
     bootstrap_positions_from_rest,
     record_position,
     record_zone_event,
@@ -186,6 +188,7 @@ async def _run_loop(on_log: Callable[[str], None] | None) -> None:
 
     ssl_ctx = _ssl_context()
     url = SEWIO_WS_URL
+    last_zone_refresh = 0.0
 
     while True:
         try:
@@ -194,11 +197,22 @@ async def _run_loop(on_log: Callable[[str], None] | None) -> None:
                 _backoff = 2.0
                 log.info("connected to %s", url)
                 await _subscribe(ws)
+                zone_loaded = bootstrap_current_zones_from_rest()
+                if zone_loaded and on_log:
+                    on_log(f"BOOTSTRAP  {zone_loaded} zone presence(s) from REST")
                 reloaded = bootstrap_positions_from_rest()
                 if reloaded and on_log:
                     on_log(f"BOOTSTRAP  {reloaded} position(s) from REST")
+                last_zone_refresh = asyncio.get_event_loop().time()
 
                 async for raw in ws:
+                    now = asyncio.get_event_loop().time()
+                    if now - last_zone_refresh >= rtls_live.ZONE_REFRESH_SECS:
+                        refreshed = bootstrap_current_zones_from_rest()
+                        last_zone_refresh = now
+                        if refreshed and on_log:
+                            on_log(f"REFRESH  {refreshed} zone presence(s) from REST")
+
                     await _handle_message(raw, on_log)
 
         except asyncio.CancelledError:

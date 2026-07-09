@@ -1,6 +1,31 @@
 {
+  "1": "TPF.Hardware.VLM All",
+  "2": "TPF.10",
+  "3": "TPF.1/2 Edgefinisher",
+  "4": "TPF.3",
+  "5": "TPF.LBD",
+  "6": "TPF.1",
   "7": "TPF.Gannomat",
+  "8": "TPF.Component Stacking",
+  "9": "TPF.LB Installation",
+  "10": "TPF.Outswing Latch Drilling",
+  "11": "TPF.Insert Station",
+  "12": "TPF.Anderson",
+  "13": "TPF.CL",
+  "14": "TPF.Hardware.VLM Pack",
+  "15": "TPF.Hardware.VLM Pick",
+  "16": "TPF.Hardware.VLM Desk",
+  "17": "TPF.Hardware.Long Hardware",
   "18": "TPF.Tenoner",
-  "19": "TPF.Holzma"
-  
+  "19": "TPF.Holzma",
+  "20": "TPF.Holzma.Falloff",
+  "21": "TPF.Packing",
+  "22": "TPF.Inspect",
+  "23": "TPF.Evolve Drilling",
+  "24": "TPF.Pack out",
+  "25": "TPF.TP Shipping",
+  "26": "TPF.TP Tags Storage",
+  "27": "TPF.TP Forklifts Aisle",
+  "28": "TPF.Hardware.VLM All (1)",
+  "58": "TPF.Hardware.VLM All (2)"
 }

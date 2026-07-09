@@ -17,84 +17,25 @@ from config import (
     DB_PATH,
     ENABLE_LIVE_INGESTION,
     RTLS_OPERATOR_CONFIRM_SECS,
-    RTLS_TEST_FEED_ID,
     SEWIO_FEED_ID,
     SEWIO_LIVE_OFFSET_HOURS,
     STATUS_OPEN,
     STATION_NAME,
 )
 from database.migrate import run_migrations
-from rtls_lookup import operator_name, operator_names, station_for_zone, zone_label
+from rtls_lookup import station_for_zone, zone_label
+import rtls_live
 
 _on_change: Optional[Callable[..., None]] = None
-_lock = threading.Lock()
 _sweeper_thread: Optional[threading.Thread] = None
 _sweeper_stop = threading.Event()
-
-_live_state = {
-    "connected": False,
-    "last_message_at": None,
-    "positions": {},
-    "zone_presence": {},
-}
-
-STALE_POSITION_SECS = 90
-
-
-def _test_feed_ids() -> set[int]:
-    ids: set[int] = set()
-    for raw in (RTLS_TEST_FEED_ID, SEWIO_FEED_ID):
-        if raw and str(raw).isdigit():
-            ids.add(int(raw))
-    for tid, name in operator_names().items():
-        if "TEST" in name.upper() and str(tid).isdigit():
-            ids.add(int(tid))
-    return ids
-
-
-def _position_at_ts(at: str | None) -> float:
-    if not at:
-        return 0.0
-    raw = at.strip()
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S.%fZ",
-        "%Y-%m-%dT%H:%M:%SZ",
-    ):
-        try:
-            return datetime.strptime(raw, fmt).timestamp()
-        except ValueError:
-            continue
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
-
-
-def _accept_position(tag_id: int, at: str | None) -> bool:
-    """Drop stale bulk snapshots; keep only the newest update per tag."""
-    new_ts = _position_at_ts(at)
-    is_test = tag_id in _test_feed_ids()
-
-    if not is_test and new_ts > 0:
-        age = time.time() - new_ts
-        if age > STALE_POSITION_SECS:
-            return False
-
-    with _lock:
-        prev = _live_state["positions"].get(tag_id)
-    if prev and new_ts > 0:
-        prev_ts = _position_at_ts(prev.get("at"))
-        if new_ts < prev_ts:
-            return False
-
-    return True
+_lock = threading.Lock()
 
 
 def set_change_callback(fn: Callable[..., None]) -> None:
     global _on_change
     _on_change = fn
+    rtls_live.set_change_callback(fn)
 
 
 def _notify(action: str, **extra) -> None:
@@ -395,59 +336,24 @@ def try_assign_on_session_open(session_id: int, station_id: int) -> bool:
 
 
 def bootstrap_current_zones_from_rest() -> int:
-    import httpx
-    from config import SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL
-
-    if not SEWIO_API_KEY:
-        return 0
-    try:
-        resp = httpx.get(
-            f"{SEWIO_REST_URL.rstrip('/')}/zones",
-            headers={"X-ApiKey": SEWIO_API_KEY, "Accept": "application/json"},
-            verify=SEWIO_VERIFY_SSL,
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return 0
-        body = resp.json()
-        zones = body if isinstance(body, list) else body.get("results", [])
-    except Exception:
+    """Refresh in-memory zone state from Sewio REST (same as rtls_viewer)."""
+    loaded = rtls_live.bootstrap_zones_from_rest()
+    if not loaded:
         return 0
 
-    latest: dict[int, tuple[str, int, str, str]] = {}
-    for zone in zones:
-        try:
-            zid = int(zone["id"])
-        except (TypeError, ValueError, KeyError):
-            continue
-        station_name = station_for_zone(zid)
-        zname = zone.get("name") or zone_label(zid)
-        for tag in zone.get("tags") or []:
-            if tag.get("status") != "in":
-                continue
-            try:
-                tid = int(tag["id"])
-            except (TypeError, ValueError, KeyError):
-                continue
-            at = str(tag.get("at") or _now_iso())
-            conn_probe = _conn()
-            try:
-                op_id = _operator_id(conn_probe, tid)
-            finally:
-                conn_probe.close()
-            if not op_id:
-                continue
-            if op_id not in latest or at > latest[op_id][0]:
-                latest[op_id] = (at, zid, station_name, zname)
-
-    if not latest:
-        return 0
-
+    snapshot = rtls_live.get_snapshot()
     conn = _conn()
     count = 0
     try:
-        for op_id, (at, zid, station_name, zname) in latest.items():
-            detected_at = _parse_sewio_ts(at)
+        for z in snapshot["zone_presence"]:
+            tid = int(z["tag_id"])
+            zid = int(z["zone_id"])
+            station_name = z.get("station_name") or station_for_zone(zid)
+            zname = z.get("zone_name") or zone_label(zid)
+            detected_at = _parse_sewio_ts(z.get("at"))
+            op_id = _operator_id(conn, tid)
+            if not op_id:
+                continue
             conn.execute(
                 """INSERT INTO operator_current_zone
                    (operator_id, zone_id, station_name, zone_name, status, updated_at)
@@ -468,7 +374,7 @@ def bootstrap_current_zones_from_rest() -> int:
         conn.commit()
     finally:
         conn.close()
-    return count
+    return loaded
 
 
 def bootstrap_positions_from_rest() -> int:
@@ -494,7 +400,7 @@ def bootstrap_positions_from_rest() -> int:
     except Exception:
         return 0
 
-    known = {int(k) for k in operator_names() if str(k).isdigit()} | _test_feed_ids()
+    known = rtls_live.known_tag_ids()
     if SEWIO_FEED_ID and str(SEWIO_FEED_ID).isdigit():
         known = {int(SEWIO_FEED_ID)}
 
@@ -503,27 +409,14 @@ def bootstrap_positions_from_rest() -> int:
         pos = parse_feed_tag(feed)
         if not pos or pos["tag_id"] not in known:
             continue
-        record_position(**pos)
-        loaded += 1
+        if rtls_live.record_position(**pos):
+            loaded += 1
 
     return loaded
 
 
 def record_position(tag_id: int, x: float, y: float, at: str | None, **extra) -> None:
-    if not _accept_position(tag_id, at):
-        return
-    pos = {
-        "tag_id": tag_id,
-        "operator_name": operator_name(tag_id),
-        "x": x,
-        "y": y,
-        "at": at,
-        **{k: v for k, v in extra.items() if v is not None},
-    }
-    with _lock:
-        _live_state["last_message_at"] = datetime.now(timezone.utc).isoformat()
-        _live_state["positions"][tag_id] = pos
-    _notify("rtls_position", position=pos)
+    rtls_live.record_position(tag_id, x, y, at, **extra)
 
 
 def record_zone_event(
@@ -535,27 +428,13 @@ def record_zone_event(
 ) -> dict:
     detected_at = _parse_sewio_ts(at)
     station_name = station_for_zone(zone_id)
+    zone_entry = rtls_live.record_zone_event(
+        tag_id, zone_id, status, at=at, duration=duration,
+    )
     summary = {
-        "tag_id": tag_id,
-        "operator_name": operator_name(tag_id),
-        "zone_id": zone_id,
-        "zone_name": zone_label(zone_id),
-        "status": status,
-        "station_name": station_name,
+        **zone_entry,
         "presence_started": 0,
     }
-
-    with _lock:
-        _live_state["last_message_at"] = datetime.now(timezone.utc).isoformat()
-        _live_state["zone_presence"][tag_id] = {
-            "tag_id": tag_id,
-            "operator_name": operator_name(tag_id),
-            "zone_id": zone_id,
-            "zone_name": zone_label(zone_id),
-            "status": status,
-            "at": detected_at,
-            "duration": duration,
-        }
 
     conn = _conn()
     try:
@@ -583,26 +462,24 @@ def record_zone_event(
     finally:
         conn.close()
 
-    _notify("rtls_zone" if status == "in" else "rtls_presence")
     return summary
 
 
 def set_connected(connected: bool) -> None:
-    with _lock:
-        _live_state["connected"] = connected
+    rtls_live.set_connected(connected)
 
 
 def get_live_state() -> dict:
-    with _lock:
-        return {
-            "enabled": ENABLE_LIVE_INGESTION,
-            "connected": _live_state["connected"],
-            "last_message_at": _live_state["last_message_at"],
-            "positions": list(_live_state["positions"].values()),
-            "zone_presence": list(_live_state["zone_presence"].values()),
-            "station_name": STATION_NAME,
-            "confirm_seconds": RTLS_OPERATOR_CONFIRM_SECS,
-        }
+    snap = rtls_live.get_snapshot()
+    return {
+        "enabled": ENABLE_LIVE_INGESTION,
+        "connected": snap["connected"],
+        "last_message_at": snap["last_message_at"],
+        "positions": snap["positions"],
+        "zone_presence": snap["zone_presence"],
+        "station_name": STATION_NAME,
+        "confirm_seconds": RTLS_OPERATOR_CONFIRM_SECS,
+    }
 
 
 def rest_health(api_key: str, rest_url: str, verify_ssl: bool) -> dict:

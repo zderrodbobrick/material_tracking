@@ -15,21 +15,22 @@ function secondsUntilConfirmed(enteredAt, confirmSecs) {
   return Math.max(0, Math.min(confirmSecs, confirmSecs - elapsed))
 }
 
-function OperatorLine({ op, variant }) {
+function OperatorLine({ op, variant, liveFeed }) {
   const confirmSecs = op.confirm_seconds ?? DEFAULT_CONFIRM_SECS
+  const showPending = variant === 'pending' && !liveFeed
   const [remaining, setRemaining] = useState(() =>
-    variant === 'pending'
+    showPending
       ? (op.seconds_until_confirmed ?? secondsUntilConfirmed(op.entered_at, confirmSecs))
       : 0,
   )
 
   useEffect(() => {
-    if (variant !== 'pending' || !op.entered_at) return undefined
+    if (!showPending || !op.entered_at) return undefined
     const tick = () => setRemaining(secondsUntilConfirmed(op.entered_at, confirmSecs))
     tick()
     const id = setInterval(tick, 250)
     return () => clearInterval(id)
-  }, [variant, op.entered_at, confirmSecs])
+  }, [showPending, op.entered_at, confirmSecs])
 
   const hasPos = op.x != null && op.y != null
 
@@ -39,13 +40,19 @@ function OperatorLine({ op, variant }) {
         <span className="font-medium text-gray-800 dark:text-slate-200">
           {op.operator_name}
         </span>
-        {variant === 'pending' && remaining > 0 && (
+        {showPending && remaining > 0 && (
           <span
             className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold
                        bg-sky-100 text-sky-800 dark:bg-sky-500/15 dark:text-sky-300"
             title={`Confirms as worked after ${confirmSecs}s in zone`}
           >
             {Math.ceil(remaining)}s
+          </span>
+        )}
+        {liveFeed && variant === 'pending' && (
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold
+                             bg-sky-100 text-sky-800 dark:bg-sky-500/15 dark:text-sky-300">
+            in zone
           </span>
         )}
         {variant === 'worked' && (
@@ -69,7 +76,7 @@ function OperatorLine({ op, variant }) {
   )
 }
 
-export function OperatorCell({ session }) {
+export function OperatorCell({ session, liveFeed = false }) {
   const present = session.operators_present ?? []
   const worked = session.operators_worked ?? []
   const hasAny = present.length > 0 || worked.length > 0
@@ -78,10 +85,10 @@ export function OperatorCell({ session }) {
     return (
       <div className="space-y-2 min-w-[8rem]">
         {present.map(op => (
-          <OperatorLine key={`p-${op.operator_id}`} op={op} variant="pending" />
+          <OperatorLine key={`p-${op.operator_id}`} op={op} variant="pending" liveFeed={liveFeed} />
         ))}
         {worked.map(op => (
-          <OperatorLine key={`w-${op.operator_id}`} op={op} variant="worked" />
+          <OperatorLine key={`w-${op.operator_id}`} op={op} variant="worked" liveFeed={liveFeed} />
         ))}
       </div>
     )
@@ -98,6 +105,7 @@ export function OperatorCell({ session }) {
           y: session.operator_y,
         }}
         variant={session.rtls_match === true ? 'worked' : 'pending'}
+        liveFeed={liveFeed}
       />
     )
   }

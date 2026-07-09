@@ -1,19 +1,21 @@
 import { machineBoundsToPercent } from '../utils/machineRegions'
 
-export function MachineOverlay({ machine, partCount, operatorCount, isActive, onClick }) {
+export function MachineOverlay({ machine, partCount, operatorCount, isActive, isPinned, onClick }) {
   const bounds = machineBoundsToPercent(machine)
   const badge = partCount > 0 || operatorCount > 0
 
   return (
     <button
       type="button"
-      aria-label={`${machine.name} — ${partCount} part${partCount !== 1 ? 's' : ''}, ${operatorCount} operator${operatorCount !== 1 ? 's' : ''}`}
+      aria-label={`${machine.name} — ${partCount} part${partCount !== 1 ? 's' : ''}, ${operatorCount} operator${operatorCount !== 1 ? 's' : ''}${isPinned ? ', queue pinned' : ''}`}
       onClick={onClick}
       className={`absolute z-[15] rounded-sm cursor-pointer transition-all duration-150
                   border-2 pointer-events-auto group/machine
-                  ${isActive
-                    ? 'border-violet-400 bg-violet-500/25 shadow-[0_0_16px_rgba(139,92,246,0.45)]'
-                    : 'border-violet-400/25 bg-violet-500/5 hover:border-violet-400/70 hover:bg-violet-500/15'
+                  ${isPinned
+                    ? 'border-blue-400 bg-blue-500/20 shadow-[0_0_14px_rgba(59,130,246,0.4)]'
+                    : isActive
+                      ? 'border-violet-400 bg-violet-500/25 shadow-[0_0_16px_rgba(139,92,246,0.45)]'
+                      : 'border-violet-400/25 bg-violet-500/5 hover:border-violet-400/70 hover:bg-violet-500/15'
                   }`}
       style={bounds}
     >
@@ -32,10 +34,8 @@ export function MachineOverlay({ machine, partCount, operatorCount, isActive, on
       <span
         className={`absolute bottom-1 left-1/2 -translate-x-1/2 text-[9px] font-bold uppercase tracking-wider
                     px-1.5 py-0.5 rounded pointer-events-none transition-opacity
-                    ${isActive
-                      ? 'bg-violet-600/90 text-white opacity-100'
-                      : 'bg-black/60 text-white/90 opacity-0 group-hover/machine:opacity-100'
-                    }`}
+                    bg-violet-600/90 text-white
+                    ${isActive ? 'opacity-100' : 'opacity-0'}`}
       >
         {machine.name}
       </span>

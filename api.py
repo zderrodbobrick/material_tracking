@@ -931,14 +931,25 @@ def _direct_emit(action: str, **extra) -> None:
         if pos:
             socketio.emit("rtls_position", {"ts": ts, "position": pos})
         else:
-            sys.path.insert(0, str(Path(__file__).parent / "tracking"))
-            from rtls_storage import get_live_state
-            live = get_live_state()
-            socketio.emit("rtls_update", {
-                "ts": ts,
-                "connected": live.get("connected", False),
-                "positions": live.get("positions", []),
-            })
+            _emit_rtls_snapshot(ts)
+    elif action in ("rtls_zone", "rtls_presence", "rtls_zone_refresh"):
+        zone = extra.get("zone")
+        if zone:
+            socketio.emit("rtls_zone", {"ts": ts, "zone": zone})
+        else:
+            _emit_rtls_snapshot(ts)
+
+
+def _emit_rtls_snapshot(ts: str) -> None:
+    sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+    from rtls_storage import get_live_state
+    live = get_live_state()
+    socketio.emit("rtls_update", {
+        "ts": ts,
+        "connected": live.get("connected", False),
+        "positions": live.get("positions", []),
+        "zone_presence": live.get("zone_presence", []),
+    })
 
 
 def _background_poll():
