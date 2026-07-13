@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { Header } from './components/Header'
 import { LandingPage } from './pages/LandingPage'
 import { LiveDashboard } from './pages/LiveDashboard'
+import { CompletedIbusPage } from './pages/CompletedIbusPage'
 import { FullReport } from './pages/FullReport'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { useTheme } from './hooks/useTheme'
@@ -32,7 +33,9 @@ export default function App() {
     setLastUpdated(new Date())
   }, [])
 
-  useEffect(() => { fetchLive() }, [fetchLive, tick])
+  useEffect(() => {
+    if (tab === 'live') fetchLive()
+  }, [fetchLive, tick, tab])
 
   const handleEndSession = useCallback(async (sessionId) => {
     await apiPost(`/api/sessions/${sessionId}/end`)
@@ -75,10 +78,11 @@ export default function App() {
         onTabChange={setTab}
         onHome={goHome}
       />
-      <main className="max-w-screen-2xl mx-auto px-4 py-6">
+      <main className="w-full px-3 sm:px-4 py-3">
         {tab === 'live' && (
-          <LiveDashboard liveSessions={liveSessions} onEndSession={handleEndSession} />
+          <LiveDashboard liveSessions={liveSessions} onEndSession={handleEndSession} tick={tick} />
         )}
+        {tab === 'completed' && <CompletedIbusPage tick={tick} />}
         {tab === 'report' && <FullReport tick={tick} />}
         {tab === 'analytics' && <AnalyticsPage tick={tick} />}
       </main>

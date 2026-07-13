@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Map as MapIcon, Radio, Users, AlertCircle, Pin, Factory, Pencil, MapPin, Eye, EyeOff } from 'lucide-react'
+import { Map as MapIcon, AlertCircle, Pin, Factory, Pencil, MapPin, Eye, EyeOff } from 'lucide-react'
 import { Panel } from '../components/Panel'
 import { LiveQueueTable } from '../components/LiveQueueTable'
 import { MachineOverlay, MachineOverlaySvg } from '../components/MachineOverlay'
@@ -8,6 +8,7 @@ import { AntennaPlaceToolbar, AntennaPlaceLayer, AntennaMarkers } from '../compo
 import { PartChipLayer } from '../components/PartChipLayer'
 import { MachineStatusTable } from '../components/MachineStatusPanel'
 import { StationDetailModal } from '../components/StationDetailModal'
+import { IbusOrdersSidebar } from '../components/IbusOrdersSidebar'
 import { useRtlsLive } from '../hooks/useRtlsLive'
 import { apiFetch, apiPut } from '../api'
 import { FLOOR_PLAN, sewioToPercentClamped } from '../utils/floorPlanCoords'
@@ -166,7 +167,7 @@ function FloorPlanMap({
   return (
     <div
       ref={mapRef}
-      className="relative w-full h-full min-h-0 rounded-lg bg-black shadow-inner ring-1 ring-gray-200 dark:ring-slate-700"
+      className="relative w-full max-w-5xl mx-auto h-full min-h-0 rounded-lg bg-black shadow-inner ring-1 ring-gray-200 dark:ring-slate-700"
       style={{ aspectRatio: `${FLOOR_PLAN.imageWidth} / ${FLOOR_PLAN.imageHeight}` }}
     >
       <img
@@ -183,8 +184,8 @@ function FloorPlanMap({
               : 'z-10'
           }
         >
-          {/* Machine regions locked (non-interactive) while drawing shapes or placing antennas */}
-          {!antennaMode && machines.map(machine => {
+          {/* Keep regions visible while placing antennas (locked / non-interactive) */}
+          {machines.map(machine => {
             const parts = sessionsByStation[machine.station] ?? []
             if (editMode && editStation === machine.station && draftPoints.length > 0) return null
             return (
@@ -256,7 +257,7 @@ function FloorPlanMap({
   )
 }
 
-export function LiveDashboard({ liveSessions = [], onEndSession }) {
+export function LiveDashboard({ liveSessions = [], onEndSession, tick = 0 }) {
   const { rtls, health, error, fetchedAt } = useRtlsLive()
   const [selectedMachine, setSelectedMachine] = useState(null)
   const [pinnedStations, setPinnedStations] = useState(loadPinnedStations)
@@ -288,6 +289,17 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   const mapRef = useRef(null)
   const shapesBaseline = useRef({})
   const antennaBaseline = useRef({})
+  const [openIbusJourneys, setOpenIbusJourneys] = useState([])
+
+  useEffect(() => {
+    let cancelled = false
+    apiFetch('/api/ibus?status=open&limit=80')
+      .then(rows => {
+        if (!cancelled && Array.isArray(rows)) setOpenIbusJourneys(rows)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [tick])
 
   useEffect(() => {
     let cancelled = false
@@ -623,10 +635,6 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
     health?.enabled ?? rtls?.enabled ?? health?.client_running ?? rtls?.connected,
   )
   const connected = Boolean(health?.websocket_connected ?? rtls?.connected)
-  const updatedStr = fetchedAt
-    ? fetchedAt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true })
-    : '—'
-
   const showConfigWarning = health != null && !health.enabled
   const showDisconnected = rtlsEnabled && !connected && operators.length === 0
   const showNoPositions = rtlsEnabled && connected && operators.length === 0
@@ -650,55 +658,8 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   }, [selectedMachine, stationsWithShapes])
 
   return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="animate-fade-in-scale rounded-xl p-4 flex items-center gap-3
-                        bg-white border border-gray-200 shadow-sm
-                        dark:bg-slate-800/60 dark:border-slate-700/60">
-          <span className={`w-9 h-9 rounded-lg flex items-center justify-center
-                            ${connected ? 'bg-green-50 dark:bg-green-500/10' : 'bg-amber-50 dark:bg-amber-500/10'}`}>
-            <Radio className={`w-4 h-4 ${connected ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400'}`} />
-          </span>
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-slate-400">RTLS</p>
-            <p className="text-sm font-semibold text-gray-900 dark:text-slate-100">
-              {!rtls && !health
-                ? 'Loading…'
-                : connected
-                  ? 'Live'
-                  : rtlsEnabled
-                    ? 'Reconnecting…'
-                    : 'Disabled'}
-            </p>
-            <p className="text-[10px] text-gray-400 dark:text-slate-500 font-mono">Updated {updatedStr}</p>
-          </div>
-        </div>
-        <div className="animate-fade-in-scale rounded-xl p-4 flex items-center gap-3
-                        bg-white border border-gray-200 shadow-sm
-                        dark:bg-slate-800/60 dark:border-slate-700/60">
-          <span className="w-9 h-9 rounded-lg flex items-center justify-center bg-blue-50 dark:bg-blue-500/10">
-            <Users className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-          </span>
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-slate-400">Tracked</p>
-            <p className="text-sm font-semibold text-gray-900 dark:text-slate-100">{operators.length}</p>
-          </div>
-        </div>
-        <div className="animate-fade-in-scale rounded-xl p-4 flex items-center gap-3
-                        bg-white border border-gray-200 shadow-sm
-                        dark:bg-slate-800/60 dark:border-slate-700/60">
-          <span className="w-9 h-9 rounded-lg flex items-center justify-center bg-violet-50 dark:bg-violet-500/10">
-            <MapIcon className="w-4 h-4 text-violet-600 dark:text-violet-400" />
-          </span>
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-slate-400">Origin</p>
-            <p className="text-sm font-mono text-gray-900 dark:text-slate-100">
-              ({FLOOR_PLAN.originCoordX}, {FLOOR_PLAN.originCoordY}) m
-            </p>
-          </div>
-        </div>
-      </div>
-
+    <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(420px,40vw)] gap-3 items-start">
+      <div className="space-y-3 min-w-0">
       <Panel
         title="Floor Plan"
         subtitle="Operators at live XY · parts at last RFID antenna"
@@ -1038,6 +999,11 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           onTogglePin={() => togglePinStation(selectedMachineLive.station)}
         />
       )}
+      </div>
+
+      <div className="xl:sticky xl:top-20 xl:self-start xl:max-h-[calc(100vh-5.5rem)] xl:overflow-hidden flex flex-col min-h-[420px]">
+        <IbusOrdersSidebar journeys={openIbusJourneys} />
+      </div>
     </div>
   )
 }

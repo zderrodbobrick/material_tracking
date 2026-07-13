@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import {
   Clock, Gauge, Zap, Timer, TrendingUp, Trophy, Factory,
-  BarChart3, CalendarDays, Hourglass, Percent, Users,
+  BarChart3, CalendarDays, Hourglass, Percent, Users, Package,
+  MapPin, Award,
 } from 'lucide-react'
 import { apiFetch } from '../api'
 import { Panel } from '../components/Panel'
@@ -43,29 +44,39 @@ function Empty({ children }) {
   return <p className="text-sm text-gray-400 dark:text-slate-500 py-10 text-center">{children}</p>
 }
 
-export function AnalyticsPage({ tick }) {
-  const [a, setA] = useState(null)
+const ANALYTICS_TABS = [
+  { id: 'parts',     label: 'Parts',     icon: Package },
+  { id: 'operators', label: 'Operators', icon: Users },
+]
 
-  useEffect(() => {
-    let alive = true
-    apiFetch('/api/analytics')
-      .then(res => { if (alive) setA(res) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [tick])
+function AnalyticsTabs({ active, onChange }) {
+  return (
+    <div className="flex items-center gap-1 p-1 rounded-xl bg-gray-100 dark:bg-slate-800/80 border border-gray-200 dark:border-slate-700/60 w-fit">
+      {ANALYTICS_TABS.map(t => {
+        const Icon = t.icon
+        const isActive = active === t.id
+        return (
+          <button
+            key={t.id}
+            onClick={() => onChange(t.id)}
+            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200
+                        ${isActive
+                          ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-slate-100'
+                          : 'text-gray-500 hover:text-gray-700 dark:text-slate-400 dark:hover:text-slate-200'}`}
+          >
+            <Icon className={`w-4 h-4 ${isActive ? 'text-violet-600 dark:text-violet-400' : ''}`} />
+            {t.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
 
-  if (!a) {
-    return (
-      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="h-28 rounded-xl bg-white border border-gray-200 dark:bg-slate-800/60 dark:border-slate-700/60 animate-pulse" />
-        ))}
-      </div>
-    )
-  }
-
+function PartsTab({ a }) {
   const t = a.totals
   const dwell = a.dwell
+  const ps = a.parts_summary ?? {}
 
   const statusSegments = [
     { label: 'Completed',   value: t.complete,    dot: 'bg-green-500',  stroke: 'stroke-green-500' },
@@ -94,21 +105,27 @@ export function AnalyticsPage({ tick }) {
 
   const distData = a.dwell_distribution.map(d => ({ label: d.label, value: d.count }))
 
+  const typeData = (ps.part_type_distribution ?? []).map(d => ({
+    label: d.part_type,
+    value: d.count,
+  }))
+
   return (
     <div className="space-y-6">
-      {/* KPI row */}
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
+        <Kpi icon={Package} label="Unique Parts" value={ps.unique_epcs_completed ?? '—'}
+             sub="Distinct EPCs completed" accent={ACCENTS.blue} />
+        <Kpi icon={Factory} label="IBUS Orders" value={ps.unique_ibus_orders ?? '—'}
+             sub="Distinct work orders" accent={ACCENTS.violet} />
+        <Kpi icon={MapPin} label="Avg Stations / Part" value={ps.avg_stations_per_part ?? '—'}
+             sub="Stations visited per tag" accent={ACCENTS.green} />
         <Kpi icon={Clock} label="Avg Dwell" value={dwell.avg_display ?? '—'}
              sub={`${dwell.sample_size} completed`} accent={ACCENTS.violet} />
-        <Kpi icon={Gauge} label="Median Dwell" value={dwell.median_display ?? '—'} accent={ACCENTS.blue} />
-        <Kpi icon={Zap} label="Fastest" value={dwell.fastest_display ?? '—'} accent={ACCENTS.green} />
-        <Kpi icon={Timer} label="Slowest" value={dwell.slowest_display ?? '—'} accent={ACCENTS.amber} />
         <Kpi icon={Percent} label="Completion Rate"
              value={a.completion_rate != null ? `${a.completion_rate}%` : '—'} accent={ACCENTS.green} />
         <Kpi icon={TrendingUp} label="Total Completed" value={t.complete} accent={ACCENTS.slate} />
       </div>
 
-      {/* Longest station highlight + status mix */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <Panel title="Slowest Station" icon={Trophy} iconColor="text-amber-500 dark:text-amber-400"
                subtitle="Highest average dwell time">
@@ -140,7 +157,6 @@ export function AnalyticsPage({ tick }) {
         </Panel>
       </div>
 
-      {/* Throughput trend */}
       <Panel title="Throughput — Last 14 Days" icon={CalendarDays}
              subtitle="Parts completed per day">
         <div className="px-5 py-5">
@@ -150,7 +166,6 @@ export function AnalyticsPage({ tick }) {
         </div>
       </Panel>
 
-      {/* Hour-of-day + dwell distribution */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Panel title="Busiest Hours" icon={Hourglass}
                subtitle={a.busiest_hour ? `Peak at ${hourLabel(a.busiest_hour.hour)} (${a.busiest_hour.completed} parts)` : 'By hour of day'}>
@@ -173,17 +188,26 @@ export function AnalyticsPage({ tick }) {
         </Panel>
       </div>
 
-      {/* Station comparison (avg dwell) */}
-      <Panel title="Average Dwell by Station" icon={Factory} iconColor="text-violet-500 dark:text-violet-400"
-             subtitle="Lower is faster throughput">
-        <div className="px-5 py-5">
-          <HorizontalBars data={stationData} accent="amber" emptyText="No completed parts yet" />
-        </div>
-      </Panel>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Panel title="Average Dwell by Station" icon={Factory} iconColor="text-violet-500 dark:text-violet-400"
+               subtitle="Lower is faster throughput">
+          <div className="px-5 py-5">
+            <HorizontalBars data={stationData} accent="amber" emptyText="No completed parts yet" />
+          </div>
+        </Panel>
 
-      {/* Longest individual parts */}
+        {typeData.length > 0 && (
+          <Panel title="Part Type Mix" icon={Package} iconColor="text-blue-500 dark:text-blue-400"
+                 subtitle="Completed sessions by part type">
+            <div className="px-5 py-5">
+              <HorizontalBars data={typeData} accent="blue" formatValue={v => `${v}`} />
+            </div>
+          </Panel>
+        )}
+      </div>
+
       <Panel title="Longest Dwell Times" icon={Trophy} iconColor="text-amber-500 dark:text-amber-400"
-             subtitle="Top 10 slowest completed parts">
+             subtitle="Top 10 slowest completed parts at a single station">
         {a.longest_parts.length === 0 ? (
           <Empty>No completed parts yet</Empty>
         ) : (
@@ -191,7 +215,7 @@ export function AnalyticsPage({ tick }) {
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left bg-gray-50 dark:bg-slate-900/40 border-b border-gray-200 dark:border-slate-700/60">
-                  {['#', 'Part / EPC', 'Dwell', 'Completed'].map((h, i) => (
+                  {['#', 'Part / EPC', 'Station', 'Dwell', 'Completed'].map((h, i) => (
                     <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap text-gray-600 dark:text-slate-400">{h}</th>
                   ))}
                 </tr>
@@ -201,6 +225,7 @@ export function AnalyticsPage({ tick }) {
                   <tr key={i} className="hover:bg-gray-50 dark:hover:bg-slate-700/30 transition-colors">
                     <td className="px-4 py-2.5 text-gray-400 dark:text-slate-500 tabular-nums">{i + 1}</td>
                     <td className="px-4 py-2.5 font-mono font-semibold text-slate-800 dark:text-slate-100 whitespace-nowrap">{p.part_name ?? p.ibus_number ?? p.epc}</td>
+                    <td className="px-4 py-2.5 text-gray-600 dark:text-slate-300 whitespace-nowrap">{p.station_name ?? '—'}</td>
                     <td className="px-4 py-2.5 font-mono font-semibold text-amber-600 dark:text-amber-400 whitespace-nowrap">
                       {p.dwell_time_display ?? formatDwell(p.dwell_seconds)}
                     </td>
@@ -215,18 +240,183 @@ export function AnalyticsPage({ tick }) {
         )}
       </Panel>
 
-      {/* Operator analytics — coming soon */}
-      <Panel title="Operator Analytics" icon={Users} iconColor="text-slate-400 dark:text-slate-500">
-        <div className="px-5 py-8 text-center">
-          <p className="text-sm text-gray-500 dark:text-slate-400">
-            Per-operator performance and throughput will appear here once operator association is added.
-          </p>
-          <span className="inline-block mt-3 text-xs font-medium px-3 py-1 rounded-full
-                           bg-slate-100 text-slate-500 dark:bg-slate-700/40 dark:text-slate-400">
-            Coming soon
-          </span>
-        </div>
+      <Panel title="Longest Line Times" icon={Timer} iconColor="text-violet-500 dark:text-violet-400"
+             subtitle="End-to-end time per part tag across all stations">
+        {(ps.longest_line_times ?? []).length === 0 ? (
+          <Empty>No completed parts yet</Empty>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left bg-gray-50 dark:bg-slate-900/40 border-b border-gray-200 dark:border-slate-700/60">
+                  {['#', 'EPC', 'Stations', 'Total Line Time'].map((h, i) => (
+                    <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap text-gray-600 dark:text-slate-400">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-slate-700/50">
+                {ps.longest_line_times.map((p, i) => (
+                  <tr key={i} className="hover:bg-gray-50 dark:hover:bg-slate-700/30 transition-colors">
+                    <td className="px-4 py-2.5 text-gray-400 dark:text-slate-500 tabular-nums">{i + 1}</td>
+                    <td className="px-4 py-2.5 font-mono font-semibold text-slate-800 dark:text-slate-100 whitespace-nowrap">{p.epc}</td>
+                    <td className="px-4 py-2.5 tabular-nums text-gray-600 dark:text-slate-300">{p.stations_visited}</td>
+                    <td className="px-4 py-2.5 font-mono font-semibold text-violet-600 dark:text-violet-400 whitespace-nowrap">
+                      {p.total_line_display ?? formatDwell(p.total_line_seconds)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Panel>
+    </div>
+  )
+}
+
+function OperatorsTab({ a }) {
+  const op = a.operators ?? {}
+  const summary = op.summary ?? {}
+  const leaderboard = op.leaderboard ?? []
+  const top = summary.top_operator
+
+  const barData = leaderboard.slice(0, 10).map(o => ({
+    label: o.operator_name ?? `Operator ${o.operator_id}`,
+    value: o.completed_pieces,
+    display: `${o.completed_pieces}`,
+  }))
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-4">
+        <Kpi icon={Users} label="Active Operators" value={summary.active_operators ?? 0}
+             sub="With attributed sessions" accent={ACCENTS.blue} />
+        <Kpi icon={Package} label="Pieces Attributed" value={summary.total_pieces_attributed ?? 0}
+             sub="Completed with operator" accent={ACCENTS.violet} />
+        <Kpi icon={Award} label="Top Operator"
+             value={top?.operator_name ?? '—'}
+             sub={top ? `${top.pieces} pieces completed` : undefined} accent={ACCENTS.amber} />
+        <Kpi icon={Percent} label="RTLS Match Rate"
+             value={summary.rtls_match_rate != null ? `${summary.rtls_match_rate}%` : '—'}
+             sub={`${summary.open_with_operator ?? 0} of ${summary.open_sessions ?? 0} open`} accent={ACCENTS.green} />
+        <Kpi icon={Clock} label="Avg Dwell"
+             value={leaderboard.length
+               ? formatDwell(Math.round(
+                   leaderboard.reduce((s, o) => s + (o.avg_dwell_seconds ?? 0), 0) / leaderboard.length
+                 ))
+               : '—'}
+             sub="Across all operators" accent={ACCENTS.slate} />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Panel title="Pieces Completed" icon={Trophy} iconColor="text-amber-500 dark:text-amber-400"
+               subtitle="Top operators by completed pieces">
+          <div className="px-5 py-5">
+            {barData.length > 0
+              ? <HorizontalBars data={barData} accent="amber" formatValue={v => `${v} pieces`} />
+              : <Empty>No operator data yet — RTLS assignments appear once operators are confirmed at machines</Empty>}
+          </div>
+        </Panel>
+
+        {top && (
+          <Panel title="Top Performer" icon={Award} iconColor="text-amber-500 dark:text-amber-400"
+                 subtitle="Most completed pieces">
+            <div className="px-5 py-6">
+              <div className="flex items-center gap-4">
+                <span className="flex items-center justify-center w-14 h-14 rounded-xl
+                                 bg-amber-50 dark:bg-amber-500/10">
+                  <Users className="w-7 h-7 text-amber-500 dark:text-amber-400" />
+                </span>
+                <div>
+                  <p className="text-2xl font-bold text-gray-900 dark:text-slate-100">{top.operator_name}</p>
+                  <p className="text-sm text-gray-500 dark:text-slate-400 mt-0.5">
+                    <span className="font-semibold text-amber-600 dark:text-amber-400">{top.pieces}</span> pieces completed
+                  </p>
+                </div>
+              </div>
+            </div>
+          </Panel>
+        )}
+      </div>
+
+      <Panel title="Operator Leaderboard" icon={Users} iconColor="text-blue-500 dark:text-blue-400"
+             subtitle="Total pieces and per-machine breakdown">
+        {leaderboard.length === 0 ? (
+          <Empty>No operator assignments recorded yet</Empty>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left bg-gray-50 dark:bg-slate-900/40 border-b border-gray-200 dark:border-slate-700/60">
+                  {['#', 'Operator', 'Completed', 'In Progress', 'Stations', 'Avg Dwell', 'Per Machine'].map((h, i) => (
+                    <th key={i} className="px-4 py-3 font-semibold whitespace-nowrap text-gray-600 dark:text-slate-400">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-slate-700/50">
+                {leaderboard.map((o, i) => (
+                  <tr key={o.operator_id} className="hover:bg-gray-50 dark:hover:bg-slate-700/30 transition-colors align-top">
+                    <td className="px-4 py-3 text-gray-400 dark:text-slate-500 tabular-nums">{i + 1}</td>
+                    <td className="px-4 py-3 font-semibold text-slate-800 dark:text-slate-100 whitespace-nowrap">{o.operator_name}</td>
+                    <td className="px-4 py-3 tabular-nums font-semibold text-green-600 dark:text-green-400">{o.completed_pieces}</td>
+                    <td className="px-4 py-3 tabular-nums text-blue-600 dark:text-blue-400">{o.in_progress || '—'}</td>
+                    <td className="px-4 py-3 tabular-nums text-gray-600 dark:text-slate-300">{o.stations_worked}</td>
+                    <td className="px-4 py-3 font-mono text-gray-600 dark:text-slate-300 whitespace-nowrap">
+                      {o.avg_dwell_display ?? '—'}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-wrap gap-1.5">
+                        {(o.stations ?? []).map(st => (
+                          <span key={st.station}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs
+                                           bg-slate-100 text-slate-700 dark:bg-slate-700/60 dark:text-slate-300"
+                                title={st.avg_dwell_display ? `Avg ${st.avg_dwell_display}` : undefined}>
+                            <span className="font-medium">{st.station}</span>
+                            <span className="tabular-nums font-semibold text-violet-600 dark:text-violet-400">{st.pieces}</span>
+                          </span>
+                        ))}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  )
+}
+
+export function AnalyticsPage({ tick }) {
+  const [a, setA] = useState(null)
+  const [tab, setTab] = useState('parts')
+
+  useEffect(() => {
+    let alive = true
+    apiFetch('/api/analytics')
+      .then(res => { if (alive) setA(res) })
+      .catch(() => {})
+    return () => { alive = false }
+  }, [tick])
+
+  if (!a) {
+    return (
+      <div className="space-y-6">
+        <div className="h-10 w-48 rounded-xl bg-gray-200 dark:bg-slate-700 animate-pulse" />
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="h-28 rounded-xl bg-white border border-gray-200 dark:bg-slate-800/60 dark:border-slate-700/60 animate-pulse" />
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-6">
+      <AnalyticsTabs active={tab} onChange={setTab} />
+      {tab === 'parts' ? <PartsTab a={a} /> : <OperatorsTab a={a} />}
     </div>
   )
 }

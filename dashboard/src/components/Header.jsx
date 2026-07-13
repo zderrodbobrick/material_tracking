@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react'
-import { Radio, LayoutDashboard, FileBarChart, LineChart, Home } from 'lucide-react'
+import { Radio, LayoutDashboard, FileBarChart, LineChart, Home, CheckCircle } from 'lucide-react'
 import { ThemeToggle } from './ThemeToggle'
 
 const TABS = [
   { id: 'live',      label: 'Live Dashboard', icon: LayoutDashboard },
+  { id: 'completed', label: 'Completed IBUS', icon: CheckCircle },
   { id: 'report',    label: 'Full Report',    icon: FileBarChart },
   { id: 'analytics', label: 'Analytics',      icon: LineChart },
 ]
@@ -92,7 +93,7 @@ export function Header({ wsStatus, lastUpdated, isDark, onToggleTheme, activeTab
                  dark:from-slate-950 dark:via-slate-900 dark:to-slate-950
                  text-white shadow-lg backdrop-blur-md"
     >
-      <div className="max-w-screen-2xl mx-auto px-6 py-3.5 flex items-center justify-between gap-4">
+      <div className="w-full px-3 sm:px-4 py-3.5 flex items-center justify-between gap-4">
         <div className="flex items-center gap-4 min-w-0">
           <button onClick={onHome} title="Back to home"
                   className="shrink-0 rounded-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400">
@@ -135,7 +136,7 @@ export function Header({ wsStatus, lastUpdated, isDark, onToggleTheme, activeTab
 
       {/* Navigation row */}
       <div className="border-t border-white/10 bg-black/10">
-        <div className="max-w-screen-2xl mx-auto px-4 sm:px-6">
+        <div className="w-full px-3 sm:px-4">
           <div className="flex items-center gap-1 py-1.5 overflow-x-auto">
             <button onClick={onHome} title="Home"
                     className="flex items-center justify-center w-9 h-9 rounded-lg text-slate-400

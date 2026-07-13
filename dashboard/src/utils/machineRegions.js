@@ -30,7 +30,6 @@ const CHIP_LABELS = {
   Inspect: 'Inspect',
   Anderson: 'Anderson',
   'Pack out': 'Pack out',
-  Packing: 'Packing',
 }
 
 /** Strip Sewio site prefixes: BLA-CL-Gannomat → Gannomat */
@@ -50,7 +49,7 @@ function displayName(zoneIds, station) {
 /** Optional RFID session aliases keyed by station name. */
 const STATION_EXTRAS = {
   'Pack out': {
-    sessionAliases: ['Final Packing', 'Pack out'],
+    sessionAliases: ['Final Packing', 'Pack out', 'Packing'],
   },
 }
 
@@ -97,7 +96,6 @@ export const PRODUCTION_LINE_ORDER = [
   'Inspect',
   'Anderson',
   'Pack out',
-  'Packing',
 ]
 
 /** Full sort order including non-production RTLS zones (queues, debugging). */

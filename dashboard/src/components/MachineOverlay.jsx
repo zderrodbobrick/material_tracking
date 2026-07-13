@@ -25,17 +25,17 @@ export function MachineOverlay({
   const badgeOps = operatorCount > 0
   const badge = badgeParts || badgeOps
 
-  let fill = 'rgba(139, 92, 246, 0.08)'
-  let stroke = 'rgba(139, 92, 246, 0.35)'
+  let fill = 'rgba(56, 189, 248, 0.22)'
+  let stroke = 'rgba(14, 165, 233, 0.9)'
   if (isEditTarget) {
-    fill = 'rgba(14, 165, 233, 0.2)'
-    stroke = 'rgba(14, 165, 233, 0.95)'
+    fill = 'rgba(14, 165, 233, 0.32)'
+    stroke = 'rgba(56, 189, 248, 1)'
   } else if (isPinned) {
-    fill = 'rgba(59, 130, 246, 0.2)'
-    stroke = 'rgba(96, 165, 250, 0.95)'
+    fill = 'rgba(59, 130, 246, 0.28)'
+    stroke = 'rgba(96, 165, 250, 1)'
   } else if (isActive) {
-    fill = 'rgba(139, 92, 246, 0.22)'
-    stroke = 'rgba(167, 139, 250, 0.95)'
+    fill = 'rgba(139, 92, 246, 0.32)'
+    stroke = 'rgba(167, 139, 250, 1)'
   }
 
   const handleActivate = (e) => {
@@ -50,7 +50,7 @@ export function MachineOverlay({
         points={points}
         fill={fill}
         stroke={stroke}
-        strokeWidth={isActive || isPinned || isEditTarget ? 2.5 : 1.5}
+        strokeWidth={isActive || isPinned || isEditTarget ? 2.5 : 2}
         vectorEffect="non-scaling-stroke"
         className={editMode ? 'pointer-events-none' : 'cursor-pointer hover:opacity-90'}
         style={{

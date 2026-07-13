@@ -23,7 +23,8 @@ export function useLiveSocket() {
     sock.on('connect_error', onError)
     sock.on('rfid_update', bump)
 
-    const fallback = setInterval(bump, 1000)
+    // Slow fallback poll — rfid_update handles real-time; avoid hammering the API.
+    const fallback = setInterval(bump, 30000)
 
     if (sock.connected) {
       setWsStatus('live')
