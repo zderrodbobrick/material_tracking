@@ -14,11 +14,37 @@ function slugify(station) {
   return station.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'station'
 }
 
-function displayName(zoneIds) {
+/** Short labels for filter chips / status table (station key → UI text). */
+const CHIP_LABELS = {
+  Holzma: 'Holzma',
+  'Holzma.Falloff': 'Holzma Falloff',
+  LBD: 'LBD',
+  'LB Installation': 'LB Install',
+  '1/2 Edgefinisher': 'Edgefinisher',
+  'Component Stacking': 'Stacking',
+  'Outswing Latch Drilling': 'Outswing Latch',
+  Tenoner: 'Tenoner',
+  Gannomat: 'Gannomat',
+  'Insert Station': 'Insert',
+  'Evolve Drilling': 'Evolve',
+  Inspect: 'Inspect',
+  Anderson: 'Anderson',
+  'Pack out': 'Pack out',
+  Packing: 'Packing',
+}
+
+/** Strip Sewio site prefixes: BLA-CL-Gannomat → Gannomat */
+function displayName(zoneIds, station) {
+  if (CHIP_LABELS[station]) return CHIP_LABELS[station]
   const zid = zoneIds[0]
   const raw = zoneNames[String(zid)]
-  if (!raw) return `Zone ${zid}`
-  return raw.replace(/^BLA-/, '')
+  if (!raw) return station || `Zone ${zid}`
+  return String(raw)
+    .replace(/^BLA-/i, '')
+    .replace(/^CL-/i, '')
+    .replace(/^Hardware-/i, '')
+    .replace(/^TP-/i, '')
+    .trim() || station
 }
 
 /** Optional RFID session aliases keyed by station name. */
@@ -46,7 +72,7 @@ function buildAllStations() {
     const sortedZoneIds = [...zoneIds].sort((a, b) => a - b)
     return {
       id: slugify(station),
-      name: displayName(sortedZoneIds),
+      name: displayName(sortedZoneIds, station),
       station,
       zoneIds: sortedZoneIds,
       polygon: null,

@@ -37,13 +37,15 @@ INSERT_STATION_NAME = os.getenv("INSERT_STATION_NAME", "Insert Station")
 # Use -55 if antennas are close, -65 if far apart
 RSSI_MIN = int(os.getenv("RSSI_MIN", "-65"))
 
-# Exit antenna (port 2): only reads with rssi >= EXIT_RSSI_MIN set exit_time.
-# The last such valid read wins; weaker reads are logged but ignored for close.
+# Exit antenna (port 2): unexpected sightings warn only — they do not end dwell.
 EXIT_RSSI_MIN = int(os.getenv("EXIT_RSSI_MIN", "-65"))
+
+# Insert antenna (port 3): only strong reads close the Gannomat session / end dwell.
+THIRD_RSSI_MIN = int(os.getenv("THIRD_RSSI_MIN", str(EXIT_RSSI_MIN)))
 
 # Temporal filtering: require N reads within throttle window before session starts
 # Prevents stray/distant tags from creating sessions (1=disabled, 3=balanced, 5=strict)
-MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "3"))
+MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "5"))
 
 # Set to True to only process tags containing "IBUS" in their EPC value.
 # Set to False to accept all tags regardless of EPC content.
@@ -57,10 +59,10 @@ EPC_FILTER_PATTERN = os.getenv("EPC_FILTER_PATTERN", r".*IBUS.*" if CHECK_FOR_IB
 # Fast-moving tags: lower throttle for higher resolution, shorter timeouts
 RAW_THROTTLE_SEC = float(os.getenv("RAW_THROTTLE_SEC", "0.05"))     # 50ms between stored reads
 IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "60.0"))      # Idle (non-exit) before sweeper acts
-# Deprecated: Gannomat sessions no longer auto-close after the last exit read.
-# They stay open until antenna 3 (Insert Station entry) confirms the 1→2→3 path.
+# Deprecated: Gannomat sessions no longer close on antenna 2.
+# They stay open until a strong antenna 3 (Insert Station) read ends dwell.
 EXIT_IDLE_TIMEOUT_SEC = float(os.getenv("EXIT_IDLE_TIMEOUT_SEC", "0"))
-ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h — keep alive until antenna 2
+ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h — keep alive until antenna 3
 SWEEP_INTERVAL_SEC = float(os.getenv("SWEEP_INTERVAL_SEC", "1.0"))  # Check every second
 
 # ── Database Pruning ──────────────────────────────────────────────────────────

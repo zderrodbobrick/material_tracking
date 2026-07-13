@@ -30,12 +30,11 @@ export function MachineShapeToolbar({
   onRemoveStation,
   stations = PRODUCTION_LINE_STATIONS,
 }) {
-  const canRemoveSelected = canRemove || draftPoints.length > 0
   const hasSavedShape = canRemove
   const isDrawing = draftPoints.length > 0
 
   return (
-    <div className="absolute inset-x-3 top-3 z-40 flex flex-col gap-2 pointer-events-none">
+    <div className="absolute inset-x-3 top-3 z-50 flex flex-col gap-2 pointer-events-none">
       <div
         className="pointer-events-auto mx-auto w-full max-w-xl rounded-xl border border-sky-200/80
                    bg-white/95 dark:bg-slate-900/95 dark:border-sky-500/30 shadow-lg backdrop-blur-sm
@@ -71,7 +70,7 @@ export function MachineShapeToolbar({
           <button
             type="button"
             onClick={onUndoPoint}
-            disabled={draftPoints.length === 0}
+            disabled={!isDrawing}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs
                        text-gray-600 dark:text-slate-300 border border-gray-200 dark:border-slate-600
                        disabled:opacity-40 hover:bg-gray-50 dark:hover:bg-slate-800"
@@ -83,11 +82,11 @@ export function MachineShapeToolbar({
           <button
             type="button"
             onClick={onRemoveShape}
-            disabled={!canRemoveSelected || saving}
+            disabled={!hasSavedShape || saving}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs
                        text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-500/30
                        disabled:opacity-40 hover:bg-rose-50 dark:hover:bg-rose-500/10"
-            title="Remove this machine's shape and save"
+            title="Remove this machine's saved shape"
           >
             <Trash2 className="w-3 h-3" />
             Remove
@@ -98,7 +97,7 @@ export function MachineShapeToolbar({
             disabled={draftPoints.length < 3}
             className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium
                        bg-sky-600 text-white disabled:opacity-40 hover:bg-sky-500"
-            title="Close polygon (needs 3+ points)"
+            title="Optional: close without snapping (or click the first corner)"
           >
             <Check className="w-3 h-3" />
             Done
@@ -163,10 +162,10 @@ export function MachineShapeToolbar({
           <MousePointerClick className="w-3.5 h-3.5 shrink-0 mt-0.5 text-sky-500" />
           <span>
             {isDrawing
-              ? 'Click to add corners. Done closes this shape and starts fresh for the next click.'
+              ? `${draftPoints.length} corner${draftPoints.length !== 1 ? 's' : ''} — open path until you click back on the first (blue) corner to close.`
               : hasSavedShape
-                ? 'Click the map to draw a new shape (replaces the old one on Done), or Edit to adjust corners.'
-                : 'Click the floor plan to place corners. Click near the first point (or Done) to close.'}
+                ? 'Click the map to draw a new shape, or Edit to adjust corners.'
+                : 'Click the floor plan to place corners as dots and lines — close by returning to the first corner.'}
           </span>
         </p>
       </div>
@@ -175,7 +174,7 @@ export function MachineShapeToolbar({
 }
 
 /**
- * Interactive draft layer inside the floor-plan SVG (viewBox = image pixels).
+ * HTML hit-layer for reliable point placement (SVG pointer events are unreliable).
  */
 export function ShapeDraftLayer({
   draftPoints,
@@ -184,57 +183,55 @@ export function ShapeDraftLayer({
   mapRef,
 }) {
   const dragging = useRef(null)
+  const dragMoved = useRef(false)
+  const layerRef = useRef(null)
   const [cursor, setCursor] = useState(null)
 
   const toPixel = useCallback((clientX, clientY) => {
-    const el = mapRef.current
+    const el = layerRef.current || mapRef.current
     if (!el) return null
     return clientToImagePixel(clientX, clientY, el)
   }, [mapRef])
+
+  const addOrClose = useCallback((pt) => {
+    onDraftChange(prev => {
+      if (
+        prev.length >= 3 &&
+        Math.hypot(pt.x - prev[0][0], pt.y - prev[0][1]) < CLOSE_THRESHOLD_PX
+      ) {
+        queueMicrotask(() => onCloseShape?.())
+        return prev
+      }
+      return [...prev, [pt.x, pt.y]]
+    })
+  }, [onCloseShape, onDraftChange])
+
+  const handleClick = useCallback((e) => {
+    if (dragging.current != null) return
+    if (e.target?.closest?.('[data-vertex-index]')) return
+    const pt = toPixel(e.clientX, e.clientY)
+    if (pt) addOrClose(pt)
+  }, [addOrClose, toPixel])
 
   const handlePointerMove = useCallback((e) => {
     const pt = toPixel(e.clientX, e.clientY)
     if (!pt) return
     setCursor(pt)
     if (dragging.current != null) {
+      dragMoved.current = true
       const idx = dragging.current
-      onDraftChange(prev => {
-        const next = prev.map((p, i) => (i === idx ? [pt.x, pt.y] : p))
-        return next
-      })
+      onDraftChange(prev => prev.map((p, i) => (i === idx ? [pt.x, pt.y] : p)))
     }
   }, [onDraftChange, toPixel])
 
-  const handlePointerUp = useCallback((e) => {
-    if (dragging.current != null) {
-      dragging.current = null
-      return
+  useEffect(() => {
+    const endDrag = () => { dragging.current = null }
+    window.addEventListener('pointerup', endDrag)
+    window.addEventListener('pointercancel', endDrag)
+    return () => {
+      window.removeEventListener('pointerup', endDrag)
+      window.removeEventListener('pointercancel', endDrag)
     }
-    if (e.button !== 0) return
-    // Ignore if released on a vertex handle (drag end already handled)
-    if (e.target?.dataset?.vertexIndex != null) return
-
-    const pt = toPixel(e.clientX, e.clientY)
-    if (!pt) return
-
-    onDraftChange(prev => {
-      if (
-        prev.length >= 3 &&
-        Math.hypot(pt.x - prev[0][0], pt.y - prev[0][1]) < CLOSE_THRESHOLD_PX
-      ) {
-        // Close on next tick so state stays intact for Done
-        queueMicrotask(() => onCloseShape?.())
-        return prev
-      }
-      return [...prev, [pt.x, pt.y]]
-    })
-  }, [onCloseShape, onDraftChange, toPixel])
-
-  const handleVertexDown = useCallback((e, index) => {
-    e.preventDefault()
-    e.stopPropagation()
-    dragging.current = index
-    e.currentTarget.setPointerCapture?.(e.pointerId)
   }, [])
 
   useEffect(() => {
@@ -245,74 +242,113 @@ export function ShapeDraftLayer({
     return () => window.removeEventListener('keydown', onKey)
   }, [draftPoints.length, onCloseShape])
 
-  const previewRing =
-    draftPoints.length > 0 && cursor && dragging.current == null
+  // Open path only — never auto-close to the first point until the user snaps back.
+  const openPath =
+    draftPoints.length > 0 && cursor && dragging.current == null && !nearFirstHint(draftPoints, cursor)
       ? [...draftPoints, [cursor.x, cursor.y]]
       : draftPoints
 
-  const nearFirst =
-    draftPoints.length >= 3 &&
-    cursor &&
-    Math.hypot(cursor.x - draftPoints[0][0], cursor.y - draftPoints[0][1]) < CLOSE_THRESHOLD_PX
+  const nearFirst = nearFirstHint(draftPoints, cursor)
+
+  // Closing preview: rubber-band last → first when cursor is near the first corner.
+  const closePreview =
+    nearFirst && draftPoints.length >= 3
+      ? [...draftPoints, draftPoints[0]]
+      : null
+
+  const pct = (x, y) => ({
+    left: `${(x / FLOOR_PLAN.imageWidth) * 100}%`,
+    top: `${(y / FLOOR_PLAN.imageHeight) * 100}%`,
+  })
 
   return (
-    <g
-      className="shape-draft"
+    <div
+      ref={layerRef}
+      className="absolute inset-0 z-40 cursor-crosshair"
+      onClick={handleClick}
       onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
       onPointerLeave={() => setCursor(null)}
-      style={{ cursor: 'crosshair' }}
+      style={{ background: 'rgba(15, 23, 42, 0.14)' }}
     >
-      <rect
-        x={0}
-        y={0}
-        width={FLOOR_PLAN.imageWidth}
-        height={FLOOR_PLAN.imageHeight}
-        fill="rgba(15, 23, 42, 0.14)"
-      />
-
-      {previewRing.length >= 2 && (
-        <polyline
-          points={pointsAttr(previewRing)}
-          fill="none"
-          stroke="rgba(14, 165, 233, 0.9)"
-          strokeWidth="2"
-          strokeDasharray={draftPoints.length < 3 ? '6 4' : undefined}
-          vectorEffect="non-scaling-stroke"
-          className="pointer-events-none"
-        />
-      )}
-
-      {draftPoints.length >= 3 && (
-        <polygon
-          points={pointsAttr(draftPoints)}
-          fill="rgba(14, 165, 233, 0.16)"
-          stroke="rgba(14, 165, 233, 0.95)"
-          strokeWidth="2"
-          vectorEffect="non-scaling-stroke"
-          className="pointer-events-none"
-        />
-      )}
+      <svg
+        className="absolute inset-0 w-full h-full pointer-events-none"
+        viewBox={`0 0 ${FLOOR_PLAN.imageWidth} ${FLOOR_PLAN.imageHeight}`}
+        preserveAspectRatio="none"
+      >
+        {openPath.length >= 2 && (
+          <polyline
+            points={pointsAttr(openPath)}
+            fill="none"
+            stroke="rgba(14, 165, 233, 0.9)"
+            strokeWidth="2"
+            strokeDasharray="6 4"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        {closePreview && (
+          <>
+            <polygon
+              points={pointsAttr(draftPoints)}
+              fill="rgba(14, 165, 233, 0.18)"
+              stroke="none"
+            />
+            <polyline
+              points={pointsAttr(closePreview)}
+              fill="none"
+              stroke="rgba(14, 165, 233, 0.95)"
+              strokeWidth="2.5"
+              vectorEffect="non-scaling-stroke"
+            />
+          </>
+        )}
+      </svg>
 
       {draftPoints.map(([x, y], i) => {
         const isFirst = i === 0
-        const r = isFirst && nearFirst ? 8 : 5.5
+        const canCloseOnFirst = isFirst && draftPoints.length >= 3
+        const size = isFirst && nearFirst ? 18 : 12
         return (
-          <circle
+          <button
             key={i}
+            type="button"
             data-vertex-index={i}
-            cx={x}
-            cy={y}
-            r={r}
-            fill={isFirst ? '#0ea5e9' : '#fff'}
-            stroke={isFirst ? '#0369a1' : '#0ea5e9'}
-            strokeWidth="2"
-            vectorEffect="non-scaling-stroke"
-            className="cursor-grab active:cursor-grabbing"
-            onPointerDown={e => handleVertexDown(e, i)}
+            title={
+              canCloseOnFirst
+                ? 'Click to close the region (drag to move)'
+                : isFirst
+                  ? 'First corner — return here to close'
+                  : `Corner ${i + 1}`
+            }
+            className="absolute z-10 -translate-x-1/2 -translate-y-1/2 rounded-full border-2
+                       cursor-grab active:cursor-grabbing touch-none shadow"
+            style={{
+              ...pct(x, y),
+              width: size,
+              height: size,
+              background: isFirst ? '#0ea5e9' : '#fff',
+              borderColor: isFirst ? '#0369a1' : '#0ea5e9',
+              boxShadow: isFirst && nearFirst ? '0 0 0 3px rgba(14,165,233,0.45)' : undefined,
+            }}
+            onPointerDown={e => {
+              e.preventDefault()
+              e.stopPropagation()
+              dragMoved.current = false
+              dragging.current = i
+              e.currentTarget.setPointerCapture?.(e.pointerId)
+            }}
+            onClick={e => {
+              e.preventDefault()
+              e.stopPropagation()
+              if (canCloseOnFirst && !dragMoved.current) onCloseShape?.()
+            }}
           />
         )
       })}
-    </g>
+    </div>
   )
+}
+
+function nearFirstHint(draftPoints, cursor) {
+  if (!cursor || draftPoints.length < 3) return false
+  return Math.hypot(cursor.x - draftPoints[0][0], cursor.y - draftPoints[0][1]) < CLOSE_THRESHOLD_PX
 }

@@ -13,6 +13,7 @@ export function MachineOverlay({
   isPinned,
   editMode = false,
   isEditTarget = false,
+  showPartBadge = true,
   onClick,
 }) {
   const polygon = machine.polygon
@@ -20,7 +21,9 @@ export function MachineOverlay({
 
   const points = pointsAttr(polygon)
   const centroid = polygonCentroid(polygon)
-  const badge = partCount > 0 || operatorCount > 0
+  const badgeParts = showPartBadge && partCount > 0
+  const badgeOps = operatorCount > 0
+  const badge = badgeParts || badgeOps
 
   let fill = 'rgba(139, 92, 246, 0.08)'
   let stroke = 'rgba(139, 92, 246, 0.35)'
@@ -68,33 +71,40 @@ export function MachineOverlay({
         }}
       />
       {badge && (
-        <g transform={`translate(${centroid.x}, ${centroid.y - 14})`} className="pointer-events-none">
-          <foreignObject x={-60} y={-12} width={120} height={24}>
-            <div xmlns="http://www.w3.org/1999/xhtml" className="flex justify-center">
-              <span
-                className="whitespace-nowrap px-2 py-0.5 rounded-full text-[10px] font-semibold
-                           bg-violet-600 text-white shadow-md border border-violet-400/50"
-              >
-                {partCount > 0 && `${partCount} part${partCount !== 1 ? 's' : ''}`}
-                {partCount > 0 && operatorCount > 0 && ' · '}
-                {operatorCount > 0 && `${operatorCount} op${operatorCount !== 1 ? 's' : ''}`}
-              </span>
-            </div>
-          </foreignObject>
+        <g transform={`translate(${centroid.x}, ${centroid.y - 10})`} className="pointer-events-none">
+          {/* SVG-native badge stays tiny in viewBox space (foreignObject was scaling huge) */}
+          <rect
+            x={badgeParts && badgeOps ? -16 : -9}
+            y={-5}
+            width={badgeParts && badgeOps ? 32 : 18}
+            height={10}
+            rx={3}
+            fill="#6d28d9"
+            stroke="rgba(255,255,255,0.7)"
+            strokeWidth="0.75"
+          />
+          <text
+            y={2.2}
+            textAnchor="middle"
+            style={{ fontSize: 6, fontWeight: 700, fill: '#fff', letterSpacing: '0.02em' }}
+          >
+            {badgeParts && badgeOps
+              ? `${partCount}p·${operatorCount}o`
+              : badgeParts
+                ? `${partCount}p`
+                : `${operatorCount}op`}
+          </text>
         </g>
       )}
       {(isActive || isEditTarget) && (
         <g transform={`translate(${centroid.x}, ${centroid.y + 8})`} className="pointer-events-none">
-          <foreignObject x={-70} y={0} width={140} height={20}>
-            <div xmlns="http://www.w3.org/1999/xhtml" className="flex justify-center">
-              <span
-                className="whitespace-nowrap text-[9px] font-bold uppercase tracking-wider
-                           px-1.5 py-0.5 rounded bg-violet-600/90 text-white"
-              >
-                {machine.name}
-              </span>
-            </div>
-          </foreignObject>
+          <text
+            y={0}
+            textAnchor="middle"
+            style={{ fontSize: 7, fontWeight: 700, fill: '#a78bfa', letterSpacing: '0.04em' }}
+          >
+            {machine.name}
+          </text>
         </g>
       )}
     </g>

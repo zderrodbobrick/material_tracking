@@ -15,13 +15,13 @@ Antenna role (Entry / Exit) is resolved per-station from rfid_antennas, so
 Session lifecycle
 -----------------
   open      : first valid Entry read at antenna 1 (after MIN_READS_FOR_SESSION threshold)
-  closed    : antenna 3 (Insert Station entry) after a valid 1→2→3 path; dwell = ant2 exit - ant1 entry
-  abandoned : Entry seen but no Exit within ABANDON_TIMEOUT_SEC, or exit seen but no ant 3 in time
-  exit_only : Exit read with no prior Entry
+  closed    : strong antenna 3 (Insert Station) read; dwell = ant3 time - ant1 entry
+  abandoned : Entry seen but no strong ant-3 within ABANDON_TIMEOUT_SEC
+  exit_only : (legacy) exit-only paths — antenna 2 no longer closes sessions
 
-Valid path is antenna 1 → 2 → 3. A direct 1 → 3 skip is ignored.
-After antenna 2, the Gannomat session stays open (no exit-idle timeout) until antenna 3
-confirms arrival at Insert Station.
+Antenna 2 sightings while a session is open are unexpected: they emit a warning only.
+They do not set exit_time, do not end dwell, and do not restart the session.
+The only way dwell ends is a strong read at antenna 3.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from rtls_storage import try_assign_on_session_open
 from config import (
     RSSI_MIN,
     EXIT_RSSI_MIN,
+    THIRD_RSSI_MIN,
     MIN_READS_FOR_SESSION,
     EPC_FILTER_PATTERN,
     ENTER_EVENT,
@@ -103,7 +104,7 @@ def _valid_rssi(rssi) -> bool:
 
 
 def _valid_exit_rssi(rssi) -> bool:
-    """True when an exit-antenna read counts toward exit_time (last valid read wins)."""
+    """True when an exit-antenna read is strong enough to log a warning."""
     if rssi is None:
         return False
     try:
@@ -111,6 +112,17 @@ def _valid_exit_rssi(rssi) -> bool:
     except (TypeError, ValueError):
         return False
     return r >= EXIT_RSSI_MIN and r <= 0
+
+
+def _valid_third_rssi(rssi) -> bool:
+    """True when an antenna-3 read is strong enough to end Gannomat dwell."""
+    if rssi is None:
+        return False
+    try:
+        r = int(rssi)
+    except (TypeError, ValueError):
+        return False
+    return r >= THIRD_RSSI_MIN and r <= 0
 
 
 def _decode_epc(epc: str) -> str:
@@ -313,11 +325,11 @@ class DwellTracker:
                 sid, tag_id, part_id, epc, station_id,
                 _parse_ts(entry_time) if entry_time else None,
             )
-            sess.exit_ts = _parse_ts(exit_time) if exit_time else None
-            sess.has_exit = sess.exit_ts is not None
-            sess.awaiting_insert = (
-                station_id == self._station_id and sess.has_exit
-            )
+            # Antenna 2 no longer marks progress; ignore leftover exit_time on open rows.
+            sess.has_exit = False
+            sess.awaiting_insert = False
+            sess.exit_ts = None
+            sess.exit_rssi = None
             if station_id == self._insert_station_id:
                 self._insert_open[epc] = sess
             else:
@@ -333,6 +345,7 @@ class DwellTracker:
             "raw_stale":      0,
             "session_opened": 0,
             "session_closed": 0,
+            "exit_warnings":  0,
         }
 
         ordered = []
@@ -400,7 +413,9 @@ class DwellTracker:
                 if is_stale:
                     read_status = "stale"
                 elif role == "Exit" and not _valid_exit_rssi(rssi):
-                    read_status = "ignored"  # logged, below EXIT_RSSI_MIN — not used for close
+                    read_status = "ignored"
+                elif antenna_port == THIRD_ANTENNA and not _valid_third_rssi(rssi):
+                    read_status = "ignored"  # weak ant-3 — logged only, does not end dwell
                 else:
                     read_status = "valid"
                 self._conn.execute(
@@ -436,7 +451,7 @@ class DwellTracker:
                     self._handle_exit(epc, tag_id, part_id, reader_dt, rssi, summary)
                 elif antenna_port == THIRD_ANTENNA:
                     self._handle_insert_entry(
-                        epc, tag_id, part_id, reader_dt, reader_iso, key, summary
+                        epc, tag_id, part_id, reader_dt, reader_iso, key, rssi, summary
                     )
 
         return summary
@@ -449,36 +464,32 @@ class DwellTracker:
             self._drop_stale_open(epc, self._open)
             sess = None
 
-        # A new entry after a completed pass -> close the stale one first
-        if sess is not None and sess.has_exit:
-            self._finalize(sess, STATUS_CLOSED, self._open)
-            summary["session_closed"] += 1
-            sess = None
-
-        if sess is None:
-            if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
-                return
-            event_id = self._insert_event(
-                part_id, tag_id, ENTER_EVENT, reader_iso, self._station_id
-            )
-            cur = self._conn.execute(
-                "INSERT INTO part_station_sessions "
-                "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (part_id, tag_id, self._station_id, event_id, reader_iso, STATUS_OPEN),
-            )
-            new_sess = _Session(
-                cur.lastrowid, tag_id, part_id, epc, self._station_id, reader_dt
-            )
-            self._open[epc] = new_sess
-            summary["session_opened"] += 1
-            try_assign_on_session_open(new_sess.session_id, self._station_id)
-        else:
+        # Open session still running — keep the same dwell; never restart on re-entry.
+        if sess is not None:
             sess.last_seen_wall = datetime.now(timezone.utc)
             self._touch_session(sess.session_id)
+            return
+
+        if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
+            return
+        event_id = self._insert_event(
+            part_id, tag_id, ENTER_EVENT, reader_iso, self._station_id
+        )
+        cur = self._conn.execute(
+            "INSERT INTO part_station_sessions "
+            "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (part_id, tag_id, self._station_id, event_id, reader_iso, STATUS_OPEN),
+        )
+        new_sess = _Session(
+            cur.lastrowid, tag_id, part_id, epc, self._station_id, reader_dt
+        )
+        self._open[epc] = new_sess
+        summary["session_opened"] += 1
+        try_assign_on_session_open(new_sess.session_id, self._station_id)
 
     def _handle_exit(self, epc, tag_id, part_id, reader_dt, rssi, summary):
-        """Exit time = last valid read at antenna 2. Session stays open until antenna 3."""
+        """Antenna 2 is unexpected during an open dwell — warn only, never end/restart."""
         sess = self._open.get(epc)
         if sess is not None and not self._session_still_open(sess.session_id):
             self._drop_stale_open(epc, self._open)
@@ -486,44 +497,40 @@ class DwellTracker:
         if sess is None:
             return
         if sess.entry_ts is not None and reader_dt < sess.entry_ts:
-            return  # exit earlier than entry -> ignore
+            return
         if not _valid_exit_rssi(rssi):
-            return  # weak exit — logged in rfid_raw_reads only
+            return
 
-        now = datetime.now(timezone.utc)
-        sess.last_seen_wall = now
-        sess.has_exit = True
-        sess.awaiting_insert = True
-        sess.last_exit_wall = now
-
-        # Last valid exit read wins (reader time, then stronger RSSI on tie).
-        if (
-            sess.exit_ts is None
-            or reader_dt > sess.exit_ts
-            or (reader_dt == sess.exit_ts and rssi > (sess.exit_rssi or -999))
-        ):
-            sess.exit_ts = reader_dt
-            sess.exit_rssi = rssi
-            self._persist_exit_progress(sess)
-
+        # Do not set exit_time / has_exit / awaiting_insert — dwell keeps running.
+        sess.last_seen_wall = datetime.now(timezone.utc)
         self._touch_session(sess.session_id)
+        summary["exit_warnings"] = summary.get("exit_warnings", 0) + 1
+        print(
+            f"[dwell-warning] Tag seen at antenna {EXIT_ANTENNA} (Exit) while session "
+            f"{sess.session_id} is still open — dwell continues until strong antenna "
+            f"{THIRD_ANTENNA} read. epc={epc!r} rssi={rssi}",
+            flush=True,
+        )
 
-    def _handle_insert_entry(self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary):
-        """Antenna 3 opens Insert Station only after a valid 1→2→3 path."""
+    def _handle_insert_entry(self, epc, tag_id, part_id, reader_dt, reader_iso, key, rssi, summary):
+        """Strong antenna 3 ends Gannomat dwell and opens Insert Station."""
+        if not _valid_third_rssi(rssi):
+            return
+
         gannomat = self._open.get(epc)
         if gannomat is not None and not self._session_still_open(gannomat.session_id):
             self._drop_stale_open(epc, self._open)
             gannomat = None
 
-        # Must have passed antenna 2 first — direct 1→3 is invalid.
-        if gannomat is None or not gannomat.has_exit:
-            return
-
-        if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
-            return
-
-        self._finalize(gannomat, STATUS_CLOSED, self._open)
-        summary["session_closed"] += 1
+        # Close open Gannomat dwell on strong ant-3 — antenna 2 is not required.
+        if gannomat is not None:
+            if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
+                return
+            gannomat.exit_ts = reader_dt
+            gannomat.exit_rssi = int(rssi) if rssi is not None else None
+            gannomat.has_exit = True
+            self._finalize(gannomat, STATUS_CLOSED, self._open)
+            summary["session_closed"] += 1
 
         insert_sess = self._insert_open.get(epc)
         if insert_sess is not None and not self._session_still_open(insert_sess.session_id):
@@ -531,6 +538,8 @@ class DwellTracker:
             insert_sess = None
 
         if insert_sess is None and self._insert_station_id is not None:
+            if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
+                return
             event_id = self._insert_event(
                 part_id, tag_id, ENTER_EVENT, reader_iso, self._insert_station_id
             )
@@ -563,16 +572,6 @@ class DwellTracker:
             (part_id, tag_id, station_id, event_type, event_iso),
         )
         return cur.lastrowid
-
-    def _persist_exit_progress(self, sess: _Session) -> None:
-        """Write antenna-2 exit time while the Gannomat session waits for antenna 3."""
-        if sess.exit_ts is None:
-            return
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
-            "UPDATE part_station_sessions SET exit_time = ?, updated_at = ? WHERE session_id = ?",
-            (sess.exit_ts.isoformat(), now_iso, sess.session_id),
-        )
 
     def _touch_session(self, session_id: int) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -629,12 +628,7 @@ class DwellTracker:
 
                 idle = (now - sess.last_seen_wall).total_seconds()
 
-                # Passed antenna 2 — wait for antenna 3 instead of exit-idle timeout.
-                if sess.awaiting_insert:
-                    if idle >= ABANDON_TIMEOUT_SEC:
-                        self._finalize(sess, STATUS_ABANDONED, self._open)
-                    continue
-
+                # Dwell stays open until strong antenna 3 (or abandon timeout).
                 if sess.entry_ts is None:
                     if idle >= IDLE_TIMEOUT_SEC:
                         self._finalize(sess, STATUS_EXIT_ONLY, self._open)
@@ -653,7 +647,7 @@ class DwellTracker:
     # ── finalize ──────────────────────────────────────────────────────────
 
     def _finalize(self, sess: _Session, status: str, bucket: dict[str, _Session]) -> None:
-        """Close a session. Gannomat dwell uses antenna-2 exit minus antenna-1 entry."""
+        """Close a session. Gannomat dwell = close time (antenna 3) − antenna 1 entry."""
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if sess.has_exit and sess.exit_ts is not None:

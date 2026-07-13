@@ -319,6 +319,8 @@ def index():
             "GET  /api/rtls/live",
             "GET  /api/machine-shapes",
             "PUT  /api/machine-shapes",
+            "GET  /api/antenna-placements",
+            "PUT  /api/antenna-placements",
             "POST /api/sessions/<id>/end",
         ],
     })
@@ -342,6 +344,7 @@ def live_sessions():
     ).fetchall()
     sessions = [_session_dict(r) for r in rows]
     _attach_operators(db, sessions)
+    _attach_last_antennas(db, sessions)
     db.close()
     return jsonify(sessions)
 
@@ -588,6 +591,83 @@ def rtls_live():
     return jsonify(get_live_state())
 
 
+def _attach_last_antennas(db: sqlite3.Connection, sessions: list[dict]) -> list[dict]:
+    """Attach the most recent RFID antenna sighting for each live session EPC."""
+    if not sessions:
+        return sessions
+
+    epcs = list({s["epc"] for s in sessions if s.get("epc")})
+    by_epc: dict[str, dict] = {}
+    if epcs:
+        placeholders = ",".join("?" * len(epcs))
+        rows = db.execute(
+            f"""SELECT rr.epc, rr.antenna_port, rr.antenna_id, rr.rssi,
+                       rr.reader_timestamp, rr.server_received_at,
+                       a.antenna_name, a.antenna_role, st.station_name AS antenna_station
+                FROM rfid_raw_reads rr
+                LEFT JOIN rfid_antennas a ON rr.antenna_id = a.antenna_id
+                LEFT JOIN stations st ON a.station_id = st.station_id
+                WHERE rr.read_id IN (
+                    SELECT MAX(read_id) FROM rfid_raw_reads
+                    WHERE epc IN ({placeholders})
+                    GROUP BY epc
+                )""",
+            epcs,
+        ).fetchall()
+        for r in rows:
+            by_epc[r["epc"]] = {
+                "last_antenna_id": r["antenna_id"],
+                "last_antenna_port": r["antenna_port"],
+                "last_antenna_name": r["antenna_name"],
+                "last_antenna_role": r["antenna_role"],
+                "last_antenna_station": r["antenna_station"],
+                "last_rssi": r["rssi"],
+                "last_read_time": r["reader_timestamp"] or r["server_received_at"],
+            }
+
+    # Catalog fallback by station + role when no raw read is available
+    ant_rows = db.execute(
+        """SELECT a.antenna_id, a.antenna_port, a.antenna_name, a.antenna_role,
+                  s.station_name
+           FROM rfid_antennas a
+           LEFT JOIN stations s ON a.station_id = s.station_id"""
+    ).fetchall()
+    by_station_role: dict[tuple[str, str], dict] = {}
+    for a in ant_rows:
+        if a["station_name"] and a["antenna_role"]:
+            by_station_role[(a["station_name"], a["antenna_role"])] = {
+                "last_antenna_id": a["antenna_id"],
+                "last_antenna_port": a["antenna_port"],
+                "last_antenna_name": a["antenna_name"],
+                "last_antenna_role": a["antenna_role"],
+                "last_antenna_station": a["station_name"],
+            }
+
+    for s in sessions:
+        hit = by_epc.get(s.get("epc") or "")
+        if hit:
+            s.update(hit)
+            continue
+        role = "Exit" if s.get("exit_time") else "Entry"
+        station = s.get("station_name") or ""
+        fb = by_station_role.get((station, role))
+        if fb:
+            s.update(fb)
+            s["last_rssi"] = None
+            s["last_read_time"] = s.get("exit_time") or s.get("entry_time")
+        else:
+            s.update({
+                "last_antenna_id": None,
+                "last_antenna_port": None,
+                "last_antenna_name": None,
+                "last_antenna_role": role,
+                "last_antenna_station": station or None,
+                "last_rssi": None,
+                "last_read_time": s.get("exit_time") or s.get("entry_time"),
+            })
+    return sessions
+
+
 # ── Machine floor-plan shapes (polygons in image pixels) ──────────────────────
 
 MACHINE_SHAPES_PATH = Path(__file__).parent / "RTLS" / "machineShapes.json"
@@ -647,6 +727,60 @@ def put_machine_shapes():
 
     MACHINE_SHAPES_PATH.parent.mkdir(parents=True, exist_ok=True)
     MACHINE_SHAPES_PATH.write_text(
+        json.dumps(cleaned, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return jsonify(cleaned)
+
+
+# ── Antenna floor-plan placements (image pixels) ──────────────────────────────
+
+ANTENNA_PLACEMENTS_PATH = Path(__file__).parent / "RTLS" / "antennaPlacements.json"
+
+
+def _load_antenna_placements() -> dict:
+    if not ANTENNA_PLACEMENTS_PATH.exists():
+        return {}
+    import json
+    try:
+        data = json.loads(ANTENNA_PLACEMENTS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+@app.route("/api/antenna-placements")
+def get_antenna_placements():
+    return jsonify(_load_antenna_placements())
+
+
+@app.route("/api/antenna-placements", methods=["PUT"])
+def put_antenna_placements():
+    import json
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Expected a JSON object of antenna_id -> {x,y,visible}"}), 400
+
+    cleaned = {}
+    for key, val in body.items():
+        if not isinstance(val, dict):
+            continue
+        try:
+            x = float(val.get("x"))
+            y = float(val.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if not (x == x and y == y):
+            continue
+        cleaned[str(key)] = {
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "visible": bool(val.get("visible", True)),
+        }
+
+    ANTENNA_PLACEMENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ANTENNA_PLACEMENTS_PATH.write_text(
         json.dumps(cleaned, indent=2) + "\n",
         encoding="utf-8",
     )

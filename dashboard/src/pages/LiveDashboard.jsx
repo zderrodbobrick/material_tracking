@@ -1,15 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Map as MapIcon, Radio, Users, AlertCircle, X, Pin, Factory, Pencil } from 'lucide-react'
+import { Map as MapIcon, Radio, Users, AlertCircle, Pin, Factory, Pencil, MapPin, Eye, EyeOff } from 'lucide-react'
 import { Panel } from '../components/Panel'
 import { LiveQueueTable } from '../components/LiveQueueTable'
 import { MachineOverlay, MachineOverlaySvg } from '../components/MachineOverlay'
 import { MachineShapeToolbar, ShapeDraftLayer } from '../components/MachineShapeEditor'
+import { AntennaPlaceToolbar, AntennaPlaceLayer, AntennaMarkers } from '../components/AntennaEditor'
+import { PartChipLayer } from '../components/PartChipLayer'
 import { MachineStatusTable } from '../components/MachineStatusPanel'
 import { StationDetailModal } from '../components/StationDetailModal'
 import { useRtlsLive } from '../hooks/useRtlsLive'
 import { apiFetch, apiPut } from '../api'
 import { FLOOR_PLAN, sewioToPercentClamped } from '../utils/floorPlanCoords'
 import { normalizeShapesMap } from '../utils/machinePolygons'
+import {
+  normalizeAntennaPlacements,
+  placementsToPayload,
+} from '../utils/antennaPlacements'
 import {
   ALL_STATIONS,
   PINNABLE_STATIONS,
@@ -25,6 +31,7 @@ import floorPlanImg from '../assets/floor_plan.png'
 const MAX_PINNED = PINNABLE_STATIONS.length
 const PINNED_STORAGE_KEY = 'liveDashboard.pinnedStations'
 const VISIBLE_MACHINES_KEY = 'liveDashboard.visibleMachines'
+const SHOW_ANTENNAS_KEY = 'liveDashboard.showAntennaMarkers'
 
 function defaultVisibleMachines() {
   return PRODUCTION_LINE_STATIONS.map(s => s.station)
@@ -130,11 +137,13 @@ function OperatorMarker({ op, colors, zone, offMap, pos, editMode = false }) {
 function FloorPlanMap({
   rtls,
   sessionsByStation,
+  liveSessions,
   operators,
   zoneByTag,
   selectedMachine,
   pinnedSet,
   onMachineClick,
+  onPartClick,
   machines,
   stationsForPresence,
   editMode,
@@ -142,8 +151,18 @@ function FloorPlanMap({
   draftPoints,
   onDraftChange,
   onCloseShape,
+  antennaMode,
+  antennas,
+  antennaPlacements,
+  selectedAntennaId,
+  onPlaceAntenna,
+  onSelectAntenna,
+  onRemoveAntenna,
+  showAntennaMarkers,
   mapRef,
 }) {
+  const mapBusy = editMode || antennaMode
+
   return (
     <div
       ref={mapRef}
@@ -157,10 +176,16 @@ function FloorPlanMap({
         draggable={false}
       />
       <div className="absolute inset-0 z-10 overflow-visible rounded-lg">
-        <MachineOverlaySvg className={editMode ? 'z-30' : 'z-10'}>
-          {machines.map(machine => {
+        <MachineOverlaySvg
+          className={
+            antennaMode || editMode
+              ? 'z-20 pointer-events-none'
+              : 'z-10'
+          }
+        >
+          {/* Machine regions locked (non-interactive) while drawing shapes or placing antennas */}
+          {!antennaMode && machines.map(machine => {
             const parts = sessionsByStation[machine.station] ?? []
-            // Hide saved fill only while actively placing/editing draft vertices
             if (editMode && editStation === machine.station && draftPoints.length > 0) return null
             return (
               <MachineOverlay
@@ -170,21 +195,48 @@ function FloorPlanMap({
                 operatorCount={operatorsInMachineZone(rtls, machine, stationsForPresence).length}
                 isActive={selectedMachine?.id === machine.id}
                 isPinned={pinnedSet.has(machine.station)}
-                editMode={editMode}
+                editMode={editMode || antennaMode}
                 isEditTarget={editMode && editStation === machine.station}
+                showPartBadge={false}
                 onClick={e => onMachineClick(machine, e)}
               />
             )
           })}
-          {editMode && (
-            <ShapeDraftLayer
-              draftPoints={draftPoints}
-              onDraftChange={onDraftChange}
-              onCloseShape={onCloseShape}
-              mapRef={mapRef}
+          {!antennaMode && !editMode && (
+            <AntennaMarkers
+              placements={antennaPlacements}
+              antennas={antennas}
+              showMarkers={showAntennaMarkers}
             />
           )}
         </MachineOverlaySvg>
+        {!antennaMode && !editMode && (
+          <PartChipLayer
+            sessions={liveSessions}
+            placements={antennaPlacements}
+            machines={machines}
+            onPartClick={onPartClick}
+          />
+        )}
+        {editMode && (
+          <ShapeDraftLayer
+            draftPoints={draftPoints}
+            onDraftChange={onDraftChange}
+            onCloseShape={onCloseShape}
+            mapRef={mapRef}
+          />
+        )}
+        {antennaMode && (
+          <AntennaPlaceLayer
+            mapRef={mapRef}
+            selectedId={selectedAntennaId}
+            placements={antennaPlacements}
+            antennas={antennas}
+            onPlace={onPlaceAntenna}
+            onSelect={onSelectAntenna}
+            onRemove={onRemoveAntenna}
+          />
+        )}
         {operators.map((op, i) => {
           const pos = sewioToPercentClamped(op.x, op.y)
           return (
@@ -195,7 +247,7 @@ function FloorPlanMap({
               zone={zoneByTag.get(op.tag_id)}
               offMap={pos.offMap}
               colors={MARKER_COLORS[i % MARKER_COLORS.length]}
-              editMode={editMode}
+              editMode={mapBusy}
             />
           )
         })}
@@ -219,24 +271,51 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [shapeMessage, setShapeMessage] = useState(null)
+  const [antennas, setAntennas] = useState([])
+  const [antennaPlacements, setAntennaPlacements] = useState({})
+  const [antennaMode, setAntennaMode] = useState(false)
+  const [selectedAntennaId, setSelectedAntennaId] = useState(null)
+  const [antennaDirty, setAntennaDirty] = useState(false)
+  const [antennaSaving, setAntennaSaving] = useState(false)
+  const [showAntennaMarkers, setShowAntennaMarkers] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SHOW_ANTENNAS_KEY)
+      return raw == null ? true : raw === 'true'
+    } catch {
+      return true
+    }
+  })
   const mapRef = useRef(null)
   const shapesBaseline = useRef({})
+  const antennaBaseline = useRef({})
 
   useEffect(() => {
     let cancelled = false
-    apiFetch('/api/machine-shapes')
-      .then(data => {
-        if (cancelled) return
-        const normalized = normalizeShapesMap(data)
-        setShapesMap(normalized)
-        shapesBaseline.current = normalized
-        setShapesLoaded(true)
-      })
-      .catch(() => {
-        if (!cancelled) setShapesLoaded(true)
-      })
+    Promise.all([
+      apiFetch('/api/machine-shapes').catch(() => ({})),
+      apiFetch('/api/antenna-placements').catch(() => ({})),
+      apiFetch('/api/antennas').catch(() => []),
+    ]).then(([shapes, placements, ants]) => {
+      if (cancelled) return
+      const normalizedShapes = normalizeShapesMap(shapes)
+      setShapesMap(normalizedShapes)
+      shapesBaseline.current = normalizedShapes
+      const normalizedPlacements = normalizeAntennaPlacements(placements)
+      setAntennaPlacements(normalizedPlacements)
+      antennaBaseline.current = normalizedPlacements
+      const list = Array.isArray(ants) ? ants : []
+      setAntennas(list)
+      if (list.length > 0) {
+        setSelectedAntennaId(String(list[0].antenna_id))
+      }
+      setShapesLoaded(true)
+    })
     return () => { cancelled = true }
   }, [])
+
+  useEffect(() => {
+    localStorage.setItem(SHOW_ANTENNAS_KEY, String(showAntennaMarkers))
+  }, [showAntennaMarkers])
 
   const stationsWithShapes = useMemo(
     () => applyMachineShapes(ALL_STATIONS, shapesMap),
@@ -331,16 +410,24 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   }, [])
 
   const handleMachineClick = useCallback((machine, e) => {
-    if (editMode) return
+    if (editMode || antennaMode) return
     if (e.shiftKey) {
       e.preventDefault()
       togglePinStation(machine.station)
       return
     }
     setSelectedMachine(machine)
-  }, [editMode, togglePinStation])
+  }, [antennaMode, editMode, togglePinStation])
+
+  const handlePartClick = useCallback((session) => {
+    if (editMode || antennaMode) return
+    const station = stationsWithShapes.find(s => s.station === session.station_name)
+      ?? PRODUCTION_LINE_STATIONS.find(s => s.station === session.station_name)
+    if (station) setSelectedMachine(station)
+  }, [antennaMode, editMode, stationsWithShapes])
 
   const enterEditMode = useCallback(() => {
+    setAntennaMode(false)
     setEditMode(true)
     setSelectedMachine(null)
     setDraftPoints([])
@@ -354,6 +441,88 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
       setDirty(false)
     }
   }, [dirty])
+
+  const enterAntennaMode = useCallback(() => {
+    setEditMode(false)
+    setDraftPoints([])
+    setAntennaMode(true)
+    setSelectedMachine(null)
+    setShowAntennaMarkers(true)
+  }, [])
+
+  const exitAntennaMode = useCallback(() => {
+    setAntennaMode(false)
+    if (antennaDirty) {
+      setAntennaPlacements(antennaBaseline.current)
+      setAntennaDirty(false)
+    }
+  }, [antennaDirty])
+
+  const handlePlaceAntenna = useCallback((antennaId, x, y, opts = {}) => {
+    const id = String(antennaId)
+    setAntennaPlacements(prev => {
+      const existing = prev[id]
+      const wasNew = !existing
+      const next = {
+        ...prev,
+        [id]: {
+          x,
+          y,
+          visible: opts.keepVisible && existing ? existing.visible !== false : true,
+        },
+      }
+      // After placing a new antenna, select the next one that still needs a pin
+      if (wasNew && !opts.keepVisible) {
+        const nextUnplaced = antennas.find(a => {
+          const aid = String(a.antenna_id)
+          return aid !== id && !next[aid]
+        })
+        if (nextUnplaced) {
+          queueMicrotask(() => setSelectedAntennaId(String(nextUnplaced.antenna_id)))
+        } else {
+          queueMicrotask(() => setSelectedAntennaId(id))
+        }
+      }
+      return next
+    })
+    setAntennaDirty(true)
+    if (opts.keepVisible) setSelectedAntennaId(id)
+  }, [antennas])
+
+  const handleRemoveAntennaPlacement = useCallback((antennaId) => {
+    if (antennaId == null || antennaId === '') return
+    const id = String(antennaId)
+    setAntennaPlacements(prev => {
+      if (!prev[id]) return prev
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    setAntennaDirty(true)
+  }, [])
+
+  const handleRemoveAllAntennas = useCallback(() => {
+    if (Object.keys(antennaPlacements).length === 0) return
+    if (!window.confirm('Remove all antenna pins from the map?')) return
+    setAntennaPlacements({})
+    setAntennaDirty(true)
+  }, [antennaPlacements])
+
+  const handleSaveAntennaPlacements = useCallback(async () => {
+    setAntennaSaving(true)
+    try {
+      const saved = await apiPut('/api/antenna-placements', placementsToPayload(antennaPlacements))
+      const normalized = normalizeAntennaPlacements(saved)
+      setAntennaPlacements(normalized)
+      antennaBaseline.current = normalized
+      setAntennaDirty(false)
+      setShapeMessage('Antenna placements saved.')
+    } catch {
+      setShapeMessage('Could not save antenna placements — is the API running?')
+    } finally {
+      setAntennaSaving(false)
+    }
+  }, [antennaPlacements])
 
   const commitDraftToShapes = useCallback((points) => {
     setShapesMap(prev => {
@@ -532,7 +701,7 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
 
       <Panel
         title="Floor Plan"
-        subtitle="Live operator positions — drawn shapes define machine edges"
+        subtitle="Operators at live XY · parts at last RFID antenna"
         icon={MapIcon}
         iconColor="text-violet-500 dark:text-violet-400"
       >
@@ -588,61 +757,47 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           </div>
         )}
 
-        <div className="px-4 sm:px-5 pt-4 space-y-2">
+        <div className="px-4 sm:px-5 pt-4 space-y-3">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1">
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1 shrink-0">
               <Pin className="w-3 h-3" />
-              Live queues:
+              Queues
             </span>
             {PINNABLE_STATIONS.map(name => {
               const pinned = pinnedSet.has(name)
               const count = sessionsByStation[name]?.length ?? 0
+              const label = PRODUCTION_LINE_STATIONS.find(s => s.station === name)?.name ?? name
               return (
                 <button
                   key={name}
                   type="button"
                   onClick={() => togglePinStation(name)}
                   disabled={!pinned && pinLimitReached}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-medium
                               border transition-colors
                     ${pinned
                       ? 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 dark:bg-blue-500/15 dark:text-blue-300 dark:border-blue-500/30 dark:hover:bg-blue-500/25'
                       : pinLimitReached
                         ? 'bg-gray-50 text-gray-400 border-gray-200 cursor-not-allowed dark:bg-slate-800 dark:text-slate-500 dark:border-slate-700'
-                        : 'bg-white text-gray-600 border-gray-200 hover:border-violet-300 hover:text-violet-700 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600 dark:hover:border-violet-500/40'
+                        : 'bg-transparent text-gray-600 border-gray-200/80 hover:border-violet-300 hover:text-violet-700 dark:text-slate-300 dark:border-slate-600 dark:hover:border-violet-500/40'
                     }`}
-                  title={pinned ? `Unpin ${name} queue` : `Pin ${name} queue`}
+                  title={pinned ? `Unpin ${label}` : `Pin ${label} queue`}
                 >
-                  {name}
+                  {label}
                   {count > 0 && (
                     <span className={`tabular-nums ${pinned ? 'text-blue-500' : 'text-gray-400 dark:text-slate-500'}`}>
-                      ({count})
+                      {count}
                     </span>
                   )}
-                  {pinned && <X className="w-3 h-3 opacity-70" />}
                 </button>
               )
             })}
-            <button
-              type="button"
-              onClick={editMode ? exitEditMode : enterEditMode}
-              className={`ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
-                          border transition-colors
-                ${editMode
-                  ? 'bg-sky-50 text-sky-700 border-sky-300 dark:bg-sky-500/15 dark:text-sky-300 dark:border-sky-500/40'
-                  : 'bg-white text-gray-600 border-gray-200 hover:border-sky-300 hover:text-sky-700 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600'
-                }`}
-              title="Draw machine shapes on the floor plan"
-            >
-              <Pencil className="w-3 h-3" />
-              {editMode ? 'Exit draw' : 'Draw shapes'}
-            </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1">
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1 shrink-0">
               <Factory className="w-3 h-3" />
-              Machines:
+              Machines
             </span>
             {PRODUCTION_LINE_STATIONS.map(st => {
               const visible = visibleMachineSet.has(st.station)
@@ -655,7 +810,7 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                   key={st.id}
                   type="button"
                   onClick={() => toggleMachineVisibility(st.station)}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
+                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-xs font-medium
                               border transition-colors
                     ${visible
                       ? inUse
@@ -663,29 +818,28 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                         : light === 'amber'
                           ? 'bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/30'
                           : 'bg-white text-gray-700 border-gray-200 hover:bg-gray-50 dark:bg-slate-800 dark:text-slate-200 dark:border-slate-600 dark:hover:bg-slate-700'
-                      : 'bg-gray-50 text-gray-400 border-gray-200 hover:border-gray-300 dark:bg-slate-900 dark:text-slate-500 dark:border-slate-700'
+                      : 'bg-transparent text-gray-400 border-transparent hover:border-gray-300 hover:text-gray-600 dark:text-slate-500 dark:hover:text-slate-300'
                     }`}
-                  title={visible ? `Hide ${st.name}` : `Show ${st.name}`}
+                  title={visible ? `Hide ${st.name} from status table` : `Show ${st.name}`}
                 >
-                  {visible && light && light !== 'idle' && (
+                  {visible && (
                     <span className={`w-1.5 h-1.5 rounded-full shrink-0
-                      ${light === 'green'
+                      ${inUse
                         ? 'bg-green-500'
                         : light === 'amber'
                           ? 'bg-amber-500'
-                          : 'bg-slate-400 dark:bg-slate-500'
+                          : 'bg-slate-300 dark:bg-slate-500'
                       }`}
                     />
                   )}
                   {st.name}
-                  {shapesLoaded && hasShape && (
+                  {shapesLoaded && hasShape && visible && (
                     <span className="w-1 h-1 rounded-full bg-sky-400 shrink-0" title="Has map shape" />
                   )}
-                  {visible && <X className="w-3 h-3 opacity-50" />}
                 </button>
               )
             })}
-            {hasVisibleMachines && (
+            {hasVisibleMachines ? (
               <button
                 type="button"
                 onClick={hideAllMachines}
@@ -694,14 +848,62 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
               >
                 Hide all
               </button>
-            )}
-            {!hasVisibleMachines && (
+            ) : (
               <button
                 type="button"
                 onClick={() => setVisibleMachines(defaultVisibleMachines())}
                 className="text-xs text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 px-1"
               >
                 Show all
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-0.5 border-t border-gray-100 dark:border-slate-700/60">
+            <span className="text-xs font-medium text-gray-500 dark:text-slate-400 shrink-0">
+              Map
+            </span>
+            <button
+              type="button"
+              onClick={editMode ? exitEditMode : enterEditMode}
+              disabled={antennaMode}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium
+                          border transition-colors disabled:opacity-40
+                ${editMode
+                  ? 'bg-sky-50 text-sky-700 border-sky-300 dark:bg-sky-500/15 dark:text-sky-300 dark:border-sky-500/40'
+                  : 'bg-transparent text-gray-600 border-gray-200 hover:border-sky-300 hover:text-sky-700 dark:text-slate-300 dark:border-slate-600'
+                }`}
+              title="Draw machine shapes on the floor plan"
+            >
+              <Pencil className="w-3 h-3" />
+              {editMode ? 'Exit draw' : 'Draw shapes'}
+            </button>
+            <button
+              type="button"
+              onClick={antennaMode ? exitAntennaMode : enterAntennaMode}
+              disabled={editMode}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium
+                          border transition-colors disabled:opacity-40
+                ${antennaMode
+                  ? 'bg-amber-50 text-amber-800 border-amber-300 dark:bg-amber-500/15 dark:text-amber-300 dark:border-amber-500/40'
+                  : 'bg-transparent text-gray-600 border-gray-200 hover:border-amber-300 hover:text-amber-700 dark:text-slate-300 dark:border-slate-600'
+                }`}
+              title="Place RFID antennas used for part chip locations"
+            >
+              <MapPin className="w-3 h-3" />
+              {antennaMode ? 'Exit antennas' : 'Place antennas'}
+            </button>
+            {!antennaMode && (
+              <button
+                type="button"
+                onClick={() => setShowAntennaMarkers(v => !v)}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs
+                           text-gray-500 border border-gray-200 dark:border-slate-600
+                           hover:bg-gray-50 dark:hover:bg-slate-800"
+                title={showAntennaMarkers ? 'Hide antenna pins' : 'Show antenna pins'}
+              >
+                {showAntennaMarkers ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                {showAntennaMarkers ? 'Pins on' : 'Pins off'}
               </button>
             )}
           </div>
@@ -737,14 +939,32 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                   stations={PRODUCTION_LINE_STATIONS}
                 />
               )}
+              {antennaMode && (
+                <AntennaPlaceToolbar
+                  antennas={antennas}
+                  selectedId={selectedAntennaId}
+                  onSelect={setSelectedAntennaId}
+                  placements={antennaPlacements}
+                  onRemove={handleRemoveAntennaPlacement}
+                  onRemoveAll={handleRemoveAllAntennas}
+                  onSave={handleSaveAntennaPlacements}
+                  onCancel={exitAntennaMode}
+                  saving={antennaSaving}
+                  dirty={antennaDirty}
+                  showMarkers={showAntennaMarkers}
+                  onToggleShowMarkers={() => setShowAntennaMarkers(v => !v)}
+                />
+              )}
               <FloorPlanMap
                 rtls={rtls}
                 sessionsByStation={sessionsByStation}
+                liveSessions={liveSessions}
                 operators={operators}
                 zoneByTag={zoneByTag}
                 selectedMachine={selectedMachine}
                 pinnedSet={pinnedSet}
                 onMachineClick={handleMachineClick}
+                onPartClick={handlePartClick}
                 machines={mapMachines}
                 stationsForPresence={stationsWithShapes}
                 editMode={editMode}
@@ -752,6 +972,14 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                 draftPoints={draftPoints}
                 onDraftChange={setDraftPoints}
                 onCloseShape={handleCloseShape}
+                antennaMode={antennaMode}
+                antennas={antennas}
+                antennaPlacements={antennaPlacements}
+                selectedAntennaId={selectedAntennaId}
+                onPlaceAntenna={handlePlaceAntenna}
+                onSelectAntenna={setSelectedAntennaId}
+                onRemoveAntenna={handleRemoveAntennaPlacement}
+                showAntennaMarkers={showAntennaMarkers}
                 mapRef={mapRef}
               />
             </div>
@@ -786,10 +1014,12 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           <p className="mt-3 text-xs text-gray-500 dark:text-slate-400 text-center">
             {editMode
               ? 'Draw mode — click corners around a machine, then Done · Save to persist'
-              : hasPinnedQueues
-                ? 'Queues stack in line order (Gannomat above Insert) · Shift+click a machine to pin or unpin · Click for details'
-                : 'Shift+click a machine on the map to show its live queue · Click for details'}
-            {!editMode && hasVisibleMachines
+              : antennaMode
+                ? 'Antenna mode — select an antenna, click the map to place it · Save to persist · Hide pins anytime'
+                : hasPinnedQueues
+                  ? 'Amber chips = parts at last antenna · Round dots = operators · Shift+click machine to pin queue'
+                  : 'Amber chips = parts at last antenna · Round dots = operators · Click machine or chip for details'}
+            {!editMode && !antennaMode && hasVisibleMachines
               ? ` · ${visibleMachineStatuses.length} machine${visibleMachineStatuses.length !== 1 ? 's' : ''} shown (${machinesInUseCount} in use)`
               : ''}
             {' · '}Origin at white rectangle top-left · {FLOOR_PLAN.scalePxPerM} px/m
