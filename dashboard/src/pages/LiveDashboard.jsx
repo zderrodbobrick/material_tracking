@@ -1,17 +1,22 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Map as MapIcon, Radio, Users, AlertCircle, X, Pin, Factory } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Map as MapIcon, Radio, Users, AlertCircle, X, Pin, Factory, Pencil } from 'lucide-react'
 import { Panel } from '../components/Panel'
 import { LiveQueueTable } from '../components/LiveQueueTable'
-import { MachineOverlay } from '../components/MachineOverlay'
+import { MachineOverlay, MachineOverlaySvg } from '../components/MachineOverlay'
+import { MachineShapeToolbar, ShapeDraftLayer } from '../components/MachineShapeEditor'
 import { MachineStatusTable } from '../components/MachineStatusPanel'
 import { StationDetailModal } from '../components/StationDetailModal'
 import { useRtlsLive } from '../hooks/useRtlsLive'
+import { apiFetch, apiPut } from '../api'
 import { FLOOR_PLAN, sewioToPercentClamped } from '../utils/floorPlanCoords'
+import { normalizeShapesMap } from '../utils/machinePolygons'
 import {
-  MACHINES,
+  ALL_STATIONS,
   PINNABLE_STATIONS,
   PRODUCTION_LINE_ORDER,
   PRODUCTION_LINE_STATIONS,
+  applyMachineShapes,
+  machinesWithPolygons,
   operatorsInMachineZone,
 } from '../utils/machineRegions'
 import { getAllStationStatuses } from '../utils/stationStatus'
@@ -70,7 +75,19 @@ function loadPinnedStations() {
   }
 }
 
-function OperatorMarker({ op, colors, zone, offMap, pos }) {
+function shapesToPayload(shapesMap) {
+  const out = {}
+  for (const [station, shape] of Object.entries(shapesMap)) {
+    if (shape?.polygon?.length >= 3) {
+      out[station] = {
+        polygon: shape.polygon.map(([x, y]) => [Math.round(x * 100) / 100, Math.round(y * 100) / 100]),
+      }
+    }
+  }
+  return out
+}
+
+function OperatorMarker({ op, colors, zone, offMap, pos, editMode = false }) {
   const title = [
     op.operator_name || `Tag ${op.tag_id}`,
     `x=${Number(op.x).toFixed(1)} y=${Number(op.y).toFixed(1)}`,
@@ -81,7 +98,7 @@ function OperatorMarker({ op, colors, zone, offMap, pos }) {
   return (
     <div
       data-floor-marker
-      className="absolute z-20 pointer-events-auto"
+      className={`absolute z-20 ${editMode ? 'pointer-events-none opacity-80' : 'pointer-events-auto'}`}
       style={{
         left: pos.left,
         top: pos.top,
@@ -118,9 +135,18 @@ function FloorPlanMap({
   selectedMachine,
   pinnedSet,
   onMachineClick,
+  machines,
+  stationsForPresence,
+  editMode,
+  editStation,
+  draftPoints,
+  onDraftChange,
+  onCloseShape,
+  mapRef,
 }) {
   return (
     <div
+      ref={mapRef}
       className="relative w-full h-full min-h-0 rounded-lg bg-black shadow-inner ring-1 ring-gray-200 dark:ring-slate-700"
       style={{ aspectRatio: `${FLOOR_PLAN.imageWidth} / ${FLOOR_PLAN.imageHeight}` }}
     >
@@ -131,21 +157,34 @@ function FloorPlanMap({
         draggable={false}
       />
       <div className="absolute inset-0 z-10 overflow-visible rounded-lg">
-        {MACHINES.map(machine => {
-          const parts = sessionsByStation[machine.station] ?? []
-          const zoneOps = operatorsInMachineZone(rtls, machine)
-          return (
-            <MachineOverlay
-              key={machine.id}
-              machine={machine}
-              partCount={parts.length}
-              operatorCount={zoneOps.length}
-              isActive={selectedMachine?.id === machine.id}
-              isPinned={pinnedSet.has(machine.station)}
-              onClick={e => onMachineClick(machine, e)}
+        <MachineOverlaySvg className={editMode ? 'z-30' : 'z-10'}>
+          {machines.map(machine => {
+            const parts = sessionsByStation[machine.station] ?? []
+            // Hide saved fill only while actively placing/editing draft vertices
+            if (editMode && editStation === machine.station && draftPoints.length > 0) return null
+            return (
+              <MachineOverlay
+                key={machine.id}
+                machine={machine}
+                partCount={parts.length}
+                operatorCount={operatorsInMachineZone(rtls, machine, stationsForPresence).length}
+                isActive={selectedMachine?.id === machine.id}
+                isPinned={pinnedSet.has(machine.station)}
+                editMode={editMode}
+                isEditTarget={editMode && editStation === machine.station}
+                onClick={e => onMachineClick(machine, e)}
+              />
+            )
+          })}
+          {editMode && (
+            <ShapeDraftLayer
+              draftPoints={draftPoints}
+              onDraftChange={onDraftChange}
+              onCloseShape={onCloseShape}
+              mapRef={mapRef}
             />
-          )
-        })}
+          )}
+        </MachineOverlaySvg>
         {operators.map((op, i) => {
           const pos = sewioToPercentClamped(op.x, op.y)
           return (
@@ -156,6 +195,7 @@ function FloorPlanMap({
               zone={zoneByTag.get(op.tag_id)}
               offMap={pos.offMap}
               colors={MARKER_COLORS[i % MARKER_COLORS.length]}
+              editMode={editMode}
             />
           )
         })}
@@ -171,6 +211,46 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   const [visibleMachines, setVisibleMachines] = useState(loadVisibleMachines)
   const [pinLimitMessage, setPinLimitMessage] = useState(null)
 
+  const [shapesMap, setShapesMap] = useState({})
+  const [shapesLoaded, setShapesLoaded] = useState(false)
+  const [editMode, setEditMode] = useState(false)
+  const [editStation, setEditStation] = useState(PRODUCTION_LINE_STATIONS[0]?.station ?? 'Gannomat')
+  const [draftPoints, setDraftPoints] = useState([])
+  const [dirty, setDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [shapeMessage, setShapeMessage] = useState(null)
+  const mapRef = useRef(null)
+  const shapesBaseline = useRef({})
+
+  useEffect(() => {
+    let cancelled = false
+    apiFetch('/api/machine-shapes')
+      .then(data => {
+        if (cancelled) return
+        const normalized = normalizeShapesMap(data)
+        setShapesMap(normalized)
+        shapesBaseline.current = normalized
+        setShapesLoaded(true)
+      })
+      .catch(() => {
+        if (!cancelled) setShapesLoaded(true)
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  const stationsWithShapes = useMemo(
+    () => applyMachineShapes(ALL_STATIONS, shapesMap),
+    [shapesMap],
+  )
+  const productionStations = useMemo(
+    () => applyMachineShapes(PRODUCTION_LINE_STATIONS, shapesMap),
+    [shapesMap],
+  )
+  const mapMachines = useMemo(
+    () => machinesWithPolygons(stationsWithShapes),
+    [stationsWithShapes],
+  )
+
   useEffect(() => {
     localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(pinnedStations))
   }, [pinnedStations])
@@ -184,6 +264,19 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
     const t = setTimeout(() => setPinLimitMessage(null), 3500)
     return () => clearTimeout(t)
   }, [pinLimitMessage])
+
+  useEffect(() => {
+    if (!shapeMessage) return
+    const t = setTimeout(() => setShapeMessage(null), 4000)
+    return () => clearTimeout(t)
+  }, [shapeMessage])
+
+  // Start a fresh draft when opening draw mode or switching machines —
+  // do not reload the saved polygon (that would continue editing old nodes).
+  useEffect(() => {
+    if (!editMode) return
+    setDraftPoints([])
+  }, [editMode, editStation])
 
   const sessionsByStation = useMemo(() => {
     const grouped = {}
@@ -238,13 +331,110 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   }, [])
 
   const handleMachineClick = useCallback((machine, e) => {
+    if (editMode) return
     if (e.shiftKey) {
       e.preventDefault()
       togglePinStation(machine.station)
       return
     }
     setSelectedMachine(machine)
-  }, [togglePinStation])
+  }, [editMode, togglePinStation])
+
+  const enterEditMode = useCallback(() => {
+    setEditMode(true)
+    setSelectedMachine(null)
+    setDraftPoints([])
+  }, [])
+
+  const exitEditMode = useCallback(() => {
+    setEditMode(false)
+    setDraftPoints([])
+    if (dirty) {
+      setShapesMap(shapesBaseline.current)
+      setDirty(false)
+    }
+  }, [dirty])
+
+  const commitDraftToShapes = useCallback((points) => {
+    setShapesMap(prev => {
+      const next = { ...prev }
+      if (!points || points.length < 3) {
+        delete next[editStation]
+      } else {
+        next[editStation] = { polygon: points.map(([x, y]) => [x, y]) }
+      }
+      return next
+    })
+    setDirty(true)
+  }, [editStation])
+
+  const handleCloseShape = useCallback(() => {
+    if (draftPoints.length < 3) return
+    commitDraftToShapes(draftPoints)
+    setDraftPoints([])
+    setShapeMessage(`Closed shape for ${editStation}. Click Save to keep it — or click the map to draw a new one.`)
+  }, [commitDraftToShapes, draftPoints, editStation])
+
+  const handleEditExistingShape = useCallback(() => {
+    const existing = shapesMap[editStation]?.polygon
+    if (!existing || existing.length < 3) return
+    setDraftPoints(existing.map(([x, y]) => [x, y]))
+    setShapeMessage(`Editing ${editStation} — drag corners, or Remove and redraw.`)
+  }, [editStation, shapesMap])
+
+  const persistShapes = useCallback(async (nextMap, successMessage) => {
+    setSaving(true)
+    try {
+      const saved = await apiPut('/api/machine-shapes', shapesToPayload(nextMap))
+      const normalized = normalizeShapesMap(saved)
+      setShapesMap(normalized)
+      shapesBaseline.current = normalized
+      setDirty(false)
+      setShapeMessage(successMessage ?? 'Machine shapes saved.')
+      return true
+    } catch {
+      setShapeMessage('Could not save shapes — is the API running?')
+      return false
+    } finally {
+      setSaving(false)
+    }
+  }, [])
+
+  const handleRemoveShape = useCallback(async (stationKey = editStation) => {
+    const label = PRODUCTION_LINE_STATIONS.find(s => s.station === stationKey)?.name ?? stationKey
+    if (!window.confirm(`Remove the shape for ${label}?`)) return
+
+    const nextMap = { ...shapesMap }
+    delete nextMap[stationKey]
+    if (stationKey === editStation) setDraftPoints([])
+    setShapesMap(nextMap)
+    await persistShapes(nextMap, `Removed shape for ${label}.`)
+  }, [editStation, persistShapes, shapesMap])
+
+  const handleUndoPoint = useCallback(() => {
+    setDraftPoints(prev => prev.slice(0, -1))
+  }, [])
+
+  const handleSelectEditStation = useCallback((station) => {
+    // Persist current draft into shapes before switching, then start fresh
+    if (draftPoints.length >= 3) {
+      commitDraftToShapes(draftPoints)
+    }
+    setDraftPoints([])
+    setEditStation(station)
+  }, [commitDraftToShapes, draftPoints])
+
+  const handleSaveShapes = useCallback(async () => {
+    let nextMap = shapesMap
+    if (draftPoints.length >= 3) {
+      nextMap = {
+        ...shapesMap,
+        [editStation]: { polygon: draftPoints.map(([x, y]) => [x, y]) },
+      }
+      setShapesMap(nextMap)
+    }
+    await persistShapes(nextMap)
+  }, [draftPoints, editStation, persistShapes, shapesMap])
 
   const zoneByTag = useMemo(() => {
     const lookup = new Map()
@@ -273,8 +463,8 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
   const showNoPositions = rtlsEnabled && connected && operators.length === 0
   const hasPinnedQueues = orderedPinnedStations.length > 0
   const allMachineStatuses = useMemo(
-    () => getAllStationStatuses(PRODUCTION_LINE_STATIONS, PRODUCTION_LINE_ORDER, sessionsByStation, rtls),
-    [sessionsByStation, rtls],
+    () => getAllStationStatuses(productionStations, PRODUCTION_LINE_ORDER, sessionsByStation, rtls),
+    [productionStations, sessionsByStation, rtls],
   )
   const visibleMachineStatuses = useMemo(
     () => allMachineStatuses.filter(s => visibleMachineSet.has(s.stationKey)),
@@ -284,6 +474,11 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
     () => allMachineStatuses.filter(s => s.inUse).length,
     [allMachineStatuses],
   )
+
+  const selectedMachineLive = useMemo(() => {
+    if (!selectedMachine) return null
+    return stationsWithShapes.find(s => s.station === selectedMachine.station) ?? selectedMachine
+  }, [selectedMachine, stationsWithShapes])
 
   return (
     <div className="space-y-4">
@@ -337,7 +532,7 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
 
       <Panel
         title="Floor Plan"
-        subtitle="Live operator positions — pushed over WebSocket"
+        subtitle="Live operator positions — drawn shapes define machine edges"
         icon={MapIcon}
         iconColor="text-violet-500 dark:text-violet-400"
       >
@@ -384,6 +579,15 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           </div>
         )}
 
+        {shapeMessage && (
+          <div className="mx-5 mt-4 flex items-center gap-2 text-sm text-sky-700 dark:text-sky-300
+                          bg-sky-50 dark:bg-sky-500/10 border border-sky-200 dark:border-sky-500/20
+                          rounded-lg px-3 py-2">
+            <AlertCircle className="w-4 h-4 shrink-0" />
+            {shapeMessage}
+          </div>
+        )}
+
         <div className="px-4 sm:px-5 pt-4 space-y-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-medium text-gray-500 dark:text-slate-400 flex items-center gap-1">
@@ -419,6 +623,20 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                 </button>
               )
             })}
+            <button
+              type="button"
+              onClick={editMode ? exitEditMode : enterEditMode}
+              className={`ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium
+                          border transition-colors
+                ${editMode
+                  ? 'bg-sky-50 text-sky-700 border-sky-300 dark:bg-sky-500/15 dark:text-sky-300 dark:border-sky-500/40'
+                  : 'bg-white text-gray-600 border-gray-200 hover:border-sky-300 hover:text-sky-700 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600'
+                }`}
+              title="Draw machine shapes on the floor plan"
+            >
+              <Pencil className="w-3 h-3" />
+              {editMode ? 'Exit draw' : 'Draw shapes'}
+            </button>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -431,6 +649,7 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
               const status = allMachineStatuses.find(s => s.stationKey === st.station)
               const inUse = status?.inUse
               const light = status?.light
+              const hasShape = Boolean(shapesMap[st.station]?.polygon?.length >= 3)
               return (
                 <button
                   key={st.id}
@@ -459,6 +678,9 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                     />
                   )}
                   {st.name}
+                  {shapesLoaded && hasShape && (
+                    <span className="w-1 h-1 rounded-full bg-sky-400 shrink-0" title="Has map shape" />
+                  )}
                   {visible && <X className="w-3 h-3 opacity-50" />}
                 </button>
               )
@@ -493,7 +715,28 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                 : ''
             }
           >
-            <div className={hasPinnedQueues ? 'min-w-0 flex items-start' : ''}>
+            <div className={`relative ${hasPinnedQueues ? 'min-w-0 flex items-start' : ''}`}>
+              {editMode && (
+                <MachineShapeToolbar
+                  draftPoints={draftPoints}
+                  selectedStation={editStation}
+                  onSelectStation={handleSelectEditStation}
+                  onCloseShape={handleCloseShape}
+                  onUndoPoint={handleUndoPoint}
+                  onRemoveShape={() => handleRemoveShape(editStation)}
+                  onRemoveStation={handleRemoveShape}
+                  onEditExisting={handleEditExistingShape}
+                  onCancel={exitEditMode}
+                  onSave={handleSaveShapes}
+                  saving={saving}
+                  dirty={dirty || draftPoints.length >= 3}
+                  canRemove={Boolean(shapesMap[editStation]?.polygon?.length >= 3)}
+                  shapedStations={PRODUCTION_LINE_STATIONS.filter(
+                    s => shapesMap[s.station]?.polygon?.length >= 3,
+                  )}
+                  stations={PRODUCTION_LINE_STATIONS}
+                />
+              )}
               <FloorPlanMap
                 rtls={rtls}
                 sessionsByStation={sessionsByStation}
@@ -502,6 +745,14 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
                 selectedMachine={selectedMachine}
                 pinnedSet={pinnedSet}
                 onMachineClick={handleMachineClick}
+                machines={mapMachines}
+                stationsForPresence={stationsWithShapes}
+                editMode={editMode}
+                editStation={editStation}
+                draftPoints={draftPoints}
+                onDraftChange={setDraftPoints}
+                onCloseShape={handleCloseShape}
+                mapRef={mapRef}
               />
             </div>
 
@@ -533,10 +784,12 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
           )}
 
           <p className="mt-3 text-xs text-gray-500 dark:text-slate-400 text-center">
-            {hasPinnedQueues
-              ? 'Queues stack in line order (Gannomat above Insert) · Shift+click a machine to pin or unpin · Click for details'
-              : 'Shift+click a machine on the map to show its live queue · Click for details'}
-            {hasVisibleMachines
+            {editMode
+              ? 'Draw mode — click corners around a machine, then Done · Save to persist'
+              : hasPinnedQueues
+                ? 'Queues stack in line order (Gannomat above Insert) · Shift+click a machine to pin or unpin · Click for details'
+                : 'Shift+click a machine on the map to show its live queue · Click for details'}
+            {!editMode && hasVisibleMachines
               ? ` · ${visibleMachineStatuses.length} machine${visibleMachineStatuses.length !== 1 ? 's' : ''} shown (${machinesInUseCount} in use)`
               : ''}
             {' · '}Origin at white rectangle top-left · {FLOOR_PLAN.scalePxPerM} px/m
@@ -544,15 +797,15 @@ export function LiveDashboard({ liveSessions = [], onEndSession }) {
         </div>
       </Panel>
 
-      {selectedMachine && (
+      {selectedMachineLive && (
         <StationDetailModal
-          machine={selectedMachine}
-          sessions={sessionsByStation[selectedMachine.station] ?? []}
-          operatorsInZone={operatorsInMachineZone(rtls, selectedMachine)}
+          machine={selectedMachineLive}
+          sessions={sessionsByStation[selectedMachineLive.station] ?? []}
+          operatorsInZone={operatorsInMachineZone(rtls, selectedMachineLive, stationsWithShapes)}
           onClose={() => setSelectedMachine(null)}
-          isPinned={pinnedSet.has(selectedMachine.station)}
+          isPinned={pinnedSet.has(selectedMachineLive.station)}
           pinLimitReached={pinLimitReached}
-          onTogglePin={() => togglePinStation(selectedMachine.station)}
+          onTogglePin={() => togglePinStation(selectedMachineLive.station)}
         />
       )}
     </div>

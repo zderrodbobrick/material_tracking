@@ -40,12 +40,12 @@ function partLabelForSessions(sessions) {
 
 /**
  * Station status for the machine status panel.
- * In use = part (open RFID session) AND operator (RTLS zone presence).
+ * In use = part (open RFID session) AND operator (polygon and/or RTLS zone).
  * Out of use = no part — separate color; operator still shown if present.
  */
-export function getStationStatus(station, sessionsByStation, rtls) {
+export function getStationStatus(station, sessionsByStation, rtls, allStations) {
   const sessions = sessionsForStation(sessionsByStation, station)
-  const zoneOps = operatorsInMachineZone(rtls, station)
+  const zoneOps = operatorsInMachineZone(rtls, station, allStations)
   const activeSessions = sessions.filter(s => s.status === 'open' || s.status === 'exit_only')
 
   const hasPart = activeSessions.length > 0
@@ -80,7 +80,7 @@ export function getAllStationStatuses(allStations, stationOrder, sessionsByStati
 
   return allStations
     .map(station => ({
-      ...getStationStatus(station, sessionsByStation, rtls),
+      ...getStationStatus(station, sessionsByStation, rtls, allStations),
       sortIndex: orderIndex.get(station.station) ?? orderIndex.get(station.name) ?? 999,
     }))
     .sort((a, b) => a.sortIndex - b.sortIndex)

@@ -1,4 +1,5 @@
 import { FLOOR_PLAN } from './floorPlanCoords'
+import { sewioInsidePolygon } from './machinePolygons'
 import zoneMappings from '../../../RTLS/zoneMappings.json'
 import zoneNames from '../../../RTLS/zoneNames.json'
 
@@ -20,14 +21,8 @@ function displayName(zoneIds) {
   return raw.replace(/^BLA-/, '')
 }
 
-/** Optional floor-plan overlays and RFID session aliases keyed by station name. */
+/** Optional RFID session aliases keyed by station name. */
 const STATION_EXTRAS = {
-  Gannomat: {
-    pixelBounds: { x: 390, y: 170, w: 35, h: 90 },
-  },
-  'Insert Station': {
-    pixelBounds: { x: 370, y: 235, w: 20, h: 20 },
-  },
   'Pack out': {
     sessionAliases: ['Final Packing', 'Pack out'],
   },
@@ -54,6 +49,7 @@ function buildAllStations() {
       name: displayName(sortedZoneIds),
       station,
       zoneIds: sortedZoneIds,
+      polygon: null,
       ...STATION_EXTRAS[station],
     }
   })
@@ -105,8 +101,28 @@ export const PRODUCTION_LINE_STATIONS = ALL_STATIONS.filter(s =>
   PRODUCTION_LINE_ORDER.includes(s.station),
 )
 
-/** Stations with floor-plan hit targets (subset of ALL_STATIONS). */
-export const MACHINES = ALL_STATIONS.filter(s => s.pixelBounds)
+/**
+ * Merge saved floor-plan polygons onto station configs.
+ * Stations with a polygon become map hit targets.
+ * Pass null polygon entries are ignored; missing keys leave polygon null.
+ */
+export function applyMachineShapes(stations, shapesMap) {
+  return stations.map(station => {
+    const saved = shapesMap?.[station.station]?.polygon
+    if (Array.isArray(saved) && saved.length >= 3) {
+      return { ...station, polygon: saved.map(([x, y]) => [x, y]) }
+    }
+    return { ...station, polygon: null }
+  })
+}
+
+/** Stations with a drawable / clickable floor-plan polygon. */
+export function machinesWithPolygons(stations = ALL_STATIONS) {
+  return stations.filter(s => Array.isArray(s.polygon) && s.polygon.length >= 3)
+}
+
+/** @deprecated prefer machinesWithPolygons after shapes load */
+export const MACHINES = machinesWithPolygons(ALL_STATIONS)
 
 /** Stations available to pin on the live dashboard (RFID queue panels). */
 export const PINNABLE_STATIONS = [
@@ -150,23 +166,26 @@ function stationForZonePresence(z, stations = ALL_STATIONS) {
   return stations.find(s => s.station === z.station_name) ?? null
 }
 
-function operatorRecord(z, pos) {
+function operatorRecord(z, pos, source = 'zone') {
   return {
-    tag_id: z.tag_id,
-    zone_id: z.zone_id,
-    zone_name: z.zone_name,
+    tag_id: z.tag_id ?? pos?.tag_id,
+    zone_id: z.zone_id ?? null,
+    zone_name: z.zone_name ?? null,
     station_name: z.station_name ?? null,
-    operator_name: z.operator_name ?? pos?.operator_name ?? `Tag ${z.tag_id}`,
-    x: pos?.x,
-    y: pos?.y,
+    operator_name: z.operator_name ?? pos?.operator_name ?? `Tag ${z.tag_id ?? pos?.tag_id}`,
+    x: pos?.x ?? z.x,
+    y: pos?.y ?? z.y,
     at: z.at ?? pos?.at,
     zone_display: pos?.zone_display ?? null,
+    presence_source: source,
   }
 }
 
 /**
- * Assign operators to stations using Sewio zone_presence (same source as rtls_viewer).
- * Each tag appears at most once, keyed by zone enter/exit + REST bootstrap.
+ * Assign operators to stations.
+ * 1) If a station has a floor-plan polygon, operators whose XY falls inside it.
+ * 2) Otherwise Sewio zone_presence (enter/exit), same as rtls_viewer.
+ * Each tag appears at most once (polygon wins over zone when both match).
  */
 export function operatorsByStation(rtls, stations = ALL_STATIONS) {
   const byStation = new Map(stations.map(s => [s.station, []]))
@@ -175,22 +194,53 @@ export function operatorsByStation(rtls, stations = ALL_STATIONS) {
   const posByTag = new Map((rtls.positions ?? []).map(p => [p.tag_id, p]))
   const assigned = new Set()
 
+  const polygonStations = stations.filter(s => Array.isArray(s.polygon) && s.polygon.length >= 3)
+  for (const pos of rtls.positions ?? []) {
+    if (pos.x == null || pos.y == null || assigned.has(pos.tag_id)) continue
+    for (const station of polygonStations) {
+      if (!sewioInsidePolygon(pos.x, pos.y, station.polygon)) continue
+      assigned.add(pos.tag_id)
+      const list = byStation.get(station.station) ?? []
+      list.push(operatorRecord({}, pos, 'polygon'))
+      byStation.set(station.station, list)
+      break
+    }
+  }
+
   for (const z of rtls.zone_presence ?? []) {
-    if (z.status !== 'in') continue
+    if (z.status !== 'in' || assigned.has(z.tag_id)) continue
     const station = stationForZonePresence(z, stations)
-    if (!station || assigned.has(z.tag_id)) continue
+    if (!station) continue
+    // Skip zone fallback when this station already uses a drawn shape —
+    // "inside the shape" is the edge of the machine.
+    if (Array.isArray(station.polygon) && station.polygon.length >= 3) continue
     assigned.add(z.tag_id)
     const list = byStation.get(station.station) ?? []
-    list.push(operatorRecord(z, posByTag.get(z.tag_id)))
+    list.push(operatorRecord(z, posByTag.get(z.tag_id), 'zone'))
     byStation.set(station.station, list)
   }
 
   return byStation
 }
 
-/** Pixel rect → CSS % for responsive overlay positioning. */
+/** Pixel rect → CSS % for responsive overlay positioning (legacy). */
 export function machineBoundsToPercent(machine, cfg = FLOOR_PLAN) {
-  const { x, y, w, h } = machine.pixelBounds
+  const bounds = machine.pixelBounds
+  if (!bounds && machine.polygon?.length) {
+    const xs = machine.polygon.map(p => p[0])
+    const ys = machine.polygon.map(p => p[1])
+    const x = Math.min(...xs)
+    const y = Math.min(...ys)
+    const w = Math.max(...xs) - x
+    const h = Math.max(...ys) - y
+    return {
+      left: `${(x / cfg.imageWidth) * 100}%`,
+      top: `${(y / cfg.imageHeight) * 100}%`,
+      width: `${(w / cfg.imageWidth) * 100}%`,
+      height: `${(h / cfg.imageHeight) * 100}%`,
+    }
+  }
+  const { x, y, w, h } = bounds
   return {
     left: `${(x / cfg.imageWidth) * 100}%`,
     top: `${(y / cfg.imageHeight) * 100}%`,
@@ -199,6 +249,13 @@ export function machineBoundsToPercent(machine, cfg = FLOOR_PLAN) {
   }
 }
 
-export function operatorsInMachineZone(rtls, machine) {
-  return operatorsByStation(rtls).get(machine.station) ?? []
+export function operatorsInMachineZone(rtls, machine, stations = ALL_STATIONS) {
+  const list = stations.map(s =>
+    s.station === machine.station
+      ? { ...s, polygon: machine.polygon ?? s.polygon }
+      : s,
+  )
+  return operatorsByStation(rtls, list).get(machine.station) ?? []
 }
+
+export { sewioInsidePolygon }

@@ -12,3 +12,13 @@ export async function apiPost(path) {
   if (!res.ok) throw new Error(`${res.status}`)
   return res.json()
 }
+
+export async function apiPut(path, body) {
+  const res = await fetch(`${API}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`${res.status}`)
+  return res.json()
+}

@@ -317,6 +317,8 @@ def index():
             "GET  /api/sessions/<id>/operators",
             "GET  /api/rtls/health",
             "GET  /api/rtls/live",
+            "GET  /api/machine-shapes",
+            "PUT  /api/machine-shapes",
             "POST /api/sessions/<id>/end",
         ],
     })
@@ -584,6 +586,71 @@ def rtls_live():
     sys.path.insert(0, str(Path(__file__).parent / "tracking"))
     from rtls_storage import get_live_state
     return jsonify(get_live_state())
+
+
+# ── Machine floor-plan shapes (polygons in image pixels) ──────────────────────
+
+MACHINE_SHAPES_PATH = Path(__file__).parent / "RTLS" / "machineShapes.json"
+
+
+def _load_machine_shapes() -> dict:
+    if not MACHINE_SHAPES_PATH.exists():
+        return {}
+    import json
+    try:
+        data = json.loads(MACHINE_SHAPES_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _normalize_polygon(points) -> list | None:
+    if not isinstance(points, list) or len(points) < 3:
+        return None
+    out = []
+    for pt in points:
+        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+            x, y = float(pt[0]), float(pt[1])
+        elif isinstance(pt, dict) and "x" in pt and "y" in pt:
+            x, y = float(pt["x"]), float(pt["y"])
+        else:
+            return None
+        if not (x == x and y == y):  # NaN check
+            return None
+        out.append([round(x, 2), round(y, 2)])
+    return out
+
+
+@app.route("/api/machine-shapes")
+def get_machine_shapes():
+    return jsonify(_load_machine_shapes())
+
+
+@app.route("/api/machine-shapes", methods=["PUT"])
+def put_machine_shapes():
+    import json
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Expected a JSON object of station -> shape"}), 400
+
+    cleaned = {}
+    for station, shape in body.items():
+        if not isinstance(station, str) or not station.strip():
+            continue
+        if not isinstance(shape, dict):
+            continue
+        poly = _normalize_polygon(shape.get("polygon"))
+        if poly is None:
+            continue
+        cleaned[station.strip()] = {"polygon": poly}
+
+    MACHINE_SHAPES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MACHINE_SHAPES_PATH.write_text(
+        json.dumps(cleaned, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return jsonify(cleaned)
 
 
 # ── Operator endpoints (read only — assignment logic deferred) ────────────────
