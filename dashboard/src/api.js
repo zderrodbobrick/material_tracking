@@ -29,6 +29,12 @@ export async function apiPost(path) {
   return res.json()
 }
 
+export async function apiDelete(path) {
+  const res = await fetch(`${API}${path}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  return res.json()
+}
+
 export async function apiPut(path, body) {
   const res = await fetch(`${API}${path}`, {
     method: 'PUT',

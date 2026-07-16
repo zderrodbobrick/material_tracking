@@ -1,5 +1,4 @@
 import { FLOOR_PLAN } from './floorPlanCoords'
-import { sewioInsidePolygon } from './machinePolygons'
 import zoneMappings from '../../../RTLS/zoneMappings.json'
 import zoneNames from '../../../RTLS/zoneNames.json'
 
@@ -21,12 +20,11 @@ const CHIP_LABELS = {
   LBD: 'LBD',
   'LB Installation': 'LB Install',
   '1/2 Edgefinisher': 'Edgefinisher',
-  'Component Stacking': 'Stacking',
-  'Outswing Latch Drilling': 'Outswing Latch',
   Tenoner: 'Tenoner',
   Gannomat: 'Gannomat',
   'Insert Station': 'Insert',
-  'Evolve Drilling': 'Evolve',
+  'Evolve Edge Finisher': 'Evolve Edge Finisher',
+  'Evolve Drilling': 'Evolve Drilling',
   Inspect: 'Inspect',
   Anderson: 'Anderson',
   'Pack out': 'Pack out',
@@ -48,6 +46,10 @@ function displayName(zoneIds, station) {
 
 /** Optional RFID session aliases keyed by station name. */
 const STATION_EXTRAS = {
+  'LB Installation': {
+    // Outswing Latch Drilling is the same workstation as LB Install
+    sessionAliases: ['LB Installation', 'Outswing Latch Drilling'],
+  },
   'Pack out': {
     sessionAliases: ['Final Packing', 'Pack out', 'Packing'],
   },
@@ -87,11 +89,10 @@ export const PRODUCTION_LINE_ORDER = [
   'LBD',
   'LB Installation',
   '1/2 Edgefinisher',
-  'Component Stacking',
-  'Outswing Latch Drilling',
   'Tenoner',
   'Gannomat',
   'Insert Station',
+  'Evolve Edge Finisher',
   'Evolve Drilling',
   'Inspect',
   'Anderson',
@@ -156,6 +157,7 @@ export const PINNABLE_STATIONS = [
   'Tenoner',
   'Gannomat',
   'Insert Station',
+  'Evolve Edge Finisher',
   'Evolve Drilling',
   'Inspect',
   'Anderson',
@@ -190,57 +192,34 @@ function stationForZonePresence(z, stations = ALL_STATIONS) {
   return stations.find(s => s.station === z.station_name) ?? null
 }
 
-function operatorRecord(z, pos, source = 'zone') {
+function operatorRecord(z) {
   return {
-    tag_id: z.tag_id ?? pos?.tag_id,
+    tag_id: z.tag_id,
     zone_id: z.zone_id ?? null,
     zone_name: z.zone_name ?? null,
     station_name: z.station_name ?? null,
-    operator_name: z.operator_name ?? pos?.operator_name ?? `Tag ${z.tag_id ?? pos?.tag_id}`,
-    x: pos?.x ?? z.x,
-    y: pos?.y ?? z.y,
-    at: z.at ?? pos?.at,
-    zone_display: pos?.zone_display ?? null,
-    presence_source: source,
+    operator_name: z.operator_name ?? `Tag ${z.tag_id}`,
+    at: z.at ?? null,
+    presence_source: 'zone',
   }
 }
 
 /**
- * Assign operators to stations.
- * 1) If a station has a floor-plan polygon, operators whose XY falls inside it.
- * 2) Otherwise Sewio zone_presence (enter/exit), same as rtls_viewer.
- * Each tag appears at most once (polygon wins over zone when both match).
+ * Assign operators to stations from Sewio zone enter/exit only.
+ * Live XY is not used — keeps the dashboard light and lag-free.
  */
 export function operatorsByStation(rtls, stations = ALL_STATIONS) {
   const byStation = new Map(stations.map(s => [s.station, []]))
   if (!rtls) return byStation
 
-  const posByTag = new Map((rtls.positions ?? []).map(p => [p.tag_id, p]))
   const assigned = new Set()
-
-  const polygonStations = stations.filter(s => Array.isArray(s.polygon) && s.polygon.length >= 3)
-  for (const pos of rtls.positions ?? []) {
-    if (pos.x == null || pos.y == null || assigned.has(pos.tag_id)) continue
-    for (const station of polygonStations) {
-      if (!sewioInsidePolygon(pos.x, pos.y, station.polygon)) continue
-      assigned.add(pos.tag_id)
-      const list = byStation.get(station.station) ?? []
-      list.push(operatorRecord({}, pos, 'polygon'))
-      byStation.set(station.station, list)
-      break
-    }
-  }
-
   for (const z of rtls.zone_presence ?? []) {
     if (z.status !== 'in' || assigned.has(z.tag_id)) continue
     const station = stationForZonePresence(z, stations)
     if (!station) continue
-    // Skip zone fallback when this station already uses a drawn shape —
-    // "inside the shape" is the edge of the machine.
-    if (Array.isArray(station.polygon) && station.polygon.length >= 3) continue
     assigned.add(z.tag_id)
     const list = byStation.get(station.station) ?? []
-    list.push(operatorRecord(z, posByTag.get(z.tag_id), 'zone'))
+    list.push(operatorRecord(z))
     byStation.set(station.station, list)
   }
 
@@ -281,5 +260,3 @@ export function operatorsInMachineZone(rtls, machine, stations = ALL_STATIONS) {
   )
   return operatorsByStation(rtls, list).get(machine.station) ?? []
 }
-
-export { sewioInsidePolygon }

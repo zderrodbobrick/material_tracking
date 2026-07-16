@@ -1,0 +1,62 @@
+{
+  "1/2 Edgefinisher": {
+    "x": 210.63,
+    "y": 193.81,
+    "visible": true
+  },
+  "Anderson": {
+    "x": 295.93,
+    "y": 407.92,
+    "visible": true
+  },
+  "Gannomat": {
+    "x": 382.39,
+    "y": 204.83,
+    "visible": true
+  },
+  "Holzma": {
+    "x": 481.61,
+    "y": 205.99,
+    "visible": true
+  },
+  "Holzma.Falloff": {
+    "x": 520.49,
+    "y": 112.57,
+    "visible": true
+  },
+  "Insert Station": {
+    "x": 378.33,
+    "y": 233.84,
+    "visible": true
+  },
+  "LB Installation": {
+    "x": 330.16,
+    "y": 233.84,
+    "visible": true
+  },
+  "LBD": {
+    "x": 425.33,
+    "y": 142.74,
+    "visible": true
+  },
+  "Pack out": {
+    "x": 420.1,
+    "y": 410.82,
+    "visible": true
+  },
+  "Tenoner": {
+    "x": 355.7,
+    "y": 121.85,
+    "visible": true
+  },
+  "Evolve Edge Finisher": {
+    "x": 589.54,
+    "y": 418.37,
+    "visible": true
+  },
+  "Evolve Drilling": {
+    "x": 557.62,
+    "y": 361.5,
+    "visible": true
+  }
+}

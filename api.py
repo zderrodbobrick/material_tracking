@@ -228,6 +228,28 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
         ids,
     ).fetchall()
 
+    # Full RTLS presence history (including left) for completed IBUS drill-down.
+    rtls_hist_rows = db.execute(
+        f"""SELECT sop.session_id, sop.entered_at, sop.confirmed_at, sop.left_at,
+                   o.operator_id, o.operator_name, o.rtls_badge_id,
+                   st.station_name,
+                   COALESCE(poa.zone_name, ocz.zone_name) AS zone_name,
+                   poa.zone_id AS zone_id,
+                   poa.assignment_method
+            FROM session_operator_presence sop
+            JOIN operators o ON sop.operator_id = o.operator_id
+            JOIN stations st ON sop.station_id = st.station_id
+            LEFT JOIN part_operator_assignments poa
+              ON poa.session_id = sop.session_id
+             AND poa.operator_id = sop.operator_id
+            LEFT JOIN operator_current_zone ocz
+              ON ocz.operator_id = o.operator_id
+             AND ocz.station_name = st.station_name
+            WHERE sop.session_id IN ({placeholders})
+            ORDER BY sop.entered_at ASC""",
+        ids,
+    ).fetchall()
+
     live_positions: dict[int, dict] = {}
     if ENABLE_LIVE_INGESTION:
         try:
@@ -258,12 +280,30 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
             )
         )
 
+    rtls_by_session: dict[int, list] = {}
+    for row in rtls_hist_rows:
+        badge = row["rtls_badge_id"]
+        rtls_by_session.setdefault(row["session_id"], []).append({
+            "operator_id": row["operator_id"],
+            "operator_name": row["operator_name"],
+            "rtls_badge_id": badge,
+            "station_name": row["station_name"],
+            "zone_name": row["zone_name"],
+            "zone_id": row["zone_id"],
+            "entered_at": row["entered_at"],
+            "left_at": row["left_at"],
+            "confirmed_at": row["confirmed_at"],
+            "assignment_method": row["assignment_method"],
+            "confirmed": bool(row["confirmed_at"]),
+        })
+
     for s in sessions:
         sid = s["session_id"]
         worked = worked_by_session.get(sid, [])
         present = present_by_session.get(sid, [])
         s["operators_worked"] = worked
         s["operators_present"] = present
+        s["operators_rtls"] = rtls_by_session.get(sid, [])
 
         if worked:
             primary = worked[-1]
@@ -319,10 +359,14 @@ def index():
             "GET  /api/sessions/<id>/operators",
             "GET  /api/rtls/health",
             "GET  /api/rtls/live",
+            "POST /api/rtls/demo",
+            "DELETE /api/rtls/demo",
             "GET  /api/machine-shapes",
             "PUT  /api/machine-shapes",
             "GET  /api/antenna-placements",
             "PUT  /api/antenna-placements",
+            "GET  /api/station-placements",
+            "PUT  /api/station-placements",
             "POST /api/sessions/<id>/end",
         ],
     })
@@ -378,11 +422,10 @@ _LINE_STATIONS = (
     "LBD",
     "LB Installation",
     "1/2 Edgefinisher",
-    "Component Stacking",
-    "Outswing Latch Drilling",
     "Tenoner",
     "Gannomat",
     "Insert Station",
+    "Evolve Edge Finisher",
     "Evolve Drilling",
     "Inspect",
     "Anderson",
@@ -401,6 +444,7 @@ def _station_progress_index(name: str | None) -> int:
     aliases = {
         "Final Packing": "Pack out",
         "Packing": "Pack out",
+        "Outswing Latch Drilling": "LB Installation",
     }
     mapped = aliases.get(n)
     if mapped and mapped in _LINE_STATIONS:
@@ -481,6 +525,7 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                     "part_name": s.get("part_name"),
                     "part_type": s.get("part_type"),
                     "work_order": s.get("work_order"),
+                    "ibus_number": s.get("ibus_number") or tag,
                 }
 
             machine_ops = []
@@ -491,6 +536,11 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                 machine_ops.append({
                     "operator_id": op.get("operator_id"),
                     "operator_name": op.get("operator_name"),
+                    "assigned_at": op.get("assigned_at"),
+                    "assignment_method": op.get("assignment_method"),
+                    "zone_name": op.get("zone_name"),
+                    "station_name": op.get("station_name") or st_name,
+                    "confirmed": True,
                 })
                 if oid not in op_map:
                     op_map[oid] = {
@@ -505,19 +555,53 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                 machine_ops.append({
                     "operator_id": s.get("operator_id"),
                     "operator_name": s.get("operator_name"),
+                    "zone_name": s.get("operator_zone"),
+                    "station_name": st_name,
+                    "confirmed": True,
                 })
+
+            # Prefer full RTLS presence history; fall back to worked assignments.
+            rtls_ops = list(s.get("operators_rtls") or [])
+            if not rtls_ops:
+                for op in machine_ops:
+                    rtls_ops.append({
+                        "operator_id": op.get("operator_id"),
+                        "operator_name": op.get("operator_name"),
+                        "station_name": st_name,
+                        "zone_name": op.get("zone_name"),
+                        "entered_at": s.get("entry_time"),
+                        "left_at": s.get("exit_time"),
+                        "confirmed_at": op.get("assigned_at"),
+                        "assignment_method": op.get("assignment_method"),
+                        "confirmed": True,
+                    })
 
             machines.append({
                 "session_id": s.get("session_id"),
                 "station_name": st_name,
+                "epc": epc,
                 "part_tag": tag,
                 "part_number": s.get("part_number"),
+                "part_name": s.get("part_name"),
+                "part_type": s.get("part_type"),
+                "work_order": s.get("work_order"),
+                "ibus_number": s.get("ibus_number") or tag,
                 "entry_time": s.get("entry_time"),
                 "exit_time": s.get("exit_time"),
                 "dwell_seconds": s.get("dwell_seconds"),
                 "dwell_time_display": s.get("dwell_time_display"),
                 "status": s.get("status"),
                 "operators": machine_ops,
+                "rtls": rtls_ops,
+                "part": {
+                    "epc": s.get("epc"),
+                    "part_tag": tag,
+                    "part_number": s.get("part_number"),
+                    "part_name": s.get("part_name"),
+                    "part_type": s.get("part_type"),
+                    "work_order": s.get("work_order"),
+                    "ibus_number": s.get("ibus_number") or tag,
+                },
             })
 
         entries = [_parse_ts(s.get("entry_time")) for s in sess_list]
@@ -547,6 +631,53 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
 
         wo = key[4:] if key.startswith("IBUS") else (sess_list[0].get("work_order") or "")
 
+        # Nest machines under each part and compute per-part production window.
+        parts_out = []
+        for epc, meta in part_map.items():
+            part_machines = [m for m in machines if m.get("epc") == epc]
+            p_entries = [_parse_ts(m.get("entry_time")) for m in part_machines]
+            p_exits = [_parse_ts(m.get("exit_time")) for m in part_machines]
+            p_entries = [t for t in p_entries if t]
+            p_exits = [t for t in p_exits if t]
+            p_start = min(p_entries) if p_entries else None
+            p_end = max(p_exits) if p_exits else None
+            if has_open and p_start and not p_end:
+                p_total = max(0, int((now - p_start).total_seconds()))
+            elif p_start and p_end:
+                p_total = max(0, int((p_end - p_start).total_seconds()))
+            else:
+                p_total = sum(
+                    int(m["dwell_seconds"]) for m in part_machines
+                    if m.get("dwell_seconds") is not None
+                ) or None
+
+            part_ops: dict[int, dict] = {}
+            for m in part_machines:
+                for op in (m.get("operators") or []):
+                    oid = op.get("operator_id")
+                    if oid is None:
+                        continue
+                    if oid not in part_ops:
+                        part_ops[oid] = {
+                            "operator_id": oid,
+                            "operator_name": op.get("operator_name"),
+                            "stations": [],
+                        }
+                    st = m.get("station_name")
+                    if st and st not in part_ops[oid]["stations"]:
+                        part_ops[oid]["stations"].append(st)
+
+            parts_out.append({
+                **meta,
+                "entry_time": p_start.isoformat() if p_start else None,
+                "exit_time": p_end.isoformat() if p_end else None,
+                "total_production_seconds": p_total,
+                "total_production_display": _dwell_display(p_total),
+                "operators": list(part_ops.values()),
+                "machines": part_machines,
+                "machine_count": len(part_machines),
+            })
+
         journeys.append({
             "key": key,
             "ibus_order": key,
@@ -557,8 +688,8 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
             "part_number": sess_list[0].get("part_number"),
             "part_name": sess_list[0].get("part_name"),
             "part_type": sess_list[0].get("part_type"),
-            "parts": list(part_map.values()),
-            "part_count": len(part_map),
+            "parts": parts_out,
+            "part_count": len(parts_out),
             "status": status,
             "current_station": current_station,
             "progress": round(progress, 3),
@@ -825,6 +956,24 @@ def rtls_live():
     return jsonify(get_live_state())
 
 
+@app.route("/api/rtls/demo", methods=["POST", "DELETE"])
+def rtls_demo():
+    """Seed or clear fake zone operators for offline dashboard testing."""
+    sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+    import rtls_live
+
+    if request.method == "DELETE":
+        removed = rtls_live.clear_demo_zones()
+        return jsonify({"ok": True, "cleared": removed})
+
+    seeded = rtls_live.seed_demo_zones()
+    return jsonify({
+        "ok": True,
+        "count": len(seeded),
+        "zone_presence": seeded,
+    })
+
+
 def _attach_last_antennas(db: sqlite3.Connection, sessions: list[dict]) -> list[dict]:
     """Attach the most recent RFID antenna sighting for each live session EPC."""
     if not sessions:
@@ -1015,6 +1164,63 @@ def put_antenna_placements():
 
     ANTENNA_PLACEMENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     ANTENNA_PLACEMENTS_PATH.write_text(
+        json.dumps(cleaned, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return jsonify(cleaned)
+
+
+# ── Station floor-plan pins (operator map anchors, image pixels) ───────────────
+
+STATION_PLACEMENTS_PATH = Path(__file__).parent / "RTLS" / "stationPlacements.json"
+
+
+def _load_station_placements() -> dict:
+    if not STATION_PLACEMENTS_PATH.exists():
+        return {}
+    import json
+    try:
+        data = json.loads(STATION_PLACEMENTS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+@app.route("/api/station-placements")
+def get_station_placements():
+    return jsonify(_load_station_placements())
+
+
+@app.route("/api/station-placements", methods=["PUT"])
+def put_station_placements():
+    import json
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Expected a JSON object of station -> {x,y,visible}"}), 400
+
+    cleaned = {}
+    for key, val in body.items():
+        if not isinstance(val, dict):
+            continue
+        station = str(key).strip()
+        if not station:
+            continue
+        try:
+            x = float(val.get("x"))
+            y = float(val.get("y"))
+        except (TypeError, ValueError):
+            continue
+        if not (x == x and y == y):
+            continue
+        cleaned[station] = {
+            "x": round(x, 2),
+            "y": round(y, 2),
+            "visible": bool(val.get("visible", True)),
+        }
+
+    STATION_PLACEMENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATION_PLACEMENTS_PATH.write_text(
         json.dumps(cleaned, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -1528,20 +1734,19 @@ def analytics():
 
 _bg_state = {"count": -1, "last_ts": ""}
 _last_direct_emit: float = 0.0
+_last_rfid_emit: float = 0.0
+_RFID_EMIT_DEBOUNCE_SEC = 2.0
 
 
 def _direct_emit(action: str, **extra) -> None:
     global _last_direct_emit
+    # Live XY arrives many times per second — do not wake the whole dashboard.
+    if action == "rtls_position":
+        return
     _last_direct_emit = _time.time()
     ts = _now_utc()
     socketio.emit("rfid_update", {"ts": ts, "action": action})
-    if action == "rtls_position":
-        pos = extra.get("position")
-        if pos:
-            socketio.emit("rtls_position", {"ts": ts, "position": pos})
-        else:
-            _emit_rtls_snapshot(ts)
-    elif action in ("rtls_zone", "rtls_presence", "rtls_zone_refresh"):
+    if action in ("rtls_zone", "rtls_presence", "rtls_zone_refresh"):
         zone = extra.get("zone")
         if zone:
             socketio.emit("rtls_zone", {"ts": ts, "zone": zone})
@@ -1556,14 +1761,14 @@ def _emit_rtls_snapshot(ts: str) -> None:
     socketio.emit("rtls_update", {
         "ts": ts,
         "connected": live.get("connected", False),
-        "positions": live.get("positions", []),
+        "positions": [],
         "zone_presence": live.get("zone_presence", []),
     })
 
 
 def _background_poll():
     while True:
-        _time.sleep(0.5)
+        _time.sleep(1.5)
         try:
             db = get_db()
             row = db.execute(
@@ -1580,7 +1785,9 @@ def _background_poll():
             if count != _bg_state["count"] or last_ts != _bg_state["last_ts"]:
                 _bg_state["count"]   = count
                 _bg_state["last_ts"] = last_ts
-                if _time.time() - _last_direct_emit > 2.0:
+                now = _time.time()
+                if now - _last_direct_emit > _RFID_EMIT_DEBOUNCE_SEC and now - _last_rfid_emit > _RFID_EMIT_DEBOUNCE_SEC:
+                    _last_rfid_emit = now
                     socketio.emit("rfid_update",
                                   {"ts": datetime.now().isoformat(), "action": "db_change"})
         except Exception:

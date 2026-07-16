@@ -9,12 +9,9 @@ export function MachineOverlay({
   machine,
   partCount,
   operatorCount,
-  isActive,
-  isPinned,
   editMode = false,
   isEditTarget = false,
   showPartBadge = true,
-  onClick,
 }) {
   const polygon = machine.polygon
   if (!Array.isArray(polygon) || polygon.length < 3) return null
@@ -30,18 +27,6 @@ export function MachineOverlay({
   if (isEditTarget) {
     fill = 'rgba(14, 165, 233, 0.32)'
     stroke = 'rgba(56, 189, 248, 1)'
-  } else if (isPinned) {
-    fill = 'rgba(59, 130, 246, 0.28)'
-    stroke = 'rgba(96, 165, 250, 1)'
-  } else if (isActive) {
-    fill = 'rgba(139, 92, 246, 0.32)'
-    stroke = 'rgba(167, 139, 250, 1)'
-  }
-
-  const handleActivate = (e) => {
-    if (editMode) return
-    e.stopPropagation()
-    onClick?.(e)
   }
 
   return (
@@ -50,25 +35,11 @@ export function MachineOverlay({
         points={points}
         fill={fill}
         stroke={stroke}
-        strokeWidth={isActive || isPinned || isEditTarget ? 2.5 : 2}
+        strokeWidth={isEditTarget ? 2.5 : 2}
         vectorEffect="non-scaling-stroke"
-        className={editMode ? 'pointer-events-none' : 'cursor-pointer hover:opacity-90'}
-        style={{
-          filter: isPinned || isActive
-            ? 'drop-shadow(0 0 6px rgba(139, 92, 246, 0.35))'
-            : undefined,
-          transition: 'fill 150ms, stroke 150ms',
-        }}
-        onClick={handleActivate}
-        role={editMode ? undefined : 'button'}
-        tabIndex={editMode ? undefined : 0}
-        aria-label={`${machine.name} — ${partCount} part${partCount !== 1 ? 's' : ''}, ${operatorCount} operator${operatorCount !== 1 ? 's' : ''}${isPinned ? ', queue pinned' : ''}`}
-        onKeyDown={editMode ? undefined : (e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault()
-            handleActivate(e)
-          }
-        }}
+        className="pointer-events-none"
+        style={{ transition: 'fill 150ms, stroke 150ms' }}
+        aria-label={`${machine.name} — ${partCount} part${partCount !== 1 ? 's' : ''}, ${operatorCount} operator${operatorCount !== 1 ? 's' : ''}`}
       />
       {badge && (
         <g transform={`translate(${centroid.x}, ${centroid.y - 10})`} className="pointer-events-none">
@@ -96,7 +67,7 @@ export function MachineOverlay({
           </text>
         </g>
       )}
-      {(isActive || isEditTarget) && (
+      {isEditTarget && (
         <g transform={`translate(${centroid.x}, ${centroid.y + 8})`} className="pointer-events-none">
           <text
             y={0}

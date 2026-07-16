@@ -5,7 +5,7 @@ export function Panel({ title, subtitle, icon: Icon, iconColor = 'text-blue-500 
                      dark:bg-slate-800/60 dark:border-slate-700/60 ${className}`}>
       {(title || right) && (
         <div className="px-5 py-4 border-b border-gray-200 dark:border-slate-700/60
-                        flex flex-wrap items-center justify-between gap-3">
+                        flex flex-wrap items-center justify-between gap-3 shrink-0">
           <div className="min-w-0">
             {title && (
               <h2 className="flex items-center gap-2 text-base font-semibold text-gray-900 dark:text-slate-100">

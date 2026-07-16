@@ -121,11 +121,6 @@ export function StationDetailModal({ machine, sessions, operatorsInZone, onClose
                       <p className="text-sm font-semibold text-gray-900 dark:text-slate-100">{op.operator_name}</p>
                       <p className="text-[10px] text-gray-500 dark:text-slate-400">{op.zone_name}</p>
                     </div>
-                    {op.x != null && op.y != null && (
-                      <span className="text-[10px] font-mono text-gray-400 dark:text-slate-500 shrink-0">
-                        {Number(op.x).toFixed(1)}, {Number(op.y).toFixed(1)} m
-                      </span>
-                    )}
                   </li>
                 ))}
               </ul>

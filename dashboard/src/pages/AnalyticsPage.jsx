@@ -388,17 +388,21 @@ function OperatorsTab({ a }) {
   )
 }
 
-export function AnalyticsPage({ tick }) {
+export function AnalyticsPage() {
   const [a, setA] = useState(null)
   const [tab, setTab] = useState('parts')
 
   useEffect(() => {
     let alive = true
-    apiFetch('/api/analytics')
-      .then(res => { if (alive) setA(res) })
-      .catch(() => {})
-    return () => { alive = false }
-  }, [tick])
+    const load = () => {
+      apiFetch('/api/analytics')
+        .then(res => { if (alive) setA(res) })
+        .catch(() => {})
+    }
+    load()
+    const id = setInterval(load, 60000)
+    return () => { alive = false; clearInterval(id) }
+  }, [])
 
   if (!a) {
     return (

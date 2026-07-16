@@ -13,11 +13,11 @@ function shortStation(name) {
   if (hit) {
     // Prefer chip-ish short names from regions via name itself
     return name.replace(/^Insert Station$/, 'Insert')
-      .replace(/^Evolve Drilling$/, 'Evolve')
-      .replace(/^Component Stacking$/, 'Stacking')
+      .replace(/^Evolve Edge Finisher$/, 'Evolve Edge')
+      .replace(/^Evolve Drilling$/, 'Evolve Drill')
       .replace(/^LB Installation$/, 'LB Install')
+      .replace(/^Outswing Latch Drilling$/, 'LB Install')
       .replace(/^1\/2 Edgefinisher$/, 'Edgefinisher')
-      .replace(/^Outswing Latch Drilling$/, 'Outswing')
       .replace(/^Holzma\.Falloff$/, 'Falloff')
   }
   return name
@@ -31,11 +31,11 @@ function progressPct(j) {
 }
 
 /**
- * Right rail: one square card per open IBUS with a top progress bar.
+ * Full-width bottom strip: open IBUS cards with a top progress bar.
  */
 export function IbusOrdersSidebar({ journeys = [] }) {
   return (
-    <aside className="flex flex-col min-h-0 min-w-0 h-full">
+    <aside className="flex flex-col min-h-0 min-w-0 w-full">
       <div
         className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden
                    dark:border-slate-700/60 dark:bg-slate-800/60 flex flex-col flex-1 min-h-0"
@@ -43,7 +43,7 @@ export function IbusOrdersSidebar({ journeys = [] }) {
         <div className="px-4 py-3 border-b border-gray-200 dark:border-slate-700/60 shrink-0">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-slate-100">
             <Package className="w-4 h-4 text-amber-500 dark:text-amber-400" />
-            In IBUS
+            In Progress IBUS
             <span className="ml-auto tabular-nums text-xs font-medium text-gray-400 dark:text-slate-500">
               {journeys.length}
             </span>
@@ -54,19 +54,19 @@ export function IbusOrdersSidebar({ journeys = [] }) {
         </div>
 
         {journeys.length === 0 ? (
-          <p className="px-4 py-10 text-center text-xs text-gray-400 dark:text-slate-500">
+          <p className="px-4 py-8 text-center text-xs text-gray-400 dark:text-slate-500">
             No open IBUS orders
           </p>
         ) : (
-          <div className="p-3.5 overflow-y-auto flex-1 min-h-0">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+          <div className="p-3.5 overflow-y-auto flex-1 min-h-0 max-h-[22rem]">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6 gap-3">
               {journeys.map(j => {
                 const label = ibusLabel(j)
                 const pct = progressPct(j)
                 return (
                   <div
                     key={j.key ?? label}
-                    className="relative aspect-square min-h-[9.5rem] rounded-xl border border-amber-200/80
+                    className="relative aspect-square min-h-[8.5rem] rounded-xl border border-amber-200/80
                                bg-gradient-to-b from-amber-50/80 to-white
                                dark:from-amber-500/10 dark:to-slate-900/40 dark:border-amber-500/25
                                overflow-hidden flex flex-col shadow-sm"

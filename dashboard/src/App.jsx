@@ -7,7 +7,7 @@ import { FullReport } from './pages/FullReport'
 import { AnalyticsPage } from './pages/AnalyticsPage'
 import { useTheme } from './hooks/useTheme'
 import { useLiveSocket } from './hooks/useLiveSocket'
-import { apiFetch, apiPost } from './api'
+import { apiFetch } from './api'
 
 const ENTERED_KEY = 'rfid-entered'
 
@@ -24,23 +24,20 @@ export default function App() {
   const [lastUpdated, setLastUpdated]   = useState(null)
 
   const fetchLive = useCallback(async () => {
-    const [sum, live] = await Promise.allSettled([
-      apiFetch('/api/summary'),
-      apiFetch('/api/live'),
-    ])
-    if (sum.status === 'fulfilled') setSummary(sum.value)
-    if (live.status === 'fulfilled') setLiveSessions(live.value)
+    const live = await apiFetch('/api/live').catch(() => null)
+    if (live) setLiveSessions(live)
     setLastUpdated(new Date())
+  }, [])
+
+  useEffect(() => {
+    apiFetch('/api/summary')
+      .then(setSummary)
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
     if (tab === 'live') fetchLive()
   }, [fetchLive, tick, tab])
-
-  const handleEndSession = useCallback(async (sessionId) => {
-    await apiPost(`/api/sessions/${sessionId}/end`)
-    fetchLive()
-  }, [fetchLive])
 
   const enter = useCallback(() => {
     sessionStorage.setItem(ENTERED_KEY, '1')
@@ -80,11 +77,11 @@ export default function App() {
       />
       <main className="w-full px-3 sm:px-4 py-3">
         {tab === 'live' && (
-          <LiveDashboard liveSessions={liveSessions} onEndSession={handleEndSession} tick={tick} />
+          <LiveDashboard liveSessions={liveSessions} />
         )}
         {tab === 'completed' && <CompletedIbusPage tick={tick} />}
         {tab === 'report' && <FullReport tick={tick} />}
-        {tab === 'analytics' && <AnalyticsPage tick={tick} />}
+        {tab === 'analytics' && <AnalyticsPage />}
       </main>
     </div>
   )

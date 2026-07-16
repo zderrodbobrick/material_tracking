@@ -1,4 +1,5 @@
-import { Factory, X } from 'lucide-react'
+import { Factory } from 'lucide-react'
+import { DwellTimer } from './DwellTimer'
 
 const LIGHT_STYLES = {
   green: {
@@ -28,7 +29,7 @@ function StatusLight({ light }) {
 
   return (
     <span
-      className={`relative flex shrink-0 w-2.5 h-2.5 rounded-full ${style.dot}`}
+      className={`relative flex shrink-0 w-3 h-3 rounded-full ${style.dot}`}
       title={style.title}
     >
       {style.ping && (
@@ -38,7 +39,23 @@ function StatusLight({ light }) {
   )
 }
 
-export function MachineStatusTable({ statuses, onClose }) {
+function DwellCell({ entranceTime, entranceEpochMs }) {
+  if (!entranceTime && entranceEpochMs == null) {
+    return <span className="text-gray-400 dark:text-slate-500">—</span>
+  }
+  return (
+    <DwellTimer
+      entranceTime={entranceTime}
+      entranceEpochMs={entranceEpochMs}
+      exitTime={null}
+      dwellSeconds={null}
+    />
+  )
+}
+
+const COLS = 'grid-cols-[1.5rem_minmax(0,1.15fr)_minmax(0,1fr)_minmax(4.5rem,0.7fr)_minmax(0,1fr)_minmax(4.5rem,0.7fr)]'
+
+export function MachineStatusTable({ statuses }) {
   const inUseCount = statuses.filter(s => s.inUse).length
   const outOfUseCount = statuses.filter(s => !s.inUse && !s.hasPart).length
 
@@ -46,71 +63,63 @@ export function MachineStatusTable({ statuses, onClose }) {
     <div className="animate-fade-in rounded-xl shadow-sm overflow-hidden h-full flex flex-col
                     bg-white border border-gray-200
                     dark:bg-slate-800/60 dark:border-slate-700/60 w-full">
-      <div className="px-3 py-3 border-b border-gray-200 dark:border-slate-700/60 shrink-0">
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-slate-100">
-              <Factory className="w-4 h-4 text-emerald-500 dark:text-emerald-400 shrink-0" />
-              <span className="truncate">Machine Status</span>
-            </h2>
-            <p className="text-xs text-gray-500 dark:text-slate-400 mt-0.5">
-              {statuses.length} shown · {inUseCount} in use · {outOfUseCount} out of use
-            </p>
-          </div>
-          {onClose && (
-            <button
-              type="button"
-              onClick={onClose}
-              className="p-1.5 rounded-md text-gray-400 hover:text-gray-700 hover:bg-gray-100
-                         dark:text-slate-500 dark:hover:text-slate-200 dark:hover:bg-slate-700
-                         transition-colors shrink-0"
-              aria-label="Hide all machines"
-              title="Hide all"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          )}
+      <div className="px-4 py-3.5 border-b border-gray-200 dark:border-slate-700/60 shrink-0">
+        <div className="min-w-0">
+          <h2 className="flex items-center gap-2 text-base font-semibold text-gray-900 dark:text-slate-100">
+            <Factory className="w-5 h-5 text-emerald-500 dark:text-emerald-400 shrink-0" />
+            <span className="truncate">Machine Status</span>
+          </h2>
+          <p className="text-sm text-gray-500 dark:text-slate-400 mt-0.5">
+            {statuses.length} stations · {inUseCount} in use · {outOfUseCount} out of use
+          </p>
         </div>
       </div>
 
-      <div className="overflow-hidden flex-1 min-h-0">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-left bg-gray-50 dark:bg-slate-900/40
-                           border-b border-gray-200 dark:border-slate-700/60">
-              {['', 'Station', 'Part', 'Operator'].map((h, i) => (
-                <th
-                  key={i}
-                  className="px-2.5 py-2 font-semibold whitespace-nowrap text-gray-600 dark:text-slate-400"
-                >
-                  {h}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100 dark:divide-slate-700/50">
-            {statuses.map(row => (
-              <tr
-                key={row.stationKey}
-                className={`transition-colors hover:bg-gray-50 dark:hover:bg-slate-700/30
-                  ${row.inUse ? '' : row.hasPart ? '' : 'opacity-80'}`}
-              >
-                <td className="px-2.5 py-2 whitespace-nowrap">
-                  <StatusLight light={row.light} />
-                </td>
-                <td className="px-2.5 py-2 whitespace-nowrap font-semibold text-gray-900 dark:text-slate-100">
-                  {row.stationName}
-                </td>
-                <td className="px-2.5 py-2 text-gray-700 dark:text-slate-300">
-                  {row.partLabel ?? '—'}
-                </td>
-                <td className="px-2.5 py-2 text-gray-700 dark:text-slate-300">
-                  {row.operatorName ?? '—'}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        <div
+          className={`grid ${COLS} gap-x-2 px-4 py-2.5 text-xs font-semibold uppercase tracking-wide
+                      text-gray-500 dark:text-slate-400 bg-gray-50 dark:bg-slate-900/80
+                      border-b border-gray-200 dark:border-slate-700/60 shrink-0`}
+        >
+          <span />
+          <span>Station</span>
+          <span>Part</span>
+          <span>Part time</span>
+          <span>Operator</span>
+          <span>Op time</span>
+        </div>
+
+        <div className="flex-1 min-h-0 flex flex-col overflow-y-auto">
+          {statuses.map(row => (
+            <div
+              key={row.stationKey}
+              className={`grid ${COLS} gap-x-2 px-4 items-center flex-1 min-h-[2.75rem]
+                          border-b border-gray-100 dark:border-slate-700/40 text-sm
+                          transition-colors hover:bg-gray-50 dark:hover:bg-slate-700/30
+                          ${row.inUse ? '' : row.hasPart ? '' : 'opacity-80'}`}
+            >
+              <StatusLight light={row.light} />
+              <span className="font-semibold text-gray-900 dark:text-slate-100 truncate" title={row.stationName}>
+                {row.stationName}
+              </span>
+              <span className="text-gray-700 dark:text-slate-300 truncate" title={row.partLabel ?? undefined}>
+                {row.partLabel ?? '—'}
+              </span>
+              <span className="whitespace-nowrap">
+                <DwellCell
+                  entranceTime={row.partEntryTime}
+                  entranceEpochMs={row.partEntryEpochMs}
+                />
+              </span>
+              <span className="text-gray-700 dark:text-slate-300 truncate" title={row.operatorName ?? undefined}>
+                {row.operatorName ?? '—'}
+              </span>
+              <span className="whitespace-nowrap">
+                <DwellCell entranceTime={row.operatorEnteredAt} />
+              </span>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   )

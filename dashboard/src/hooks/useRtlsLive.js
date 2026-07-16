@@ -2,16 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiFetch } from '../api'
 import { getSocket } from '../lib/socket'
 
-const BACKUP_POLL_MS = 1000
-
-function mergePosition(prev, position) {
-  const base = prev ?? { positions: [], zone_presence: [], connected: true, enabled: true }
-  const positions = [...(base.positions ?? [])]
-  const idx = positions.findIndex(p => p.tag_id === position.tag_id)
-  if (idx >= 0) positions[idx] = position
-  else positions.push(position)
-  return { ...base, positions }
-}
+const BACKUP_POLL_MS = 5000
 
 function mergeZone(prev, zone) {
   if (!zone?.tag_id) return prev
@@ -28,10 +19,21 @@ function mergeZone(prev, zone) {
   return { ...base, zone_presence }
 }
 
+function zoneOnlyState(res, prev = null) {
+  return {
+    enabled: res?.enabled ?? prev?.enabled ?? true,
+    connected: res?.connected ?? prev?.connected ?? false,
+    last_message_at: res?.last_message_at ?? res?.ts ?? prev?.last_message_at,
+    positions: [],
+    zone_presence: res?.zone_presence ?? prev?.zone_presence ?? [],
+    station_name: res?.station_name ?? prev?.station_name,
+    confirm_seconds: res?.confirm_seconds ?? prev?.confirm_seconds,
+  }
+}
+
 /**
  * Live RTLS state for the floor plan.
- * Primary: Socket.IO `rtls_position` per-tag pushes (minimal latency).
- * Backup: full `rtls_update` + HTTP poll every 1s.
+ * Zone enter/exit only — no live XY position stream (avoids high-frequency re-renders).
  */
 export function useRtlsLive() {
   const [rtls, setRtls] = useState(null)
@@ -41,15 +43,7 @@ export function useRtlsLive() {
   const rtlsRef = useRef(null)
 
   const applyLive = useCallback((res) => {
-    rtlsRef.current = res
-    setRtls(res)
-    setError(null)
-    setFetchedAt(new Date())
-  }, [])
-
-  const applyPosition = useCallback((position) => {
-    if (!position?.tag_id) return
-    const next = mergePosition(rtlsRef.current, position)
+    const next = zoneOnlyState(res, rtlsRef.current)
     rtlsRef.current = next
     setRtls(next)
     setError(null)
@@ -64,6 +58,15 @@ export function useRtlsLive() {
     setError(null)
     setFetchedAt(new Date())
   }, [])
+
+  const refresh = useCallback(() => {
+    return apiFetch('/api/rtls/live')
+      .then(res => { applyLive(res); return res })
+      .catch(err => {
+        if (!rtlsRef.current) setError('Could not load RTLS data')
+        throw err
+      })
+  }, [applyLive])
 
   useEffect(() => {
     let alive = true
@@ -90,41 +93,33 @@ export function useRtlsLive() {
 
     const sock = getSocket()
 
-    const onRtlsPosition = (data) => {
-      if (!alive || !data?.position) return
-      applyPosition(data.position)
-    }
-
     const onRtlsZone = (data) => {
       if (!alive || !data?.zone) return
       applyZone(data.zone)
     }
 
     const onRtlsUpdate = (data) => {
-      if (!alive || !data?.positions) return
+      if (!alive || !data) return
       applyLive({
         enabled: rtlsRef.current?.enabled ?? true,
         connected: data.connected ?? rtlsRef.current?.connected ?? false,
         last_message_at: data.ts ?? rtlsRef.current?.last_message_at,
-        positions: data.positions,
         zone_presence: data.zone_presence ?? rtlsRef.current?.zone_presence ?? [],
         station_name: rtlsRef.current?.station_name,
         confirm_seconds: rtlsRef.current?.confirm_seconds,
       })
     }
 
-    sock.on('rtls_position', onRtlsPosition)
     sock.on('rtls_zone', onRtlsZone)
     sock.on('rtls_update', onRtlsUpdate)
 
     return () => {
       alive = false
       clearInterval(pollId)
-      sock.off('rtls_position', onRtlsPosition)
       sock.off('rtls_zone', onRtlsZone)
       sock.off('rtls_update', onRtlsUpdate)
     }
-  }, [applyLive, applyPosition, applyZone])
+  }, [applyLive, applyZone])
 
-  return { rtls, health, error, fetchedAt }
+  return { rtls, health, error, fetchedAt, refresh }
 }

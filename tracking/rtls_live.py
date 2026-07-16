@@ -311,3 +311,40 @@ def clear_live_state() -> None:
     with _lock:
         _positions.clear()
         _zone_presence.clear()
+
+
+# Stations with floor-plan shapes → (tag_id, zone_id) for offline UI demos.
+_DEMO_ZONE_SEEDS = (
+    (38, 7),   # Lilly → Gannomat
+    (37, 12),  # Pedro → Anderson
+    (22, 18),  # Victor → Tenoner
+    (27, 11),  # Nicholas M → Insert Station
+    (26, 21),  # Keith → Pack out
+    (36, 9),   # Nicholas R → LB Installation
+)
+
+
+def seed_demo_zones() -> list[dict]:
+    """Inject fake zone-presence for dashboard testing without Sewio."""
+    at = datetime.now().astimezone().isoformat()
+    seeded: list[dict] = []
+    for tag_id, zone_id in _DEMO_ZONE_SEEDS:
+        entry = record_zone_event(tag_id, zone_id, "in", at=at)
+        seeded.append(entry)
+    set_connected(True)
+    _notify("rtls_zone_refresh")
+    return seeded
+
+
+def clear_demo_zones() -> int:
+    """Remove demo (and any) zone presence for the demo tag ids."""
+    removed = 0
+    demo_tags = {tag_id for tag_id, _ in _DEMO_ZONE_SEEDS}
+    for tag_id in demo_tags:
+        with _lock:
+            existed = tag_id in _zone_presence
+        if existed:
+            record_zone_event(tag_id, 0, "out")
+            removed += 1
+    _notify("rtls_zone_refresh")
+    return removed
