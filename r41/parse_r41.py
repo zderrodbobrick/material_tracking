@@ -13,19 +13,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-# Progress tracking starts at Tenoner (= 0%).
+# Progress spine (RFID path for now). Tenoner = 0%.
 PROGRESS_STATIONS = (
     "Tenoner",
+    "LBD",
     "Gannomat",
     "Insert Station",
-    "Evolve Edge Finisher",
-    "Evolve Drilling",
-    "Inspect",
-    "Anderson",
-    "Pack out",
 )
 
-PROGRESS_PCT_PER_STATION = round(100 / len(PROGRESS_STATIONS), 2)  # ~9.09%
+PROGRESS_PCT_PER_STATION = round(100 / max(len(PROGRESS_STATIONS) - 1, 1), 2)
 
 _SECTION_RE = re.compile(r"\[([^\]]+)\](.*?)\[\1\]", re.S)
 _ISTK_RE = re.compile(r"^ISTK-(\d+)$", re.I)

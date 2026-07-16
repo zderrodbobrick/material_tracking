@@ -58,16 +58,13 @@ TENONER_EXIT_ANTENNAS = tuple(
 )
 LBD_ANTENNA = int(os.getenv("LBD_ANTENNA", "6"))
 
-# Progress line starts at Tennoner (= 0%). Alias DB name "Tennoner" → "Tenoner".
+# Progress spine (RFID path for now). Alias DB name "Tennoner" → "Tenoner".
+# Order progress = average of each tracked part's index / (len - 1).
 PROGRESS_STATIONS = (
     "Tenoner",
+    "LBD",
     "Gannomat",
     "Insert Station",
-    "Evolve Edge Finisher",
-    "Evolve Drilling",
-    "Inspect",
-    "Anderson",
-    "Pack out",
 )
 
 # Comma-separated IBUS orders hidden from live map + open sidebar (data kept in DB).

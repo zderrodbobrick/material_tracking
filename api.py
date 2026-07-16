@@ -457,14 +457,17 @@ def _station_progress_index(name: str | None) -> int:
     return -1
 
 
-def _progress_fraction(max_idx: int, has_open: bool, status: str) -> float:
-    """Tennoner/Tenoner = 0.0 … Pack out = 1.0."""
+def _progress_fraction(max_idx: int) -> float:
+    """One part: Tenoner = 0.0 … last spine station = 1.0 (by furthest arrival)."""
     denom = max(len(PROGRESS_STATIONS) - 1, 1)
-    if status == "completed" and max_idx >= 0:
-        return 1.0
     if max_idx < 0:
         return 0.0
     return min(1.0, max_idx / denom)
+
+
+def _part_progress_at_station(station_name: str | None) -> float:
+    """Progress for one part from its current (arrival) station on the spine."""
+    return _progress_fraction(_station_progress_index(station_name))
 
 
 def _ibus_order_key(session: dict) -> str:
@@ -635,12 +638,11 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
         open_sess = next((s for s in reversed(sess_list) if s.get("status") == STATUS_OPEN), None)
         current_station = (open_sess or sess_list[-1]).get("station_name")
 
-        progress = _progress_fraction(max_idx, has_open, status)
-
         wo = key[4:] if key.startswith("IBUS") else (sess_list[0].get("work_order") or "")
 
         # Nest machines under each part and compute per-part production window.
         parts_out = []
+        part_progresses: list[float] = []
         for epc, meta in part_map.items():
             part_machines = [m for m in machines if m.get("epc") == epc]
             p_entries = [_parse_ts(m.get("entry_time")) for m in part_machines]
@@ -682,6 +684,10 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
             part_station = (open_m or (part_machines[-1] if part_machines else {})).get(
                 "station_name"
             )
+            part_status = "open" if open_m else "completed"
+            # Current spine station (Tennoner=0% … Insert=100%). Resets if they return.
+            p_prog = _part_progress_at_station(part_station)
+            part_progresses.append(p_prog)
 
             parts_out.append({
                 **meta,
@@ -693,8 +699,15 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                 "machines": part_machines,
                 "machine_count": len(part_machines),
                 "current_station": part_station,
-                "status": "open" if open_m else "completed",
+                "status": part_status,
+                "progress": round(p_prog, 3),
             })
+
+        # Order bar = average of tracked parts only (BOM lines never seen are ignored)
+        if part_progresses:
+            progress = sum(part_progresses) / len(part_progresses)
+        else:
+            progress = _progress_fraction(max_idx)
 
         journeys.append({
             "key": key,

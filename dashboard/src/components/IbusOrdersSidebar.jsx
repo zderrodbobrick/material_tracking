@@ -29,8 +29,8 @@ function progressPct(j) {
   if (typeof j.progress === 'number') {
     return Math.round(Math.min(1, Math.max(0, j.progress)) * 100)
   }
-  const spine = ['Tenoner', 'Gannomat', 'Insert Station', 'Evolve Edge Finisher',
-    'Evolve Drilling', 'Inspect', 'Anderson', 'Pack out']
+  // Fallback spine (RFID path) — API is source of truth
+  const spine = ['Tenoner', 'LBD', 'Gannomat', 'Insert Station']
   const raw = j.current_station === 'Tennoner' ? 'Tenoner' : j.current_station
   const idx = spine.indexOf(raw)
   if (idx < 0) return 0
