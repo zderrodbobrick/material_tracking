@@ -9,19 +9,16 @@ Implements the layered pipeline from Database.md:
               ->  part_station_events (ENTER / EXIT)
               ->  part_station_sessions (dwell time + status)
 
-Antenna role (Entry / Exit) is resolved per-station from rfid_antennas, so
-"entrance" and "exit" are relative to the machine, not hardcoded numbers.
+Session modes
+-------------
+  Dwell (Gannomat, Tennoner):
+    Entry antenna opens a session; a dedicated closer ends it with dwell_seconds.
+    Gannomat: ant 1 opens; ant 2 = at exit (does NOT close); ant 3 Insert closes.
+    Tennoner: ant 7 opens; ant 4/5 close dwell, then hold visible at the table.
 
-Session lifecycle
------------------
-  open      : first valid Entry read at antenna 1 (after MIN_READS_FOR_SESSION threshold)
-  closed    : strong antenna 3 (Insert Station) read; dwell = ant3 time - ant1 entry
-  abandoned : Entry seen but no strong ant-3 within ABANDON_TIMEOUT_SEC
-  exit_only : (legacy) exit-only paths — antenna 2 no longer closes sessions
-
-Antenna 2 sightings while a session is open are unexpected: they emit a warning only.
-They do not set exit_time, do not end dwell, and do not restart the session.
-The only way dwell ends is a strong read at antenna 3.
+  Presence (LBD, Insert Station):
+    A valid read means the part is there. Idle timeout without reads means
+    it is not there (session closed). No enter/exit dwell pair.
 """
 
 from __future__ import annotations
@@ -67,6 +64,11 @@ from config import (
     EXIT_ANTENNA,
     THIRD_ANTENNA,
     INSERT_STATION_NAME,
+    TENONER_ENTRY_ANTENNA,
+    TENONER_EXIT_ANTENNAS,
+    LBD_ANTENNA,
+    DWELL_STATIONS,
+    PRESENCE_STATIONS,
 )
 
 _DEFAULT_DB = DB_PATH
@@ -207,11 +209,16 @@ class DwellTracker:
         # Resolve this machine's station + reader + antenna roles
         self._station_id = self._lookup_station(station_name)
         self._insert_station_id = self._lookup_station(INSERT_STATION_NAME)
+        self._tenoner_station_id = self._lookup_station("Tennoner")
+        self._lbd_station_id = self._lookup_station("LBD")
         self._reader_id = self._lookup_reader(reader_name)
         self._antenna_roles = self._load_antenna_roles(self._reader_id)  # port -> (id, role)
+        self._antenna_stations = self._load_antenna_stations(self._reader_id)
+        self._station_names = self._load_station_names()  # station_id -> name
 
-        self._open: dict[str, _Session] = {}        # epc -> Gannomat session
-        self._insert_open: dict[str, _Session] = {}   # epc -> Insert Station session
+        self._open: dict[str, _Session] = {}           # Gannomat dwell
+        self._tenoner_open: dict[str, _Session] = {}   # Tennoner dwell
+        self._presence_open: dict[str, _Session] = {}  # LBD / Insert presence
         self._last_raw: dict[tuple[str, int], float] = {}
         self._read_counts: dict[tuple[str, int], int] = {}
 
@@ -247,6 +254,30 @@ class DwellTracker:
         ):
             roles[int(port)] = (aid, role)
         return roles
+
+    def _load_antenna_stations(self, reader_id) -> dict[int, int]:
+        """port -> station_id for antennas bound to a station."""
+        out: dict[int, int] = {}
+        if reader_id is None:
+            return out
+        for port, station_id in self._conn.execute(
+            "SELECT antenna_port, station_id FROM rfid_antennas "
+            "WHERE reader_id = ? AND station_id IS NOT NULL",
+            (reader_id,),
+        ):
+            out[int(port)] = int(station_id)
+        return out
+
+    def _load_station_names(self) -> dict[int, str]:
+        return {
+            int(sid): name
+            for sid, name in self._conn.execute(
+                "SELECT station_id, station_name FROM stations"
+            )
+        }
+
+    def _all_open_buckets(self) -> tuple[dict[str, _Session], ...]:
+        return (self._open, self._tenoner_open, self._presence_open)
 
     # ── tag / part resolution ─────────────────────────────────────────────
 
@@ -302,9 +333,14 @@ class DwellTracker:
     # ── recovery ──────────────────────────────────────────────────────────
 
     def _recover_open_sessions(self) -> None:
-        station_ids = [
-            sid for sid in (self._station_id, self._insert_station_id) if sid is not None
-        ]
+        station_ids = {
+            sid for sid in (
+                self._station_id,
+                self._insert_station_id,
+                self._tenoner_station_id,
+                self._lbd_station_id,
+            ) if sid is not None
+        }
         if not station_ids:
             return
 
@@ -325,15 +361,21 @@ class DwellTracker:
                 sid, tag_id, part_id, epc, station_id,
                 _parse_ts(entry_time) if entry_time else None,
             )
-            # Antenna 2 no longer marks progress; ignore leftover exit_time on open rows.
             sess.has_exit = False
             sess.awaiting_insert = False
             sess.exit_ts = None
             sess.exit_rssi = None
-            if station_id == self._insert_station_id:
-                self._insert_open[epc] = sess
-            else:
+            name = self._station_names.get(station_id, "")
+            if station_id == self._station_id:
                 self._open[epc] = sess
+            elif station_id == self._tenoner_station_id:
+                self._tenoner_open[epc] = sess
+            elif name in PRESENCE_STATIONS or station_id in (
+                self._insert_station_id, self._lbd_station_id
+            ):
+                self._presence_open[epc] = sess
+            else:
+                self._presence_open[epc] = sess
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -446,25 +488,89 @@ class DwellTracker:
 
                 # ── 4. event + session logic (port-based) ──────────────
                 if antenna_port == ENTRY_ANTENNA:
-                    self._handle_entry(epc, tag_id, part_id, reader_dt, reader_iso, key, summary)
-                elif antenna_port == EXIT_ANTENNA:
-                    self._handle_exit(epc, tag_id, part_id, reader_dt, rssi, summary)
-                elif antenna_port == THIRD_ANTENNA:
-                    self._handle_insert_entry(
-                        epc, tag_id, part_id, reader_dt, reader_iso, key, rssi, summary
+                    self._handle_dwell_entry(
+                        epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                        bucket=self._open, station_id=self._station_id,
                     )
+                elif antenna_port == EXIT_ANTENNA:
+                    # Gannomat exit sighting: show at ant 2, do NOT close dwell.
+                    # Dwell ends at Insert (ant 3) or when the part moves on.
+                    if _valid_exit_rssi(rssi):
+                        self._handle_gannomat_exit_sighting(
+                            epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                        )
+                elif antenna_port == TENONER_ENTRY_ANTENNA:
+                    self._handle_dwell_entry(
+                        epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                        bucket=self._tenoner_open, station_id=self._tenoner_station_id,
+                    )
+                elif antenna_port in TENONER_EXIT_ANTENNAS:
+                    # Close dwell (entry→exit timer), then force a table-hold
+                    # presence so /api/live still returns the part at ant 4/5.
+                    if _valid_exit_rssi(rssi):
+                        self._handle_dwell_exit(
+                            epc, tag_id, part_id, reader_dt, rssi, summary,
+                            bucket=self._tenoner_open, antenna_label="Tennoner Exit Table",
+                        )
+                        self._handle_presence(
+                            epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                            station_id=self._tenoner_station_id,
+                            force=True,
+                        )
+                elif antenna_port == LBD_ANTENNA:
+                    self._handle_presence(
+                        epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                        station_id=self._lbd_station_id,
+                    )
+                elif antenna_port == THIRD_ANTENNA:
+                    # Insert: presence only. If Gannomat dwell still open, close it first.
+                    if self._open.get(epc) is not None and _valid_third_rssi(rssi):
+                        if self._read_counts.get(key, 0) >= MIN_READS_FOR_SESSION:
+                            g = self._open[epc]
+                            if self._session_still_open(g.session_id):
+                                g.exit_ts = reader_dt
+                                g.exit_rssi = int(rssi) if rssi is not None else None
+                                g.has_exit = True
+                                self._finalize(g, STATUS_CLOSED, self._open)
+                                summary["session_closed"] = summary.get("session_closed", 0) + 1
+                    if _valid_third_rssi(rssi):
+                        self._handle_presence(
+                            epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                            station_id=self._insert_station_id,
+                        )
 
         return summary
 
-    # ── entry / exit handlers ─────────────────────────────────────────────
+    # ── entry / exit / presence handlers ────────────────────────────────────
 
-    def _handle_entry(self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary):
-        sess = self._open.get(epc)
+    def _close_other_buckets(self, epc: str, keep: dict, summary: dict) -> None:
+        for bucket in self._all_open_buckets():
+            if bucket is keep:
+                continue
+            other = bucket.get(epc)
+            if other is None:
+                continue
+            if self._session_still_open(other.session_id):
+                # Presence/dwell closed by moving on — record end time for dwell calc when possible
+                if other.entry_ts is not None and not other.has_exit:
+                    other.exit_ts = datetime.now(timezone.utc)
+                    other.has_exit = True
+                self._finalize(other, STATUS_CLOSED, bucket)
+                summary["session_closed"] = summary.get("session_closed", 0) + 1
+            else:
+                self._drop_stale_open(epc, bucket)
+
+    def _handle_dwell_entry(
+        self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+        *, bucket: dict, station_id: Optional[int],
+    ):
+        if station_id is None:
+            return
+        sess = bucket.get(epc)
         if sess is not None and not self._session_still_open(sess.session_id):
-            self._drop_stale_open(epc, self._open)
+            self._drop_stale_open(epc, bucket)
             sess = None
 
-        # Open session still running — keep the same dwell; never restart on re-entry.
         if sess is not None:
             sess.last_seen_wall = datetime.now(timezone.utc)
             self._touch_session(sess.session_id)
@@ -472,95 +578,143 @@ class DwellTracker:
 
         if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
             return
+
+        self._close_other_buckets(epc, bucket, summary)
+
         event_id = self._insert_event(
-            part_id, tag_id, ENTER_EVENT, reader_iso, self._station_id
+            part_id, tag_id, ENTER_EVENT, reader_iso, station_id
         )
         cur = self._conn.execute(
             "INSERT INTO part_station_sessions "
             "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (part_id, tag_id, self._station_id, event_id, reader_iso, STATUS_OPEN),
+            (part_id, tag_id, station_id, event_id, reader_iso, STATUS_OPEN),
         )
         new_sess = _Session(
-            cur.lastrowid, tag_id, part_id, epc, self._station_id, reader_dt
+            cur.lastrowid, tag_id, part_id, epc, station_id, reader_dt
         )
-        self._open[epc] = new_sess
+        bucket[epc] = new_sess
         summary["session_opened"] += 1
-        try_assign_on_session_open(new_sess.session_id, self._station_id)
+        try_assign_on_session_open(new_sess.session_id, station_id)
 
-    def _handle_exit(self, epc, tag_id, part_id, reader_dt, rssi, summary):
-        """Antenna 2 is unexpected during an open dwell — warn only, never end/restart."""
-        sess = self._open.get(epc)
+    def _handle_dwell_exit(
+        self, epc, tag_id, part_id, reader_dt, rssi, summary,
+        *, bucket: dict, antenna_label: str,
+    ):
+        """Close an open dwell session and compute dwell_seconds."""
+        sess = bucket.get(epc)
         if sess is not None and not self._session_still_open(sess.session_id):
-            self._drop_stale_open(epc, self._open)
+            self._drop_stale_open(epc, bucket)
             sess = None
         if sess is None:
+            # Caller may still open presence so the part stays visible at the table.
+            print(
+                f"[dwell] {antenna_label}: no open dwell to close for epc={epc!r}",
+                flush=True,
+            )
             return
         if sess.entry_ts is not None and reader_dt < sess.entry_ts:
             return
         if not _valid_exit_rssi(rssi):
+            print(
+                f"[dwell] {antenna_label}: exit ignored (weak RSSI={rssi}) epc={epc!r}",
+                flush=True,
+            )
             return
 
-        # Do not set exit_time / has_exit / awaiting_insert — dwell keeps running.
+        sess.exit_ts = reader_dt
+        sess.exit_rssi = int(rssi) if rssi is not None else None
+        sess.has_exit = True
         sess.last_seen_wall = datetime.now(timezone.utc)
-        self._touch_session(sess.session_id)
-        summary["exit_warnings"] = summary.get("exit_warnings", 0) + 1
+        self._finalize(sess, STATUS_CLOSED, bucket)
+        summary["session_closed"] = summary.get("session_closed", 0) + 1
+        dwell = None
+        if sess.entry_ts is not None:
+            dwell = int(round((reader_dt - sess.entry_ts).total_seconds()))
         print(
-            f"[dwell-warning] Tag seen at antenna {EXIT_ANTENNA} (Exit) while session "
-            f"{sess.session_id} is still open — dwell continues until strong antenna "
-            f"{THIRD_ANTENNA} read. epc={epc!r} rssi={rssi}",
+            f"[dwell] {antenna_label}: session closed epc={epc!r} dwell={dwell}s",
             flush=True,
         )
 
-    def _handle_insert_entry(self, epc, tag_id, part_id, reader_dt, reader_iso, key, rssi, summary):
-        """Strong antenna 3 ends Gannomat dwell and opens Insert Station."""
-        if not _valid_third_rssi(rssi):
+    def _handle_gannomat_exit_sighting(
+        self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+    ):
+        """Antenna 2: part is at Gannomat exit — keep dwell open, stay on map."""
+        sess = self._open.get(epc)
+        if sess is not None and not self._session_still_open(sess.session_id):
+            self._drop_stale_open(epc, self._open)
+            sess = None
+
+        if sess is not None:
+            sess.last_seen_wall = datetime.now(timezone.utc)
+            self._touch_session(sess.session_id)
+            print(
+                f"[map] Gannomat Exit sighting epc={epc!r} "
+                f"(dwell still open — closes at Insert)",
+                flush=True,
+            )
             return
 
-        gannomat = self._open.get(epc)
-        if gannomat is not None and not self._session_still_open(gannomat.session_id):
-            self._drop_stale_open(epc, self._open)
-            gannomat = None
-
-        # Close open Gannomat dwell on strong ant-3 — antenna 2 is not required.
-        if gannomat is not None:
-            if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
-                return
-            gannomat.exit_ts = reader_dt
-            gannomat.exit_rssi = int(rssi) if rssi is not None else None
-            gannomat.has_exit = True
-            self._finalize(gannomat, STATUS_CLOSED, self._open)
-            summary["session_closed"] += 1
-
-        insert_sess = self._insert_open.get(epc)
-        if insert_sess is not None and not self._session_still_open(insert_sess.session_id):
-            self._drop_stale_open(epc, self._insert_open)
-            insert_sess = None
-
-        if insert_sess is None and self._insert_station_id is not None:
-            if self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
-                return
-            event_id = self._insert_event(
-                part_id, tag_id, ENTER_EVENT, reader_iso, self._insert_station_id
+        # No open dwell yet — still show the part at the exit antenna.
+        if self._station_id is not None:
+            self._handle_presence(
+                epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                station_id=self._station_id,
+                force=True,
             )
-            cur = self._conn.execute(
-                "INSERT INTO part_station_sessions "
-                "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    part_id, tag_id, self._insert_station_id,
-                    event_id, reader_iso, STATUS_OPEN,
-                ),
-            )
-            new_sess = _Session(
-                cur.lastrowid, tag_id, part_id, epc, self._insert_station_id, reader_dt
-            )
-            self._insert_open[epc] = new_sess
-            summary["session_opened"] += 1
-            try_assign_on_session_open(new_sess.session_id, self._insert_station_id)
-        elif insert_sess is not None:
-            insert_sess.last_seen_wall = datetime.now(timezone.utc)
-            self._touch_session(insert_sess.session_id)
+
+    def _handle_presence(
+        self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+        *, station_id: Optional[int], force: bool = False,
+    ):
+        """Presence station: read => there; idle sweeper => not there."""
+        if station_id is None:
+            return
+        if not force and self._read_counts.get(key, 0) < MIN_READS_FOR_SESSION:
+            return
+
+        sess = self._presence_open.get(epc)
+        if sess is not None and not self._session_still_open(sess.session_id):
+            self._drop_stale_open(epc, self._presence_open)
+            sess = None
+
+        if sess is not None and sess.station_id == station_id:
+            sess.last_seen_wall = datetime.now(timezone.utc)
+            self._touch_session(sess.session_id)
+            return
+
+        self._close_other_buckets(epc, self._presence_open, summary)
+        # If switching presence station, drop old presence row
+        old = self._presence_open.get(epc)
+        if old is not None:
+            if self._session_still_open(old.session_id):
+                old.exit_ts = reader_dt
+                old.has_exit = True
+                self._finalize(old, STATUS_CLOSED, self._presence_open)
+                summary["session_closed"] = summary.get("session_closed", 0) + 1
+            else:
+                self._drop_stale_open(epc, self._presence_open)
+
+        event_id = self._insert_event(
+            part_id, tag_id, ENTER_EVENT, reader_iso, station_id
+        )
+        cur = self._conn.execute(
+            "INSERT INTO part_station_sessions "
+            "(part_id, tag_id, station_id, entry_event_id, entry_time, session_status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (part_id, tag_id, station_id, event_id, reader_iso, STATUS_OPEN),
+        )
+        new_sess = _Session(
+            cur.lastrowid, tag_id, part_id, epc, station_id, reader_dt
+        )
+        self._presence_open[epc] = new_sess
+        summary["session_opened"] += 1
+        try_assign_on_session_open(new_sess.session_id, station_id)
+        st_name = self._station_names.get(station_id, station_id)
+        print(
+            f"[map] hold OPEN at {st_name} epc={epc!r} session={new_sess.session_id}",
+            flush=True,
+        )
 
     # ── DB write helpers ──────────────────────────────────────────────────
 
@@ -594,7 +748,39 @@ class DwellTracker:
 
     def open_session_count(self) -> int:
         with self._lock:
-            return len(self._open) + len(self._insert_open)
+            return (
+                len(self._open)
+                + len(self._tenoner_open)
+                + len(self._presence_open)
+            )
+
+    def close_open_sessions_for_epc(self, epc: str) -> int:
+        """Force-close every open dwell/presence session for this EPC.
+
+        Used by the sim when reseeding (move all 7) so the next entry
+        starts a fresh dwell timer instead of touching the old session.
+        """
+        closed = 0
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            for bucket in self._all_open_buckets():
+                sess = bucket.get(epc)
+                if sess is None:
+                    continue
+                if not self._session_still_open(sess.session_id):
+                    self._drop_stale_open(epc, bucket)
+                    continue
+                if sess.entry_ts is not None and not sess.has_exit:
+                    sess.exit_ts = now
+                    sess.has_exit = True
+                self._finalize(sess, STATUS_CLOSED, bucket)
+                closed += 1
+            # Clear read debounce so the next burst can open a new session
+            for key in list(self._read_counts.keys()):
+                if key[0] == epc:
+                    self._read_counts.pop(key, None)
+                    self._last_raw.pop(key, None)
+        return closed
 
     def close(self) -> None:
         self._stop_evt.set()
@@ -620,34 +806,47 @@ class DwellTracker:
     def _sweep_once(self) -> None:
         now = datetime.now(timezone.utc)
         with self._lock:
-            for epc in list(self._open.keys()):
-                sess = self._open[epc]
+            # Dwell sessions: abandon if no progress for a long time
+            for bucket in (self._open, self._tenoner_open):
+                for epc in list(bucket.keys()):
+                    sess = bucket[epc]
+                    if not self._session_still_open(sess.session_id):
+                        self._drop_stale_open(epc, bucket)
+                        continue
+                    idle = (now - sess.last_seen_wall).total_seconds()
+                    if sess.entry_ts is None:
+                        if idle >= IDLE_TIMEOUT_SEC:
+                            self._finalize(sess, STATUS_EXIT_ONLY, bucket)
+                    elif idle >= ABANDON_TIMEOUT_SEC:
+                        self._finalize(sess, STATUS_ABANDONED, bucket)
+
+            # Presence:
+            #   Tennoner table hold / Insert — stay until abandon or next station
+            #   LBD — idle timeout (no reads => not there)
+            for epc in list(self._presence_open.keys()):
+                sess = self._presence_open[epc]
                 if not self._session_still_open(sess.session_id):
-                    self._drop_stale_open(epc, self._open)
-                    continue
-
-                idle = (now - sess.last_seen_wall).total_seconds()
-
-                # Dwell stays open until strong antenna 3 (or abandon timeout).
-                if sess.entry_ts is None:
-                    if idle >= IDLE_TIMEOUT_SEC:
-                        self._finalize(sess, STATUS_EXIT_ONLY, self._open)
-                elif idle >= ABANDON_TIMEOUT_SEC:
-                    self._finalize(sess, STATUS_ABANDONED, self._open)
-
-            for epc in list(self._insert_open.keys()):
-                sess = self._insert_open[epc]
-                if not self._session_still_open(sess.session_id):
-                    self._drop_stale_open(epc, self._insert_open)
+                    self._drop_stale_open(epc, self._presence_open)
                     continue
                 idle = (now - sess.last_seen_wall).total_seconds()
-                if idle >= ABANDON_TIMEOUT_SEC:
-                    self._finalize(sess, STATUS_ABANDONED, self._insert_open)
+                hold_ids = {
+                    self._tenoner_station_id,
+                    self._insert_station_id,
+                }
+                timeout = (
+                    ABANDON_TIMEOUT_SEC
+                    if sess.station_id in hold_ids
+                    else IDLE_TIMEOUT_SEC
+                )
+                if idle >= timeout:
+                    sess.exit_ts = now
+                    sess.has_exit = True
+                    self._finalize(sess, STATUS_CLOSED, self._presence_open)
 
     # ── finalize ──────────────────────────────────────────────────────────
 
     def _finalize(self, sess: _Session, status: str, bucket: dict[str, _Session]) -> None:
-        """Close a session. Gannomat dwell = close time (antenna 3) − antenna 1 entry."""
+        """Close a session. Dwell stations set dwell_seconds = exit − entry."""
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if sess.has_exit and sess.exit_ts is not None:

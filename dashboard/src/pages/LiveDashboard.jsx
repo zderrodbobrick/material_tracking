@@ -291,7 +291,19 @@ export function LiveDashboard({ liveSessions = [] }) {
     setStationMode(false)
     setAntennaMode(true)
     setShowAntennaMarkers(true)
-  }, [])
+    // Re-fetch so newly seeded antennas (4–7) show up without a full page reload
+    apiFetch('/api/antennas')
+      .then((list) => {
+        const ants = Array.isArray(list) ? list : []
+        setAntennas(ants)
+        const placed = antennaBaseline.current || {}
+        const firstUnplaced = ants.find(a => !placed[String(a.antenna_id)])
+          || ants.find(a => !antennaPlacements[String(a.antenna_id)])
+        const pick = firstUnplaced || ants[0]
+        if (pick) setSelectedAntennaId(String(pick.antenna_id))
+      })
+      .catch(() => {})
+  }, [antennaPlacements])
 
   const exitAntennaMode = useCallback(() => {
     setAntennaMode(false)
@@ -752,7 +764,7 @@ export function LiveDashboard({ liveSessions = [] }) {
               ? 'Antenna mode — select an antenna, click the map to place it · Save to persist'
               : stationMode
                 ? 'Station mode — select a machine, click the map to place its operator pin · Save to persist'
-                : 'Amber chips = parts at antennas · White dots = operators at station pins'}
+                : 'Colored chips = parts by IBUS order · White dots = operators at station pins'}
             {!antennaMode && !stationMode
               ? ` · ${allMachineStatuses.length} machines (${machinesInUseCount} in use)`
               : ''}

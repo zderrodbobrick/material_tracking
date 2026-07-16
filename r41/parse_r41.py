@@ -13,11 +13,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-# LBD → Pack out (progress tracking; ~equal weight per station).
+# Progress tracking starts at Tenoner (= 0%).
 PROGRESS_STATIONS = (
-    "LBD",
-    "LB Installation",
-    "1/2 Edgefinisher",
     "Tenoner",
     "Gannomat",
     "Insert Station",

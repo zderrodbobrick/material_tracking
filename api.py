@@ -35,6 +35,8 @@ from config import (
     ENABLE_LIVE_INGESTION,
     RTLS_OPERATOR_CONFIRM_SECS,
     SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL,
+    PROGRESS_STATIONS,
+    HIDDEN_IBUS_ORDERS,
 )
 from database.migrate import run_migrations
 
@@ -367,6 +369,11 @@ def index():
             "PUT  /api/antenna-placements",
             "GET  /api/station-placements",
             "PUT  /api/station-placements",
+            "GET  /api/work-orders",
+            "GET  /api/work-orders/<ibus>",
+            "GET  /api/work-orders/<ibus>/components",
+            "POST /api/work-orders/ingest",
+            "POST /api/notify",
             "POST /api/sessions/<id>/end",
         ],
     })
@@ -379,6 +386,19 @@ def serve_assets(filename):
 
 # ── GET /api/live  (open sessions) ────────────────────────────────────────────
 
+def _is_hidden_ibus(session_or_key) -> bool:
+    """True if this session / IBUS key is in HIDDEN_IBUS_ORDERS (.env)."""
+    if not HIDDEN_IBUS_ORDERS:
+        return False
+    if isinstance(session_or_key, dict):
+        key = _ibus_order_key(session_or_key)
+    else:
+        key = str(session_or_key or "").strip().upper()
+    if not key:
+        return False
+    return key.upper() in HIDDEN_IBUS_ORDERS
+
+
 @app.route("/api/live")
 def live_sessions():
     db = get_db()
@@ -389,6 +409,8 @@ def live_sessions():
         (STATUS_OPEN, STATUS_EXIT_ONLY),
     ).fetchall()
     sessions = [_session_dict(r) for r in rows]
+    if HIDDEN_IBUS_ORDERS:
+        sessions = [s for s in sessions if not _is_hidden_ibus(s)]
     _attach_operators(db, sessions)
     _attach_last_antennas(db, sessions)
     db.close()
@@ -416,40 +438,33 @@ def completed_sessions():
 
 # ── GET /api/ibus  (part journeys grouped by EPC / IBUS) ───────────────────────
 
-_LINE_STATIONS = (
-    "Holzma",
-    "Holzma.Falloff",
-    "LBD",
-    "LB Installation",
-    "1/2 Edgefinisher",
-    "Tenoner",
-    "Gannomat",
-    "Insert Station",
-    "Evolve Edge Finisher",
-    "Evolve Drilling",
-    "Inspect",
-    "Anderson",
-    "Pack out",
-    "Final Packing",
-    "Packing",
-)
+# Progress starts at Tennoner (= 0%). DB may store "Tennoner".
+_STATION_PROGRESS_ALIASES = {
+    "Tennoner": "Tenoner",
+    "Final Packing": "Pack out",
+    "Packing": "Pack out",
+    "Outswing Latch Drilling": "LB Installation",
+}
 
 
 def _station_progress_index(name: str | None) -> int:
     if not name:
         return -1
     n = str(name).strip()
-    if n in _LINE_STATIONS:
-        return _LINE_STATIONS.index(n)
-    aliases = {
-        "Final Packing": "Pack out",
-        "Packing": "Pack out",
-        "Outswing Latch Drilling": "LB Installation",
-    }
-    mapped = aliases.get(n)
-    if mapped and mapped in _LINE_STATIONS:
-        return _LINE_STATIONS.index(mapped)
+    n = _STATION_PROGRESS_ALIASES.get(n, n)
+    if n in PROGRESS_STATIONS:
+        return PROGRESS_STATIONS.index(n)
     return -1
+
+
+def _progress_fraction(max_idx: int, has_open: bool, status: str) -> float:
+    """Tennoner/Tenoner = 0.0 … Pack out = 1.0."""
+    denom = max(len(PROGRESS_STATIONS) - 1, 1)
+    if status == "completed" and max_idx >= 0:
+        return 1.0
+    if max_idx < 0:
+        return 0.0
+    return min(1.0, max_idx / denom)
 
 
 def _ibus_order_key(session: dict) -> str:
@@ -494,7 +509,6 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
         groups.setdefault(key, []).append(s)
 
     journeys = []
-    line_len = len([x for x in _LINE_STATIONS if x not in ("Final Packing", "Packing")])
     now = datetime.now(timezone.utc)
 
     for key, sess_list in groups.items():
@@ -621,13 +635,7 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
         open_sess = next((s for s in reversed(sess_list) if s.get("status") == STATUS_OPEN), None)
         current_station = (open_sess or sess_list[-1]).get("station_name")
 
-        denom = max(line_len, 1)
-        if status == "completed" and max_idx >= 0:
-            progress = 1.0
-        elif max_idx < 0:
-            progress = min(0.05 * len(stations_touched), 0.2)
-        else:
-            progress = min(1.0, (max_idx + (0.55 if has_open else 1.0)) / denom)
+        progress = _progress_fraction(max_idx, has_open, status)
 
         wo = key[4:] if key.startswith("IBUS") else (sess_list[0].get("work_order") or "")
 
@@ -667,6 +675,14 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                     if st and st not in part_ops[oid]["stations"]:
                         part_ops[oid]["stations"].append(st)
 
+            open_m = next(
+                (m for m in reversed(part_machines) if m.get("status") == STATUS_OPEN),
+                None,
+            )
+            part_station = (open_m or (part_machines[-1] if part_machines else {})).get(
+                "station_name"
+            )
+
             parts_out.append({
                 **meta,
                 "entry_time": p_start.isoformat() if p_start else None,
@@ -676,6 +692,8 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                 "operators": list(part_ops.values()),
                 "machines": part_machines,
                 "machine_count": len(part_machines),
+                "current_station": part_station,
+                "status": "open" if open_m else "completed",
             })
 
         journeys.append({
@@ -694,7 +712,7 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
             "current_station": current_station,
             "progress": round(progress, 3),
             "stations_done": len(stations_touched),
-            "stations_total": line_len,
+            "stations_total": len(PROGRESS_STATIONS),
             "entry_time": start.isoformat() if start else sess_list[0].get("entry_time"),
             "exit_time": end.isoformat() if end else None,
             "total_production_seconds": total_sec,
@@ -729,6 +747,12 @@ def ibus_journeys():
         journeys = [j for j in journeys if j["status"] == "open"]
     elif status in ("completed", "closed", "done"):
         journeys = [j for j in journeys if j["status"] == "completed"]
+
+    if HIDDEN_IBUS_ORDERS:
+        journeys = [
+            j for j in journeys
+            if not _is_hidden_ibus(j.get("key") or j.get("ibus_order"))
+        ]
 
     return jsonify(journeys[:limit])
 
@@ -928,6 +952,125 @@ def list_tags():
     ).fetchall()
     db.close()
     return jsonify([dict(r) for r in rows])
+
+
+# ── Work orders / R41 BOM ─────────────────────────────────────────────────────
+
+@app.route("/api/work-orders")
+def list_work_orders():
+    status = request.args.get("status")
+    db = get_db()
+    if status:
+        rows = db.execute(
+            "SELECT * FROM work_orders WHERE status = ? ORDER BY ingested_at DESC",
+            (status,),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT * FROM work_orders ORDER BY ingested_at DESC"
+        ).fetchall()
+    db.close()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/work-orders/<ibus>")
+def get_work_order(ibus: str):
+    key = ibus.strip().upper()
+    if not key.startswith("IBUS"):
+        key = f"IBUS{key}"
+    db = get_db()
+    row = db.execute(
+        "SELECT * FROM work_orders WHERE ibus_number = ?", (key,)
+    ).fetchone()
+    if not row:
+        # Also try bare work-order digits
+        digits = re.sub(r"\D", "", ibus)[-6:]
+        if digits:
+            row = db.execute(
+                "SELECT * FROM work_orders WHERE work_order = ? OR ibus_number = ?",
+                (digits, f"IBUS{digits}"),
+            ).fetchone()
+    if not row:
+        db.close()
+        return jsonify({"error": f"Work order not found: {ibus}"}), 404
+    order = dict(row)
+    comps = db.execute(
+        "SELECT component_id, line_index, ref, qty, epc, tag_label, status, "
+        "       size, room, operation, product, material_family, color "
+        "FROM work_order_components WHERE work_order_id = ? "
+        "ORDER BY line_index",
+        (order["work_order_id"],),
+    ).fetchall()
+    db.close()
+    order["components"] = [dict(c) for c in comps]
+    return jsonify(order)
+
+
+@app.route("/api/work-orders/<ibus>/components")
+def list_work_order_components(ibus: str):
+    key = ibus.strip().upper()
+    if not key.startswith("IBUS"):
+        key = f"IBUS{key}"
+    db = get_db()
+    wo = db.execute(
+        "SELECT work_order_id, ibus_number FROM work_orders WHERE ibus_number = ?",
+        (key,),
+    ).fetchone()
+    if not wo:
+        digits = re.sub(r"\D", "", ibus)[-6:]
+        if digits:
+            wo = db.execute(
+                "SELECT work_order_id, ibus_number FROM work_orders "
+                "WHERE work_order = ? OR ibus_number = ?",
+                (digits, f"IBUS{digits}"),
+            ).fetchone()
+    if not wo:
+        db.close()
+        return jsonify({"error": f"Work order not found: {ibus}"}), 404
+    rows = db.execute(
+        "SELECT * FROM work_order_components WHERE work_order_id = ? ORDER BY line_index",
+        (wo["work_order_id"],),
+    ).fetchall()
+    db.close()
+    return jsonify({
+        "ibus_number": wo["ibus_number"],
+        "count": len(rows),
+        "components": [dict(r) for r in rows],
+    })
+
+
+@app.route("/api/work-orders/ingest", methods=["POST"])
+def ingest_work_orders():
+    """Ingest .R41 file(s) into work_orders + work_order_components.
+
+    JSON body (all optional):
+      { "path": ".R41/IBUS462064.R41", "replace": true }
+    Defaults to .R41/ then r41/inbox/.
+    """
+    body = request.get_json(silent=True) or {}
+    path_raw = body.get("path")
+    replace = bool(body.get("replace", False))
+    target = Path(path_raw) if path_raw else None
+    if target and not target.is_absolute():
+        target = (Path(__file__).parent / target).resolve()
+
+    try:
+        from r41.ingest import ingest_path
+        results = ingest_path(target, replace=replace)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"ok": True, "orders": results})
+
+
+@app.route("/api/notify", methods=["POST"])
+def notify_clients():
+    """Wake the dashboard after an external writer (e.g. sim/run.py) changes the DB."""
+    body = request.get_json(silent=True) or {}
+    action = str(body.get("action") or "sim_update")
+    _direct_emit(action)
+    return jsonify({"ok": True, "action": action})
 
 
 # ── Sewio RTLS endpoints ──────────────────────────────────────────────────────

@@ -20,7 +20,8 @@ const CHIP_LABELS = {
   LBD: 'LBD',
   'LB Installation': 'LB Install',
   '1/2 Edgefinisher': 'Edgefinisher',
-  Tenoner: 'Tenoner',
+  Tenoner: 'Tennoner',
+  Tennoner: 'Tennoner',
   Gannomat: 'Gannomat',
   'Insert Station': 'Insert',
   'Evolve Edge Finisher': 'Evolve Edge Finisher',
@@ -46,6 +47,13 @@ function displayName(zoneIds, station) {
 
 /** Optional RFID session aliases keyed by station name. */
 const STATION_EXTRAS = {
+  // RTLS zone is "Tenoner"; RFID DB station is "Tennoner"
+  Tenoner: {
+    sessionAliases: ['Tenoner', 'Tennoner'],
+  },
+  Tennoner: {
+    sessionAliases: ['Tennoner', 'Tenoner'],
+  },
   'LB Installation': {
     // Outswing Latch Drilling is the same workstation as LB Install
     sessionAliases: ['LB Installation', 'Outswing Latch Drilling'],
@@ -82,13 +90,8 @@ function buildAllStations() {
   })
 }
 
-/** CL production workstations — shown on machine status panel and filter chips. */
+/** CL production workstations — progress starts at Tenoner (= 0%). */
 export const PRODUCTION_LINE_ORDER = [
-  'Holzma',
-  'Holzma.Falloff',
-  'LBD',
-  'LB Installation',
-  '1/2 Edgefinisher',
   'Tenoner',
   'Gannomat',
   'Insert Station',
@@ -97,6 +100,12 @@ export const PRODUCTION_LINE_ORDER = [
   'Inspect',
   'Anderson',
   'Pack out',
+  // Presence / upstream machines (not on the 0→100 progress spine)
+  'LBD',
+  'LB Installation',
+  '1/2 Edgefinisher',
+  'Holzma',
+  'Holzma.Falloff',
 ]
 
 /** Full sort order including non-production RTLS zones (queues, debugging). */

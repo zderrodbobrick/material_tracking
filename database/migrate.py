@@ -35,6 +35,7 @@ _DEFAULT_STATIONS = [
     ("Insert Station", "Assembly"),
     ("Anderson",       "Machining"),
     ("Final Packing",  "Packing"),
+    ("LBD",            "Machining"),
 ]
 
 
@@ -412,6 +413,114 @@ def _m011_assignment_zone_snapshot(conn: sqlite3.Connection, **_) -> None:
             conn.execute(f"ALTER TABLE part_operator_assignments ADD COLUMN {col} {typ}")
 
 
+def _m012_seed_line_antennas(
+    conn: sqlite3.Connection,
+    reader_name: str = "FX9600-Gannomat",
+    **_,
+) -> None:
+    """Seed LBD + Tennoner antennas 4–7 on the shared FX9600 reader."""
+    # Local import avoids a circular import at module load (config → migrate).
+    from config import ANTENNA_CATALOG
+
+    extra_ports = (4, 5, 6, 7)
+    for port in extra_ports:
+        name, role, station_name, station_type = ANTENNA_CATALOG[port]
+        conn.execute(
+            "INSERT OR IGNORE INTO stations (station_name, station_type) VALUES (?, ?)",
+            (station_name, station_type),
+        )
+
+    reader = conn.execute(
+        "SELECT reader_id FROM rfid_readers WHERE reader_name = ?", (reader_name,)
+    ).fetchone()
+    if not reader:
+        return
+    reader_id = reader[0]
+
+    for port in extra_ports:
+        name, role, station_name, _station_type = ANTENNA_CATALOG[port]
+        st = conn.execute(
+            "SELECT station_id FROM stations WHERE station_name = ?", (station_name,)
+        ).fetchone()
+        if not st:
+            continue
+        exists = conn.execute(
+            "SELECT antenna_id FROM rfid_antennas WHERE reader_id = ? AND antenna_port = ?",
+            (reader_id, port),
+        ).fetchone()
+        if exists:
+            continue
+        conn.execute(
+            "INSERT INTO rfid_antennas (reader_id, antenna_port, antenna_name, antenna_role, station_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (reader_id, port, name, role, st[0]),
+        )
+
+
+def _m013_work_order_bom(conn: sqlite3.Connection, **_) -> None:
+    """Cut Rite / R41 work orders and expected component BOM lines."""
+    conn.executescript(f"""
+        CREATE TABLE IF NOT EXISTS work_orders (
+            work_order_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            ibus_number     TEXT NOT NULL UNIQUE,
+            work_order      TEXT,
+            customer        TEXT,
+            job_site        TEXT,
+            prod_date       TEXT,
+            project_id      TEXT,
+            source_file     TEXT,
+            parts_count     INTEGER NOT NULL DEFAULT 0,
+            pieces_count    INTEGER NOT NULL DEFAULT 0,
+            status          TEXT NOT NULL DEFAULT 'open'
+                            CHECK (status IN ('open', 'closed', 'cancelled')),
+            ingested_at     TEXT NOT NULL DEFAULT ({_UTC_NOW}),
+            created_at      TEXT NOT NULL DEFAULT ({_UTC_NOW}),
+            updated_at      TEXT NOT NULL DEFAULT ({_UTC_NOW})
+        );
+
+        CREATE TABLE IF NOT EXISTS work_order_components (
+            component_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_order_id    INTEGER NOT NULL REFERENCES work_orders(work_order_id) ON DELETE CASCADE,
+            line_index       INTEGER NOT NULL,
+            ref              TEXT,
+            qty              INTEGER NOT NULL DEFAULT 1,
+            epc              TEXT,
+            tag_label        TEXT,
+            part_id          INTEGER REFERENCES parts(part_id),
+            tag_id           INTEGER REFERENCES rfid_tags(tag_id),
+            size             TEXT,
+            room             TEXT,
+            operation        TEXT,
+            product          TEXT,
+            material_family  TEXT,
+            color            TEXT,
+            length_cut       TEXT,
+            width_cut        TEXT,
+            part_erp_id      TEXT,
+            job_number       TEXT,
+            po               TEXT,
+            drawing          TEXT,
+            bem              TEXT,
+            bem2             TEXT,
+            bem3             TEXT,
+            status           TEXT NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'in_process', 'complete')),
+            created_at       TEXT NOT NULL DEFAULT ({_UTC_NOW}),
+            updated_at       TEXT NOT NULL DEFAULT ({_UTC_NOW}),
+            UNIQUE (work_order_id, line_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS IX_woc_work_order
+            ON work_order_components (work_order_id);
+        CREATE INDEX IF NOT EXISTS IX_woc_epc
+            ON work_order_components (epc);
+        CREATE INDEX IF NOT EXISTS IX_woc_ref
+            ON work_order_components (ref);
+        CREATE UNIQUE INDEX IF NOT EXISTS UX_woc_epc_nonnull
+            ON work_order_components (epc) WHERE epc IS NOT NULL AND epc != '';
+    """)
+
+
 # ── Migration registry ────────────────────────────────────────────────────────
 
 _MIGRATIONS: list[tuple[int, str, object]] = [
@@ -426,6 +535,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (9, "operator_current_zone",    _m009_operator_current_zone),
     (10, "session_operator_presence", _m010_session_operator_presence),
     (11, "assignment_zone_snapshot", _m011_assignment_zone_snapshot),
+    (12, "seed_line_antennas",      _m012_seed_line_antennas),
+    (13, "work_order_bom",          _m013_work_order_bom),
 ]
 
 

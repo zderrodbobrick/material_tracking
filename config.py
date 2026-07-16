@@ -31,6 +31,53 @@ THIRD_ANTENNA = int(os.getenv("THIRD_ANTENNA", "3"))
 THIRD_ANTENNA_NAME = os.getenv("THIRD_ANTENNA_NAME", "Insert Station")
 INSERT_STATION_NAME = os.getenv("INSERT_STATION_NAME", "Insert Station")
 
+# Extra reader ports beyond the Gannomat 1→2→3 path (seeded into rfid_antennas).
+# Ports 4 and 5 share the Tennoner exit-table location.
+# Format: port -> (antenna_name, role, station_name, station_type)
+ANTENNA_CATALOG: dict[int, tuple[str, str, str, str]] = {
+    1: ("Gannomat Entry Antenna", "Entry", "Gannomat", "Drilling"),
+    2: ("Gannomat Exit Antenna", "Exit", "Gannomat", "Drilling"),
+    3: ("Insert Station Entry Antenna", "Entry", INSERT_STATION_NAME, "Assembly"),
+    4: ("Tennoner Exit Table A", "Exit", "Tennoner", "Cutting"),
+    5: ("Tennoner Exit Table B", "Exit", "Tennoner", "Cutting"),
+    6: ("LBD Entry Antenna", "Entry", "LBD", "Machining"),
+    7: ("Tennoner Entry Antenna", "Entry", "Tennoner", "Cutting"),
+}
+
+# Session behaviour by station:
+#   dwell    = Entry opens timer, Exit closes with dwell_seconds
+#   presence = read => there; idle => not there (no enter/exit dwell pair)
+DWELL_STATIONS = frozenset({"Gannomat", "Tennoner"})
+PRESENCE_STATIONS = frozenset({"LBD", INSERT_STATION_NAME})
+
+TENONER_ENTRY_ANTENNA = int(os.getenv("TENONER_ENTRY_ANTENNA", "7"))
+TENONER_EXIT_ANTENNAS = tuple(
+    int(x.strip())
+    for x in os.getenv("TENONER_EXIT_ANTENNAS", "4,5").split(",")
+    if x.strip().isdigit()
+)
+LBD_ANTENNA = int(os.getenv("LBD_ANTENNA", "6"))
+
+# Progress line starts at Tennoner (= 0%). Alias DB name "Tennoner" → "Tenoner".
+PROGRESS_STATIONS = (
+    "Tenoner",
+    "Gannomat",
+    "Insert Station",
+    "Evolve Edge Finisher",
+    "Evolve Drilling",
+    "Inspect",
+    "Anderson",
+    "Pack out",
+)
+
+# Comma-separated IBUS orders hidden from live map + open sidebar (data kept in DB).
+# Example: HIDDEN_IBUS_ORDERS=IBUS462064
+HIDDEN_IBUS_ORDERS = frozenset(
+    x.strip().upper()
+    for x in os.getenv("HIDDEN_IBUS_ORDERS", "").split(",")
+    if x.strip()
+)
+
 # ── RSSI Filter ───────────────────────────────────────────────────────────────
 # Valid reads must satisfy: RSSI_MIN <= rssi <= 0
 # Lower = greater range, Higher = more selective (less cross-antenna reads)

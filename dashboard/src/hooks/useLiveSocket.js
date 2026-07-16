@@ -23,8 +23,8 @@ export function useLiveSocket() {
     sock.on('connect_error', onError)
     sock.on('rfid_update', bump)
 
-    // Slow fallback poll — rfid_update handles real-time; avoid hammering the API.
-    const fallback = setInterval(bump, 30000)
+    // Fast fallback so sim DB writes still refresh even if a socket event is missed.
+    const fallback = setInterval(bump, 3000)
 
     if (sock.connected) {
       setWsStatus('live')

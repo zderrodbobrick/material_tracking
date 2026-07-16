@@ -23,6 +23,7 @@ from config import (
     RSSI_MIN, EPC_FILTER_PATTERN, LISTENER_HOST, LISTENER_PORT,
     STATION_NAME, READER_NAME,
     ENTRY_ANTENNA, EXIT_ANTENNA, THIRD_ANTENNA, THIRD_ANTENNA_NAME,
+    ANTENNA_CATALOG,
 )
 from storage import DwellTracker
 from epc_type_map import format_tag_id, parse_tag_id
@@ -62,12 +63,19 @@ def _antenna_role(port: int) -> str:
         return "Exit"
     if port == THIRD_ANTENNA:
         return THIRD_ANTENNA_NAME
+    info = ANTENNA_CATALOG.get(port)
+    if info:
+        return f"{info[2]} {info[1]}"
     return "Unknown"
 
 
 def _antenna_label(port: int) -> str:
     role = _antenna_role(port)
     return f"Ant{port} ({role})"
+
+
+def _all_antenna_ports() -> list[int]:
+    return sorted(ANTENNA_CATALOG.keys())
 
 
 def _tag_detail(epc_readable: str) -> str:
@@ -189,7 +197,7 @@ def run_http():
         "last_event_at":   None,    # epoch seconds; None until first POST
         "events_total":    0,
         "batches_total":   0,
-        "antenna_hits":    {str(ENTRY_ANTENNA): 0, str(EXIT_ANTENNA): 0, str(THIRD_ANTENNA): 0},
+        "antenna_hits":    {str(p): 0 for p in _all_antenna_ports()},
         "third_antenna_last_at": None,
         "reader_source":   None,
     }
@@ -292,8 +300,10 @@ def run_http():
 
     divider("Zebra FX9600 — HTTP Listener")
     print(f"\n  Station: {STATION_NAME}   Reader: {READER_NAME}")
-    print(f"  Antennas: {_antenna_label(ENTRY_ANTENNA)}  |  "
-          f"{_antenna_label(EXIT_ANTENNA)}  |  {_antenna_label(THIRD_ANTENNA)}")
+    print("  Antennas:")
+    for port in _all_antenna_ports():
+        name, role, station, _ = ANTENNA_CATALOG[port]
+        print(f"    {port}: {name}  ({station} / {role})")
     print(f"  Listening on  http://{LISTENER_HOST}:{LISTENER_PORT}/tags")
     post_urls = _local_post_urls()
     print(f"  Point the reader's HTTP POST target to:")
