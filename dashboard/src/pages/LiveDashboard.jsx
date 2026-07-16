@@ -762,12 +762,12 @@ export function LiveDashboard({ liveSessions = [] }) {
       </Panel>
 
       <div className="min-w-0 min-h-[24rem] lg:min-h-0 h-full self-stretch overflow-hidden">
-        <MachineStatusTable statuses={allMachineStatuses} />
+        <IbusOrdersSidebar journeys={openIbusJourneys} />
       </div>
       </div>
 
       <div className="min-h-[16rem]">
-        <IbusOrdersSidebar journeys={openIbusJourneys} />
+        <MachineStatusTable statuses={allMachineStatuses} />
       </div>
     </div>
   )

@@ -31,14 +31,14 @@ function progressPct(j) {
 }
 
 /**
- * Full-width bottom strip: open IBUS cards with a top progress bar.
+ * Open IBUS cards with a top progress bar (side panel next to the map).
  */
 export function IbusOrdersSidebar({ journeys = [] }) {
   return (
-    <aside className="flex flex-col min-h-0 min-w-0 w-full">
+    <aside className="flex flex-col min-h-0 min-w-0 w-full h-full">
       <div
         className="rounded-xl border border-gray-200 bg-white shadow-sm overflow-hidden
-                   dark:border-slate-700/60 dark:bg-slate-800/60 flex flex-col flex-1 min-h-0"
+                   dark:border-slate-700/60 dark:bg-slate-800/60 flex flex-col flex-1 min-h-0 h-full"
       >
         <div className="px-4 py-3 border-b border-gray-200 dark:border-slate-700/60 shrink-0">
           <h2 className="flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-slate-100">
@@ -58,8 +58,8 @@ export function IbusOrdersSidebar({ journeys = [] }) {
             No open IBUS orders
           </p>
         ) : (
-          <div className="p-3.5 overflow-y-auto flex-1 min-h-0 max-h-[22rem]">
-            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6 gap-3">
+          <div className="p-3.5 overflow-y-auto flex-1 min-h-0">
+            <div className="grid grid-cols-2 sm:grid-cols-2 gap-3">
               {journeys.map(j => {
                 const label = ibusLabel(j)
                 const pct = progressPct(j)
