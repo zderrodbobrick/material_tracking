@@ -655,15 +655,16 @@ def main() -> int:
                     f"  Operator movement: {n_moving} badges roaming "
                     f"({SIM_OPERATOR_MIN_DWELL_SEC:.0f}–{SIM_OPERATOR_MAX_DWELL_SEC:.0f}s dwell)"
                 )
-                if RTLS_OPERATOR_CONFIRM_SECS > SIM_OPERATOR_MIN_DWELL_SEC:
-                    print(
-                        f"  Tip: set RTLS_OPERATOR_CONFIRM_SECS={SIM_OPERATOR_MIN_DWELL_SEC:.0f} "
-                        "in .env so short station visits count toward part assignments"
-                    )
 
         _print_antenna_map()
 
         if args.auto:
+            # Keep demo operators at their seeded stations during the batch run —
+            # otherwise the first machine (Tennoner) hogs all assignments.
+            if operator_mover_started:
+                stop_operator_movement()
+                operator_mover_started = False
+                print("  Operator movement paused for auto pipeline (fair per-station credit)")
             _auto_run(
                 tracker, parts, locations, burst,
                 duration_sec=max(5.0, args.duration),

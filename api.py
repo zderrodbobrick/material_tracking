@@ -47,7 +47,9 @@ from tracking.station_specs import (
     position_progress,
     progress_spine_names,
     spec_row_to_api,
+    spine_sort_key,
     upsert_spec,
+    estimate_order_pipeline,
 )
 
 DASH_DIST = Path(__file__).parent / "dashboard" / "dist"
@@ -102,6 +104,73 @@ def _dwell_display(seconds) -> str | None:
         return f"{m} min {s} sec"
     h, m = divmod(m, 60)
     return f"{h}h {m}m {s}s"
+
+
+def _variance_display(delta_seconds: int | None) -> str | None:
+    if delta_seconds is None:
+        return None
+    if delta_seconds == 0:
+        return "on estimate"
+    sign = "+" if delta_seconds > 0 else "−"
+    return f"{sign}{_dwell_display(abs(delta_seconds))}"
+
+
+def _work_order_parts_by_ibus(db: sqlite3.Connection) -> dict[str, int]:
+    """IBUS key → expected part count from work_orders / BOM."""
+    out: dict[str, int] = {}
+    rows = db.execute(
+        "SELECT work_order_id, UPPER(ibus_number) AS ibus, parts_count "
+        "FROM work_orders WHERE ibus_number IS NOT NULL AND TRIM(ibus_number) != ''"
+    ).fetchall()
+    for r in rows:
+        ibus = (r["ibus"] or "").strip().upper()
+        if not ibus:
+            continue
+        bom = db.execute(
+            "SELECT COUNT(*) FROM work_order_components WHERE work_order_id = ?",
+            (r["work_order_id"],),
+        ).fetchone()[0]
+        expected = int(r["parts_count"] or bom or 0)
+        if expected > 0:
+            out[ibus] = expected
+    return out
+
+
+def _attach_order_time_estimates(
+    journey: dict,
+    specs_by_name: dict,
+    part_actuals: dict[str, float] | None,
+    wo_parts_by_ibus: dict[str, int] | None,
+) -> None:
+    key = (journey.get("key") or journey.get("ibus_order") or "").upper()
+    bom_expected = (wo_parts_by_ibus or {}).get(key)
+    tracked = journey.get("part_count") or len(journey.get("parts") or [])
+    est_parts = bom_expected or tracked or 1
+
+    est = estimate_order_pipeline(
+        est_parts,
+        specs_by_name,
+        part_actuals=part_actuals,
+    )
+    journey["expected_parts"] = bom_expected
+    journey["estimated_parts"] = est_parts
+    journey["estimated_transit_seconds"] = est["transit_seconds"]
+    journey["estimated_machine_dwell_seconds"] = est["machine_dwell_seconds"]
+    journey["estimated_per_part_seconds"] = est["per_part_seconds"]
+    journey["estimated_per_part_display"] = _dwell_display(est["per_part_seconds"])
+    journey["estimated_total_seconds"] = est["estimated_total_seconds"]
+    journey["estimated_total_display"] = (
+        _dwell_display(est["estimated_total_seconds"])
+        if est["estimated_total_seconds"] is not None
+        else None
+    )
+    journey["station_time_estimates"] = est["station_breakdown"]
+
+    actual = journey.get("total_production_seconds")
+    if actual is not None and est.get("estimated_total_seconds"):
+        diff = int(actual) - int(est["estimated_total_seconds"])
+        journey["actual_vs_estimated_seconds"] = diff
+        journey["actual_vs_estimated_display"] = _variance_display(diff)
 
 
 def _to_epoch_ms(iso_str) -> int | None:
@@ -309,6 +378,15 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
             "confirmed": bool(row["confirmed_at"]),
         })
 
+    zone_rows = db.execute(
+        """SELECT o.operator_id, o.operator_name, o.rtls_badge_id,
+                  ocz.zone_name, ocz.station_name, ocz.updated_at
+           FROM operator_current_zone ocz
+           JOIN operators o ON o.operator_id = ocz.operator_id
+           WHERE ocz.status = 'in' AND o.is_active = 1
+           ORDER BY ocz.updated_at ASC"""
+    ).fetchall()
+
     for s in sessions:
         sid = s["session_id"]
         worked = worked_by_session.get(sid, [])
@@ -324,6 +402,7 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
             s["operator_zone"] = primary.get("zone_name")
             s["assignment_method"] = primary.get("assignment_method")
             s["rtls_match"] = True
+            s["has_operator"] = True
             if primary.get("x") is not None:
                 s["operator_x"] = primary["x"]
                 s["operator_y"] = primary["y"]
@@ -333,11 +412,43 @@ def _attach_operators(db: sqlite3.Connection, sessions: list[dict]) -> list[dict
             s["operator_id"] = primary["operator_id"]
             s["operator_zone"] = primary.get("zone_name")
             s["rtls_match"] = None  # pending, not confirmed
+            s["has_operator"] = True
             if primary.get("x") is not None:
                 s["operator_x"] = primary["x"]
                 s["operator_y"] = primary["y"]
         elif s.get("status") == STATUS_OPEN:
-            s["rtls_match"] = False
+            st_name = s.get("station_name")
+            zone_op = None
+            for zrow in zone_rows:
+                zst = zrow["station_name"]
+                if st_name and zst and (
+                    st_name == zst
+                    or (canonical_station(st_name) or st_name) == (canonical_station(zst) or zst)
+                ):
+                    zone_op = zrow
+                    break
+            if zone_op:
+                entered = zone_op["updated_at"]
+                entered_dt = _parse_ts(entered)
+                secs = max(0.0, (now - entered_dt).total_seconds()) if entered_dt else 0.0
+                fallback = _operator_dict(
+                    zone_op,
+                    live_positions=live_positions,
+                    entered_at=entered,
+                    confirmed=False,
+                    seconds_in_zone=secs,
+                )
+                s["operators_present"] = [fallback]
+                s["operator_name"] = fallback["operator_name"]
+                s["operator_id"] = fallback["operator_id"]
+                s["operator_zone"] = fallback.get("zone_name")
+                s["rtls_match"] = None
+                s["has_operator"] = True
+            else:
+                s["rtls_match"] = False
+                s["has_operator"] = False
+        else:
+            s["has_operator"] = bool(worked or present)
     return sessions
 
 
@@ -518,6 +629,8 @@ def _part_tag_label(session: dict) -> str:
 def _build_ibus_journeys(
     sessions: list[dict],
     specs_by_name: dict | None = None,
+    part_actuals: dict[str, float] | None = None,
+    wo_parts_by_ibus: dict[str, int] | None = None,
 ) -> list[dict]:
     """Group station sessions by IBUS order (work order), not individual part EPC."""
     groups: dict[str, list[dict]] = {}
@@ -735,7 +848,7 @@ def _build_ibus_journeys(
 
         spine = progress_spine_names(specs_by_name or {}) if specs_by_name else list(PROGRESS_STATIONS)
 
-        journeys.append({
+        journey = {
             "key": key,
             "ibus_order": key,
             "ibus_number": key,
@@ -760,7 +873,12 @@ def _build_ibus_journeys(
             "machines": machines,
             "operators": list(op_map.values()),
             "session_count": len(sess_list),
-        })
+        }
+        if specs_by_name:
+            _attach_order_time_estimates(
+                journey, specs_by_name, part_actuals, wo_parts_by_ibus
+            )
+        journeys.append(journey)
 
     journeys.sort(key=lambda j: j.get("entry_time") or "", reverse=True)
     return journeys
@@ -781,9 +899,13 @@ def ibus_journeys():
     sessions = [_session_dict(r) for r in rows]
     _attach_operators(db, sessions)
     specs_by_name = fetch_specs_by_name(db)
+    part_actuals, _ = _station_actual_dwells(db)
+    wo_parts_by_ibus = _work_order_parts_by_ibus(db)
     db.close()
 
-    journeys = _build_ibus_journeys(sessions, specs_by_name)
+    journeys = _build_ibus_journeys(
+        sessions, specs_by_name, part_actuals, wo_parts_by_ibus
+    )
     if status in ("open", "live", "in"):
         journeys = [j for j in journeys if j["status"] == "open"]
     elif status in ("completed", "closed", "done"):
@@ -976,7 +1098,7 @@ def list_station_specifications():
 
     seen_ids: set[int] = set()
     out = []
-    for row in sorted(specs.values(), key=lambda r: (not r.get("on_progress_spine"), r.get("progress_spine_index") or 99, r["station_id"])):
+    for row in sorted(specs.values(), key=spine_sort_key):
         sid = row["station_id"]
         if sid in seen_ids:
             continue
@@ -1711,14 +1833,15 @@ def report_sessions():
 # ── GET /api/analytics ────────────────────────────────────────────────────────
 
 def _build_operator_analytics(db: sqlite3.Connection) -> dict:
-    """Aggregate per-operator session counts, dwell, and per-station breakdown."""
+    """Aggregate per-operator counts (distinct parts), dwell, and per-station breakdown."""
     rows = db.execute(
         """SELECT o.operator_id, o.operator_name, st.station_name,
-                  s.session_id, s.dwell_seconds, s.session_status
+                  s.session_id, s.dwell_seconds, s.session_status, t.epc
            FROM part_operator_assignments poa
            JOIN operators o ON poa.operator_id = o.operator_id
            JOIN part_station_sessions s ON poa.session_id = s.session_id
-           JOIN stations st ON s.station_id = st.station_id"""
+           JOIN stations st ON s.station_id = st.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id"""
     ).fetchall()
 
     op_acc: dict[int, dict] = {}
@@ -1731,30 +1854,43 @@ def _build_operator_analytics(db: sqlite3.Connection) -> dict:
                 "closed":        [],
                 "open":          0,
                 "stations":      {},
+                "epcs_closed":   set(),
+                "epcs_open":     set(),
             }
         acc = op_acc[oid]
         station = r["station_name"] or STATION_NAME
-        st_acc = acc["stations"].setdefault(station, {"pieces": 0, "dwells": []})
+        epc = r["epc"] or f"session-{r['session_id']}"
+        st_acc = acc["stations"].setdefault(
+            station,
+            {"pieces": 0, "dwells": [], "epcs": set()},
+        )
         if r["session_status"] == STATUS_CLOSED:
             acc["closed"].append(int(r["dwell_seconds"] or 0))
             st_acc["pieces"] += 1
+            st_acc["epcs"].add(epc)
+            acc["epcs_closed"].add(epc)
             if r["dwell_seconds"] is not None:
                 st_acc["dwells"].append(int(r["dwell_seconds"]))
         elif r["session_status"] == STATUS_OPEN:
             acc["open"] += 1
             st_acc["pieces"] += 1
+            st_acc["epcs"].add(epc)
+            acc["epcs_open"].add(epc)
 
     leaderboard = []
     for acc in op_acc.values():
         dwells = acc["closed"]
         total_closed = len(dwells)
+        unique_closed = len(acc["epcs_closed"])
+        unique_open = len(acc["epcs_open"] - acc["epcs_closed"])
         avg = sum(dwells) / total_closed if dwells else None
         stations = []
         for name, st in acc["stations"].items():
             s_avg = sum(st["dwells"]) / len(st["dwells"]) if st["dwells"] else None
             stations.append({
                 "station":           name,
-                "pieces":            st["pieces"],
+                "pieces":            len(st["epcs"]),
+                "sessions":          st["pieces"],
                 "completed":         len(st["dwells"]),
                 "avg_dwell_seconds": round(s_avg, 1) if s_avg is not None else None,
                 "avg_dwell_display": _dwell_display(s_avg),
@@ -1763,9 +1899,10 @@ def _build_operator_analytics(db: sqlite3.Connection) -> dict:
         leaderboard.append({
             "operator_id":       acc["operator_id"],
             "operator_name":     acc["operator_name"],
-            "total_pieces":      total_closed + acc["open"],
-            "completed_pieces":  total_closed,
-            "in_progress":       acc["open"],
+            "total_pieces":      unique_closed + unique_open,
+            "completed_pieces":  unique_closed,
+            "completed_sessions": total_closed,
+            "in_progress":       unique_open,
             "stations_worked":   len(acc["stations"]),
             "avg_dwell_seconds": round(avg, 1) if avg is not None else None,
             "avg_dwell_display": _dwell_display(avg),
@@ -1836,20 +1973,14 @@ def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
         (STATION_NAME, STATION_NAME),
     ).fetchall()
 
-    # Hourly assignment volume (when operators get confirmed at machines).
-    hour_rows = db.execute(
-        """SELECT CAST(strftime('%H', poa.assigned_at) AS INTEGER) AS hour,
-                  COUNT(*) AS assignments
-           FROM part_operator_assignments poa
-           WHERE poa.assigned_at IS NOT NULL
-           GROUP BY hour
-           ORDER BY hour"""
-    ).fetchall()
-    hour_map = {int(r["hour"]): int(r["assignments"]) for r in hour_rows}
-    by_hour = [
-        {"hour": h, "assignments": hour_map.get(h, 0)}
-        for h in range(24)
+    # Hourly assignment volume (local wall-clock — not UTC strftime).
+    assign_ts = [
+        r["assigned_at"]
+        for r in db.execute(
+            "SELECT assigned_at FROM part_operator_assignments WHERE assigned_at IS NOT NULL"
+        )
     ]
+    by_hour = _hourly_buckets_from_timestamps(assign_ts)
 
     # RTLS presence confirmation stats.
     pres = db.execute(
@@ -2008,15 +2139,15 @@ def analytics_operator_detail(operator_id: int):
         (operator_id,),
     ).fetchall()
 
-    hour_rows = db.execute(
-        """SELECT CAST(strftime('%H', poa.assigned_at) AS INTEGER) AS hour,
-                  COUNT(*) AS assignments
-           FROM part_operator_assignments poa
-           WHERE poa.operator_id = ? AND poa.assigned_at IS NOT NULL
-           GROUP BY hour ORDER BY hour""",
-        (operator_id,),
-    ).fetchall()
-    hour_map = {int(r["hour"]): int(r["assignments"]) for r in hour_rows}
+    assign_ts = [
+        r["assigned_at"]
+        for r in db.execute(
+            "SELECT assigned_at FROM part_operator_assignments "
+            "WHERE operator_id = ? AND assigned_at IS NOT NULL",
+            (operator_id,),
+        )
+    ]
+    by_hour = _hourly_buckets_from_timestamps(assign_ts)
 
     recent = db.execute(
         """SELECT poa.assigned_at,
@@ -2077,9 +2208,7 @@ def analytics_operator_detail(operator_id: int):
         "stats": stats,
         "currently_in_zone": dict(in_zone) if in_zone else None,
         "stations": stations,
-        "assignments_by_hour": [
-            {"hour": h, "assignments": hour_map.get(h, 0)} for h in range(24)
-        ],
+        "assignments_by_hour": by_hour,
         "recent_assignments": [
             {
                 "assigned_at":    r["assigned_at"],
@@ -2205,9 +2334,403 @@ def _median(values: list[int]):
     return (s[mid - 1] + s[mid]) / 2.0
 
 
+def _percentile(values: list[int], pct: float):
+    if not values:
+        return None
+    s = sorted(values)
+    k = (len(s) - 1) * pct / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    if lo == hi:
+        return float(s[lo])
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _local_dt(ts: str | None) -> datetime | None:
+    dt = _parse_ts(ts)
+    return dt.astimezone() if dt else None
+
+
+def _local_hour(ts: str | None) -> int | None:
+    dt = _local_dt(ts)
+    return dt.hour if dt else None
+
+
+def _local_date(ts: str | None):
+    dt = _local_dt(ts)
+    return dt.date() if dt else None
+
+
+def _in_analytics_period(ts: str | None, days: int | None) -> bool:
+    if days is None:
+        return True
+    dt = _parse_ts(ts)
+    if not dt:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt >= cutoff
+
+
+def _hourly_buckets_from_timestamps(timestamps: list[str | None]) -> list[dict]:
+    """Bucket timestamps into local wall-clock hours (fixes UTC strftime bug)."""
+    counts = [0] * 24
+    for ts in timestamps:
+        h = _local_hour(ts)
+        if h is not None:
+            counts[h] += 1
+    return [{"hour": h, "assignments": counts[h], "completed": counts[h]} for h in range(24)]
+
+
+def _spec_for_station(specs_by_name: dict, station_name: str) -> dict | None:
+    return specs_by_name.get(station_name) or specs_by_name.get(canonical_station(station_name) or "")
+
+
+def _build_machine_analytics(
+    db: sqlite3.Connection,
+    specs_by_name: dict,
+    days: int | None = None,
+) -> list[dict]:
+    """Per-station efficiency: dwell stats, throughput, WIP, vs targets."""
+    now = datetime.now(timezone.utc)
+    today = datetime.now().astimezone().date()
+    one_hour_ago = now - timedelta(hours=1)
+
+    wip_map: dict[str, int] = {}
+    for r in db.execute(
+        """SELECT COALESCE(st.station_name, ?) AS station_name, COUNT(*) AS c
+           FROM part_station_sessions s
+           JOIN stations st ON st.station_id = s.station_id
+           WHERE s.session_status = ?
+           GROUP BY st.station_name""",
+        (STATION_NAME, STATUS_OPEN),
+    ):
+        wip_map[r["station_name"]] = int(r["c"])
+
+    status_rows = db.execute(
+        """SELECT st.station_name, s.session_status, s.dwell_seconds, s.exit_time,
+                  s.entry_time, t.epc
+           FROM part_station_sessions s
+           JOIN stations st ON st.station_id = s.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id"""
+    ).fetchall()
+
+    station_data: dict[str, dict] = {}
+    repeat_pairs: dict[tuple[str, str], int] = {}
+    epc_visits: dict[str, list[tuple[str, str]]] = {}
+
+    for r in status_rows:
+        name = r["station_name"] or STATION_NAME
+        acc = station_data.setdefault(name, {
+            "closed_dwells": [],
+            "completed_epcs": set(),
+            "completed_today_epcs": set(),
+            "completed_last_hour_epcs": set(),
+            "exit_only": 0,
+            "abandoned": 0,
+            "exceeding_target": 0,
+            "exceeding_max": 0,
+        })
+        status = r["session_status"]
+        spec = _spec_for_station(specs_by_name, name)
+        target = spec.get("target_part_dwell_seconds") if spec else None
+        max_dwell = spec.get("max_dwell_seconds") if spec else None
+        epc = r["epc"] or ""
+
+        if status == STATUS_CLOSED and r["dwell_seconds"] is not None:
+            if not _in_analytics_period(r["exit_time"], days):
+                pass
+            else:
+                dwell = int(r["dwell_seconds"])
+                acc["closed_dwells"].append(dwell)
+                if epc:
+                    acc["completed_epcs"].add(epc)
+                exit_local = _local_dt(r["exit_time"])
+                if exit_local and exit_local.date() == today and epc:
+                    acc["completed_today_epcs"].add(epc)
+                exit_dt = _parse_ts(r["exit_time"])
+                if exit_dt and exit_dt >= one_hour_ago and epc:
+                    acc["completed_last_hour_epcs"].add(epc)
+                if target and dwell > target:
+                    acc["exceeding_target"] += 1
+                if max_dwell and dwell > max_dwell:
+                    acc["exceeding_max"] += 1
+                if epc:
+                    key = (epc, name)
+                    repeat_pairs[key] = repeat_pairs.get(key, 0) + 1
+                    epc_visits.setdefault(epc, []).append((name, r["entry_time"] or ""))
+        elif status == STATUS_EXIT_ONLY:
+            acc["exit_only"] += 1
+        elif status == STATUS_ABANDONED:
+            acc["abandoned"] += 1
+
+    repeat_visits = sum(c - 1 for c in repeat_pairs.values() if c > 1)
+
+    spine = progress_spine_names(specs_by_name)
+    spine_idx = {
+        canonical_station(s) or s: i
+        for i, s in enumerate(spine)
+    }
+    skipped_parts = 0
+    wrong_order_parts = 0
+    for epc, visits in epc_visits.items():
+        ordered = sorted(visits, key=lambda x: x[1])
+        visited_indices = []
+        prev_idx = -1
+        for st_name, _ in ordered:
+            canon = canonical_station(st_name) or st_name
+            if canon not in spine_idx:
+                continue
+            idx = spine_idx[canon]
+            if idx < prev_idx:
+                wrong_order_parts += 1
+                break
+            prev_idx = max(prev_idx, idx)
+            if idx not in visited_indices:
+                visited_indices.append(idx)
+        if visited_indices:
+            max_idx = max(visited_indices)
+            expected = set(range(max_idx + 1))
+            if set(visited_indices) != expected:
+                skipped_parts += 1
+
+    seen_ids: set[int] = set()
+    machines = []
+    for spec in sorted(
+        specs_by_name.values(),
+        key=spine_sort_key,
+    ):
+        sid = spec["station_id"]
+        if sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        name = spec["station_name"]
+        acc = station_data.get(name, {
+            "closed_dwells": [], "completed_epcs": set(),
+            "completed_today_epcs": set(), "completed_last_hour_epcs": set(),
+            "exit_only": 0, "abandoned": 0,
+            "exceeding_target": 0, "exceeding_max": 0,
+        })
+        dwells = acc["closed_dwells"]
+        completed = len(acc["completed_epcs"])
+        completed_today = len(acc["completed_today_epcs"])
+        completed_last_hour = len(acc["completed_last_hour_epcs"])
+        target = spec.get("target_part_dwell_seconds")
+        target_pph = spec.get("target_pieces_per_hour")
+        avg = sum(dwells) / len(dwells) if dwells else None
+        med = _median(dwells)
+        p90 = _percentile(dwells, 90)
+        mn = min(dwells) if dwells else None
+        mx = max(dwells) if dwells else None
+        cmp_ = compare_to_target(avg, target)
+        actual_pph = float(completed_last_hour) if completed_last_hour else None
+        pph_cmp = (
+            compare_to_target(actual_pph, int(target_pph))
+            if actual_pph is not None and target_pph
+            else {"vs_target_pct": None, "vs_target_status": None}
+        )
+
+        machines.append({
+            "station_id":              sid,
+            "station":                 name,
+            "station_type":            spec.get("station_type"),
+            "on_progress_spine":       bool(spec.get("on_progress_spine")),
+            "progress_spine_index":    spec.get("progress_spine_index"),
+            "in_process":              wip_map.get(name, 0),
+            "completed":               completed,
+            "completed_today":         completed_today,
+            "completed_last_hour":     completed_last_hour,
+            "exit_only":               acc["exit_only"],
+            "abandoned":               acc["abandoned"],
+            "exceeding_target":        acc["exceeding_target"],
+            "exceeding_max":           acc["exceeding_max"],
+            "avg_dwell_seconds":       round(avg, 1) if avg is not None else None,
+            "avg_dwell_display":       _dwell_display(avg),
+            "median_dwell_seconds":    med,
+            "median_dwell_display":    _dwell_display(med),
+            "p90_dwell_seconds":       round(p90, 1) if p90 is not None else None,
+            "p90_dwell_display":       _dwell_display(p90),
+            "min_dwell_seconds":       mn,
+            "min_dwell_display":       _dwell_display(mn),
+            "max_dwell_seconds":       mx,
+            "max_dwell_display":       _dwell_display(mx),
+            "target_part_dwell_seconds": target,
+            "target_part_dwell_display": _dwell_display(target),
+            "max_dwell_limit_seconds": spec.get("max_dwell_seconds"),
+            "target_pieces_per_hour":    target_pph,
+            "actual_pieces_per_hour":    actual_pph,
+            "vs_target_pct":           cmp_["vs_target_pct"],
+            "vs_target_status":        cmp_["vs_target_status"],
+            "throughput_vs_target_pct": pph_cmp["vs_target_pct"],
+            "throughput_vs_target_status": pph_cmp["vs_target_status"],
+        })
+
+    for m in machines:
+        m["repeat_visits"] = repeat_visits
+        m["skipped_parts"] = skipped_parts
+        m["wrong_order_parts"] = wrong_order_parts
+
+    machines.sort(
+        key=lambda m: (
+            not m.get("on_progress_spine"),
+            m.get("progress_spine_index") if m.get("progress_spine_index") is not None else 99,
+        ),
+    )
+    return machines
+
+
+def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> list[dict]:
+    """Work-order progress: BOM expected vs RFID-completed parts."""
+    spine = progress_spine_names(specs_by_name)
+    final_station = spine[-1] if spine else INSERT_STATION_NAME
+
+    orders = db.execute(
+        "SELECT * FROM work_orders ORDER BY ingested_at DESC"
+    ).fetchall()
+
+    session_rows = db.execute(
+        """SELECT v.epc, v.ibus_number, v.job_number, v.station_name,
+                  v.session_status, v.dwell_seconds, v.entry_time, v.exit_time
+           FROM vw_live_part_status v
+           WHERE v.epc IS NOT NULL"""
+    ).fetchall()
+
+    ibus_acc: dict[str, dict] = {}
+    for r in session_rows:
+        key = (r["ibus_number"] or r["job_number"] or "").strip().upper()
+        if not key:
+            continue
+        if not key.startswith("IBUS") and r["job_number"]:
+            key = f"IBUS{r['job_number']}"
+        acc = ibus_acc.setdefault(key, {
+            "epcs": set(),
+            "completed_epcs": set(),
+            "open_epcs": set(),
+            "stations_touched": set(),
+            "dwell_sum": 0,
+            "closed_count": 0,
+            "entries": [],
+            "exits": [],
+        })
+        epc = r["epc"]
+        acc["epcs"].add(epc)
+        st = r["station_name"] or ""
+        acc["stations_touched"].add(st)
+        if r["session_status"] == STATUS_CLOSED:
+            acc["closed_count"] += 1
+            if r["dwell_seconds"]:
+                acc["dwell_sum"] += int(r["dwell_seconds"])
+            acc["exits"].append(r["exit_time"])
+            if st == final_station or canonical_station(st) == canonical_station(final_station):
+                acc["completed_epcs"].add(epc)
+        elif r["session_status"] == STATUS_OPEN:
+            acc["open_epcs"].add(epc)
+        if r["entry_time"]:
+            acc["entries"].append(r["entry_time"])
+
+    out = []
+    seen_ibus: set[str] = set()
+    for wo in orders:
+        ibus = (wo["ibus_number"] or "").strip().upper()
+        if not ibus or ibus in seen_ibus:
+            continue
+        seen_ibus.add(ibus)
+        if HIDDEN_IBUS_ORDERS and ibus in HIDDEN_IBUS_ORDERS:
+            continue
+
+        comp_row = db.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) AS bom_complete,
+                      SUM(CASE WHEN status = 'in_process' THEN 1 ELSE 0 END) AS bom_in_process
+               FROM work_order_components WHERE work_order_id = ?""",
+            (wo["work_order_id"],),
+        ).fetchone()
+        bom_total = int(comp_row["total"] or 0)
+        bom_complete = int(comp_row["bom_complete"] or 0)
+
+        rfid = ibus_acc.get(ibus, {})
+        expected = int(wo["parts_count"] or bom_total or 0)
+        rfid_completed = len(rfid.get("completed_epcs", set()))
+        rfid_unique = len(rfid.get("epcs", set()))
+        rfid_in_progress = len(rfid.get("open_epcs", set()))
+        completion_base = expected or rfid_unique or 1
+        completion_pct = round(100.0 * rfid_completed / completion_base, 1) if completion_base else None
+        bom_pct = round(100.0 * bom_complete / bom_total, 1) if bom_total else None
+
+        entries = rfid.get("entries", [])
+        exits = rfid.get("exits", [])
+        cycle_sec = None
+        if entries and exits:
+            entry_dt = min(_parse_ts(t) for t in entries if _parse_ts(t))
+            exit_dt = max(_parse_ts(t) for t in exits if _parse_ts(t))
+            if entry_dt and exit_dt and exit_dt > entry_dt:
+                cycle_sec = int((exit_dt - entry_dt).total_seconds())
+
+        stations_done = len(rfid.get("stations_touched", set()) & set(spine))
+        progress = round(stations_done / len(spine), 3) if spine else None
+
+        out.append({
+            "ibus_number":            ibus,
+            "work_order":             wo["work_order"],
+            "customer":               wo["customer"],
+            "prod_date":              wo["prod_date"],
+            "status":                 wo["status"],
+            "expected_parts":         expected,
+            "bom_total":              bom_total,
+            "bom_complete":           bom_complete,
+            "bom_in_process":         int(comp_row["bom_in_process"] or 0),
+            "bom_completion_pct":     bom_pct,
+            "rfid_completed":         rfid_completed,
+            "rfid_unique_tags":       rfid_unique,
+            "rfid_in_progress":       rfid_in_progress,
+            "completion_pct":         completion_pct,
+            "stations_done":          stations_done,
+            "stations_total":         len(spine),
+            "progress":               progress,
+            "avg_cycle_seconds":      round(rfid["dwell_sum"] / rfid["closed_count"], 1) if rfid.get("closed_count") else None,
+            "avg_cycle_display":      _dwell_display(rfid["dwell_sum"] / rfid["closed_count"]) if rfid.get("closed_count") else None,
+            "total_cycle_seconds":      cycle_sec,
+            "total_cycle_display":    _dwell_display(cycle_sec),
+        })
+
+    for key, rfid in ibus_acc.items():
+        if key in seen_ibus or (HIDDEN_IBUS_ORDERS and key in HIDDEN_IBUS_ORDERS):
+            continue
+        if not rfid.get("epcs"):
+            continue
+        expected = len(rfid["epcs"])
+        rfid_completed = len(rfid.get("completed_epcs", set()))
+        out.append({
+            "ibus_number":        key,
+            "work_order":         None,
+            "customer":           None,
+            "prod_date":          None,
+            "status":             "open" if rfid.get("open_epcs") else "completed",
+            "expected_parts":     expected,
+            "bom_total":          0,
+            "bom_complete":       0,
+            "bom_in_process":     0,
+            "bom_completion_pct": None,
+            "rfid_completed":     rfid_completed,
+            "rfid_unique_tags":   expected,
+            "rfid_in_progress":   len(rfid.get("open_epcs", set())),
+            "completion_pct":     round(100.0 * rfid_completed / max(expected, 1), 1),
+            "stations_done":      len(rfid.get("stations_touched", set()) & set(spine)),
+            "stations_total":     len(spine),
+            "progress":           round(len(rfid.get("stations_touched", set()) & set(spine)) / len(spine), 3) if spine else None,
+            "avg_cycle_seconds":  None,
+            "avg_cycle_display":  None,
+            "total_cycle_seconds": None,
+            "total_cycle_display": None,
+        })
+
+    out.sort(key=lambda o: (o["completion_pct"] or 0, o["rfid_completed"]), reverse=True)
+    return out
+
+
 @app.route("/api/analytics")
 def analytics():
     db = get_db()
+    days = request.args.get("days", type=int)
 
     counts = {STATUS_CLOSED: 0, STATUS_OPEN: 0, STATUS_EXIT_ONLY: 0, STATUS_ABANDONED: 0}
     for r in db.execute(
@@ -2221,10 +2744,14 @@ def analytics():
            WHERE session_status = ? AND dwell_seconds IS NOT NULL""",
         (STATUS_CLOSED,),
     ).fetchall()
+    if days is not None:
+        completed = [r for r in completed if _in_analytics_period(r["exit_time"], days)]
+
     operators = _build_operator_analytics(db)
     parts_summary = _build_parts_summary(db, completed)
     specs_by_name = fetch_specs_by_name(db)
-    part_actuals, op_actuals = _station_actual_dwells(db)
+    machines = _build_machine_analytics(db, specs_by_name, days=days)
+    ibus_orders = _build_ibus_order_analytics(db, specs_by_name)
 
     dwells = [int(r["dwell_seconds"]) for r in completed if r["dwell_seconds"] is not None]
     avg = sum(dwells) / len(dwells) if dwells else None
@@ -2318,10 +2845,13 @@ def analytics():
     )
 
     progress_spine = progress_spine_names(specs_by_name)
+    bottleneck = max(machines, key=lambda m: m.get("avg_dwell_seconds") or 0) if machines else None
+    total_exceeding = sum(m.get("exceeding_target", 0) for m in machines)
     db.close()
 
     return jsonify({
         "generated_at": _now_utc(),
+        "period_days": days,
         "totals": {
             "total":       total,
             "complete":    counts[STATUS_CLOSED],
@@ -2330,6 +2860,14 @@ def analytics():
             "abandoned":   counts[STATUS_ABANDONED],
         },
         "completion_rate": completion_rate,
+        "exceptions": {
+            "exit_only":        counts[STATUS_EXIT_ONLY],
+            "abandoned":        counts[STATUS_ABANDONED],
+            "exceeding_target": total_exceeding,
+            "repeat_visits":    machines[0]["repeat_visits"] if machines else 0,
+            "skipped_parts":    machines[0]["skipped_parts"] if machines else 0,
+            "wrong_order_parts": machines[0]["wrong_order_parts"] if machines else 0,
+        },
         "dwell": {
             "avg_seconds":     round(avg, 1) if avg is not None else None,
             "avg_display":     _dwell_display(avg),
@@ -2342,6 +2880,9 @@ def analytics():
             "sample_size":     len(dwells),
         },
         "stations":           stations,
+        "machines":           machines,
+        "ibus_orders":        ibus_orders,
+        "bottleneck":         bottleneck,
         "longest_station":    longest_station,
         "throughput_by_day":  throughput_by_day,
         "throughput_by_hour": throughput_by_hour,

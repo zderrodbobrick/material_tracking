@@ -75,6 +75,9 @@ HIDDEN_IBUS_ORDERS = frozenset(
     if x.strip()
 )
 
+# Per-part buffer added to IBUS time estimates (transit between spine machines).
+IBUS_TRANSIT_BUFFER_SEC = int(os.getenv("IBUS_TRANSIT_BUFFER_SEC", "3600"))
+
 # ── RSSI Filter ───────────────────────────────────────────────────────────────
 # Valid reads must satisfy: RSSI_MIN <= rssi <= 0
 # Lower = greater range, Higher = more selective (less cross-antenna reads)
@@ -176,8 +179,12 @@ RTLS_DATA_DIR = Path(os.getenv("RTLS_DATA_DIR", BASE_DIR / "RTLS"))
 RTLS_OPERATOR_CONFIRM_SECS = float(os.getenv("RTLS_OPERATOR_CONFIRM_SECS", "10"))
 
 # Max operators linked to one part (session) at once — additional RTLS matches are ignored.
-MAX_OPERATORS_PER_PART = int(os.getenv("MAX_OPERATORS_PER_PART", "2"))
+MAX_OPERATORS_PER_PART = int(os.getenv("MAX_OPERATORS_PER_PART", "1"))
+
+# Max distinct operators actively working at one station (zone) at a time.
+MAX_OPERATORS_PER_STATION = int(os.getenv("MAX_OPERATORS_PER_STATION", "1"))
 
 # Offline sim: random operator movement between production zones
-SIM_OPERATOR_MIN_DWELL_SEC = float(os.getenv("SIM_OPERATOR_MIN_DWELL_SEC", "5"))
+# Min dwell must exceed RTLS_OPERATOR_CONFIRM_SECS or assignments never confirm.
+SIM_OPERATOR_MIN_DWELL_SEC = float(os.getenv("SIM_OPERATOR_MIN_DWELL_SEC", "12"))
 SIM_OPERATOR_MAX_DWELL_SEC = float(os.getenv("SIM_OPERATOR_MAX_DWELL_SEC", "30"))

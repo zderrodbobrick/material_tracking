@@ -9,7 +9,11 @@ import urllib.error
 import urllib.request
 from typing import Callable, Optional
 
-from config import SIM_OPERATOR_MAX_DWELL_SEC, SIM_OPERATOR_MIN_DWELL_SEC
+from config import (
+    SIM_OPERATOR_MAX_DWELL_SEC,
+    SIM_OPERATOR_MIN_DWELL_SEC,
+    RTLS_OPERATOR_CONFIRM_SECS,
+)
 
 _stop = threading.Event()
 _threads: list[threading.Thread] = []
@@ -47,8 +51,9 @@ def _worker(
     notify: Optional[Callable[[], None]],
 ) -> None:
     current = initial_zone
+    min_dwell = max(SIM_OPERATOR_MIN_DWELL_SEC, RTLS_OPERATOR_CONFIRM_SECS + 2.0)
     while not _stop.is_set():
-        dwell = random.uniform(SIM_OPERATOR_MIN_DWELL_SEC, SIM_OPERATOR_MAX_DWELL_SEC)
+        dwell = random.uniform(min_dwell, max(SIM_OPERATOR_MAX_DWELL_SEC, min_dwell + 1.0))
         if _stop.wait(dwell):
             return
         choices = [z for z in zone_pool if z != current]

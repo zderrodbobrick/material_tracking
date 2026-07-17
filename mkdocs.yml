@@ -1,0 +1,81 @@
+site_name: Material Tracking
+site_description: RFID part and operator tracking — Bobrick production stations
+site_author: Bobrick Washroom Equipment
+
+repo_name: material_tracking
+repo_url: https://github.com/zderrodbobrick/material_tracking
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: en
+  logo: assets/bobrick-logo.png
+  favicon: assets/favicon.svg
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.path
+    - toc.integrate
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+  palette:
+    # Bobrick dashboard theme — fixed dark (black + light blue)
+    - scheme: bobrick
+      primary: custom
+      accent: custom
+      pygments_style: monokai
+      toggle:
+        icon: material/brightness-4
+        name: Bobrick theme
+
+extra_css:
+  - stylesheets/bobrick.css
+
+nav:
+  - Home: README.md
+  - Tutorials:
+      - Getting started: tutorials/getting-started.md
+      - Explore the dashboard: tutorials/explore-the-dashboard.md
+  - How-to guides:
+      - Run locally: how-to/run-locally.md
+      - Configure Zebra reader: how-to/configure-zebra-reader.md
+      - Run the simulator: how-to/run-the-simulator.md
+      - Print RFID labels: how-to/print-rfid-labels.md
+      - Enable RTLS: how-to/enable-rtls.md
+      - Build the dashboard: how-to/build-and-deploy-dashboard.md
+      - Run tests: how-to/run-tests.md
+      - Publish documentation: how-to/publish-documentation.md
+  - Explanation:
+      - Architecture: explanation/architecture.md
+      - Session lifecycle: explanation/session-lifecycle.md
+      - Data model: explanation/data-model.md
+      - RTLS and operators: explanation/rtls-and-operators.md
+  - Reference:
+      - Configuration: reference/configuration.md
+      - API: reference/api.md
+      - Database schema: reference/database-schema.md
+      - CLI and scripts: reference/cli-and-scripts.md
+      - Glossary: reference/glossary.md
+  - Legacy:
+      - Codebase reference: CODEBASE_REFERENCE.md
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/zderrodbobrick/material_tracking

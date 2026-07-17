@@ -36,3 +36,6 @@ Thumbs.db
 # Project specific
 output/*.zpl
 output/*.txt
+
+# MkDocs build output
+site/

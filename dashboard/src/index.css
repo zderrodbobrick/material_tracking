@@ -4,7 +4,24 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+  /* Bobrick brand — black + light blue */
+  --bb-black: #08080a;
+  --bb-surface: #111114;
+  --bb-elevated: #18181d;
+  --bb-border: #27272f;
+  --bb-blue: #4dc4f4;
+  --bb-blue-dark: #0099cc;
+  --bb-blue-glow: rgba(77, 196, 244, 0.15);
+  --bb-text: #eef2f7;
+  --bb-muted: #8b939e;
+  --bb-success: #34d399;
+  --bb-warn: #fbbf24;
+  --bb-danger: #f87171;
+}
+
+html {
+  color-scheme: dark;
 }
 
 html.dark {
@@ -15,6 +32,8 @@ body {
   margin: 0;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
+  background-color: var(--bb-black);
+  color: var(--bb-text);
 }
 
 #root {
@@ -140,6 +159,138 @@ body {
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(100, 116, 139, 0.6);
+  background: rgba(77, 196, 244, 0.45);
   background-clip: padding-box;
+}
+
+/* Bobrick analytics shell */
+.bobrick-shell {
+  --color-surface: var(--bb-surface);
+  --color-elevated: var(--bb-elevated);
+  --color-border: var(--bb-border);
+  --color-accent: var(--bb-blue);
+  --color-text: var(--bb-text);
+  --color-muted: var(--bb-muted);
+}
+
+/* Bobrick UI primitives — used app-wide */
+@layer components {
+  .bb-panel {
+    @apply rounded-xl overflow-hidden shadow-sm;
+    animation: fade-in 0.45s cubic-bezier(0.4, 0, 0.2, 1) both;
+    background-color: var(--bb-elevated);
+    border: 1px solid var(--bb-border);
+  }
+  .bb-panel-header {
+    @apply px-5 py-4 flex flex-wrap items-center justify-between gap-3 shrink-0;
+    border-bottom: 1px solid var(--bb-border);
+  }
+  .bb-title {
+    @apply flex items-center gap-2 text-base font-semibold;
+    color: var(--bb-text);
+  }
+  .bb-subtitle {
+    @apply text-xs mt-0.5;
+    color: var(--bb-muted);
+  }
+  .bb-card {
+    @apply rounded-xl p-4 transition-[transform,box-shadow,border-color] duration-300;
+    background-color: var(--bb-elevated);
+    border: 1px solid var(--bb-border);
+  }
+  .bb-card:hover {
+    @apply -translate-y-0.5 shadow-lg;
+    border-color: color-mix(in srgb, var(--bb-blue) 35%, var(--bb-border));
+  }
+  .bb-kpi-label {
+    @apply text-xs font-semibold uppercase tracking-wider leading-none;
+    color: var(--bb-muted);
+  }
+  .bb-input {
+    @apply px-3 py-1.5 text-sm rounded-lg transition-colors focus:outline-none focus:ring-2;
+    background-color: var(--bb-black);
+    border: 1px solid var(--bb-border);
+    color: var(--bb-text);
+  }
+  .bb-input::placeholder {
+    color: var(--bb-muted);
+  }
+  .bb-input:focus {
+    --tw-ring-color: color-mix(in srgb, var(--bb-blue) 50%, transparent);
+    border-color: transparent;
+  }
+  .bb-select {
+    @apply px-3 py-1.5 text-sm rounded-lg transition-colors focus:outline-none focus:ring-2;
+    background-color: var(--bb-black);
+    border: 1px solid var(--bb-border);
+    color: var(--bb-text);
+  }
+  .bb-select:focus {
+    --tw-ring-color: color-mix(in srgb, var(--bb-blue) 50%, transparent);
+    border-color: transparent;
+  }
+  .bb-table-head {
+    @apply text-left;
+    background-color: var(--bb-black);
+    border-bottom: 1px solid var(--bb-border);
+  }
+  .bb-table-head th {
+    @apply px-4 py-2.5 font-semibold whitespace-nowrap text-sm;
+    color: var(--bb-muted);
+  }
+  .bb-table-row {
+    border-bottom: 1px solid color-mix(in srgb, var(--bb-border) 80%, transparent);
+    @apply transition-colors;
+  }
+  .bb-table-row:hover {
+    background-color: var(--bb-blue-glow);
+  }
+  .bb-btn-primary {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors;
+    background-color: var(--bb-blue);
+    color: var(--bb-black);
+  }
+  .bb-btn-primary:hover {
+    filter: brightness(1.08);
+  }
+  .bb-btn-ghost {
+    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors;
+    color: var(--bb-muted);
+  }
+  .bb-btn-ghost:hover {
+    color: var(--bb-text);
+    background-color: rgba(255, 255, 255, 0.05);
+  }
+  .bb-accent-icon {
+    color: var(--bb-blue);
+  }
+  .bb-badge-blue {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    background-color: color-mix(in srgb, var(--bb-blue) 12%, transparent);
+    color: var(--bb-blue);
+    border-color: color-mix(in srgb, var(--bb-blue) 30%, transparent);
+  }
+  .bb-badge-green {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    background-color: color-mix(in srgb, var(--bb-success) 12%, transparent);
+    color: var(--bb-success);
+    border-color: color-mix(in srgb, var(--bb-success) 30%, transparent);
+  }
+  .bb-badge-warn {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    background-color: color-mix(in srgb, var(--bb-warn) 12%, transparent);
+    color: var(--bb-warn);
+    border-color: color-mix(in srgb, var(--bb-warn) 30%, transparent);
+  }
+  .bb-badge-muted {
+    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    background-color: rgba(255, 255, 255, 0.05);
+    color: var(--bb-muted);
+    border-color: var(--bb-border);
+  }
+  .bb-divide {
+    @apply divide-y;
+    --tw-divide-opacity: 1;
+    border-color: color-mix(in srgb, var(--bb-border) 80%, transparent);
+  }
 }

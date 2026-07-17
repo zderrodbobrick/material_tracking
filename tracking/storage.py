@@ -14,7 +14,8 @@ Session modes
   Dwell (Gannomat, Tennoner):
     Entry antenna opens a session; a dedicated closer ends it with dwell_seconds.
     Gannomat: ant 1 opens; ant 2 = at exit (does NOT close); ant 3 Insert closes.
-    Tennoner: ant 7 opens; ant 4/5 close dwell, then hold visible at the table.
+    Tennoner: ant 7 opens; ant 4/5 mark exit-table (dwell timer stops, session
+    stays open for map); LBD ant 6 closes the Tennoner visit (one session per part).
 
   Presence (LBD, Insert Station):
     A valid read means the part is there. Idle timeout without reads means
@@ -36,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from database.migrate import run_migrations
 from epc_type_map import format_tag_id, parse_tag_id
-from rtls_storage import try_assign_on_session_open
+from rtls_storage import try_assign_on_session_open, finalize_session_operators
 from config import (
     RSSI_MIN,
     EXIT_RSSI_MIN,
@@ -521,18 +522,17 @@ class DwellTracker:
                         bucket=self._tenoner_open, station_id=self._tenoner_station_id,
                     )
                 elif antenna_port in TENONER_EXIT_ANTENNAS:
-                    # Close dwell (entry→exit timer), then force a table-hold
-                    # presence so /api/live still returns the part at ant 4/5.
                     if _valid_exit_rssi(rssi):
-                        self._handle_dwell_exit(
+                        at_table = self._handle_tennoner_exit_sighting(
                             epc, tag_id, part_id, reader_dt, rssi, summary,
-                            bucket=self._tenoner_open, antenna_label="Tennoner Exit Table",
                         )
-                        self._handle_presence(
-                            epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
-                            station_id=self._tenoner_station_id,
-                            force=True,
-                        )
+                        # Exit-only (no ant-7 entry): still show part at table.
+                        if not at_table:
+                            self._handle_presence(
+                                epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
+                                station_id=self._tenoner_station_id,
+                                force=True,
+                            )
                 elif antenna_port == LBD_ANTENNA:
                     self._handle_presence(
                         epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
@@ -651,6 +651,44 @@ class DwellTracker:
             f"[dwell] {antenna_label}: session closed epc={epc!r} dwell={dwell}s",
             flush=True,
         )
+
+    def _handle_tennoner_exit_sighting(
+        self, epc, tag_id, part_id, reader_dt, rssi, summary,
+    ):
+        """Antenna 4/5: part at exit table — stop dwell timer, keep one open session until LBD."""
+        sess = self._tenoner_open.get(epc)
+        if sess is not None and not self._session_still_open(sess.session_id):
+            self._drop_stale_open(epc, self._tenoner_open)
+            sess = None
+        if sess is None:
+            print(
+                f"[dwell] Tennoner Exit Table: no open dwell for epc={epc!r}",
+                flush=True,
+            )
+            return False
+        if sess.entry_ts is not None and reader_dt < sess.entry_ts:
+            return False
+        if not _valid_exit_rssi(rssi):
+            print(
+                f"[dwell] Tennoner Exit Table: exit ignored (weak RSSI={rssi}) epc={epc!r}",
+                flush=True,
+            )
+            return False
+
+        sess.exit_ts = reader_dt
+        sess.exit_rssi = int(rssi) if rssi is not None else None
+        sess.has_exit = True
+        sess.last_seen_wall = datetime.now(timezone.utc)
+        self._touch_session(sess.session_id)
+        dwell = None
+        if sess.entry_ts is not None:
+            dwell = int(round((reader_dt - sess.entry_ts).total_seconds()))
+        print(
+            f"[map] Tennoner table hold epc={epc!r} session={sess.session_id} "
+            f"machine_dwell={dwell}s (closes at LBD)",
+            flush=True,
+        )
+        return True
 
     def _handle_gannomat_exit_sighting(
         self, epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
@@ -910,18 +948,16 @@ class DwellTracker:
                         self._finalize(sess, STATUS_ABANDONED, bucket)
 
             # Presence:
-            #   Tennoner table hold / Insert — stay until abandon or next station
+            #   Insert — stay until abandon or order complete
             #   LBD — idle timeout (no reads => not there)
+            #   (Tennoner table hold uses _tenoner_open dwell bucket, not presence)
             for epc in list(self._presence_open.keys()):
                 sess = self._presence_open[epc]
                 if not self._session_still_open(sess.session_id):
                     self._drop_stale_open(epc, self._presence_open)
                     continue
                 idle = (now - sess.last_seen_wall).total_seconds()
-                hold_ids = {
-                    self._tenoner_station_id,
-                    self._insert_station_id,
-                }
+                hold_ids = {self._insert_station_id}
                 timeout = (
                     ABANDON_TIMEOUT_SEC
                     if sess.station_id in hold_ids
@@ -963,3 +999,7 @@ class DwellTracker:
                 (status, now_iso, sess.session_id),
             )
         bucket.pop(sess.epc, None)
+        try:
+            finalize_session_operators(sess.session_id)
+        except Exception:
+            pass

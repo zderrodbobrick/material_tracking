@@ -191,7 +191,7 @@ check("stations grouping returned", "stations" in reps and len(reps["stations"])
 
 st, an = _get("/api/analytics")
 check("GET /api/analytics returns 200", st == 200)
-for key in ("totals", "dwell", "stations", "throughput_by_day", "dwell_distribution", "operators", "parts_summary"):
+for key in ("totals", "dwell", "stations", "machines", "ibus_orders", "throughput_by_day", "dwell_distribution", "operators", "parts_summary", "exceptions"):
     check(f"analytics has '{key}'", key in an, str(list(an.keys())))
 check("analytics totals.complete >= 1", an["totals"]["complete"] >= 1, str(an["totals"]))
 check("analytics operators has leaderboard", "leaderboard" in an.get("operators", {}))

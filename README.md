@@ -1,90 +1,88 @@
-# RFID Tracking System
+# Material Tracking
 
-Track RFID labels as they pass between two antennas, measuring dwell time from entry to exit.
+Track RFID-labeled parts and operator badges through Bobrick production stations. Measure dwell time, visualize live floor status, and analyze throughput from Gannomat through Tennoner, LBD, and Insert Station.
 
-## Quick Start
+## Documentation
 
-```bash
-# 1. Install dependencies
+Full documentation follows the [Diátaxis framework](https://diataxis.fr/) — tutorials, how-to guides, explanations, and reference:
+
+**[→ docs/README.md](docs/README.md)** · **Web app:** `pip install -r requirements-docs.txt && mkdocs serve` → http://127.0.0.1:8000
+
+| Start here | Link |
+|------------|------|
+| First-time setup | [Getting started](docs/tutorials/getting-started.md) |
+| Run the stack | [Run locally](docs/how-to/run-locally.md) |
+| System overview | [Architecture](docs/explanation/architecture.md) |
+| API & config | [API reference](docs/reference/api.md) · [Configuration](docs/reference/configuration.md) |
+
+## Quick start
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-
-# 2. Configure environment
 copy .env.example .env
-# Edit .env with your settings (antenna numbers, RSSI threshold, etc.)
 
-# 3. Start the listener
-python tracking/listener.py
+cd dashboard && npm install && npm run build && cd ..
 
-# 4. Point your Zebra reader to http://YOUR_PC_IP:5000/tags
+.\start.ps1
 ```
 
-## Architecture
+- **Dashboard:** http://localhost:5001  
+- **Reader POST:** http://\<your-ip\>:5000/tags  
+- **Health:** http://localhost:5000/healthz  
 
-- **listener.py** - HTTP server receiving tag reads from the RFID reader
-- **storage.py** - SQLite database with session tracking and dwell time calculation
-- **config.py** - Centralized configuration loaded from `.env`
+Demo without hardware:
 
-## Database
-
-Tables:
-- `tag_reads` - Raw filtered reads (EPC, antenna, RSSI, timestamp)
-- `component_sessions` - One row per pass with dwell time calculation
-
-Session statuses:
-- `IN_PROGRESS` - Tag seen on entry antenna only
-- `COMPLETE` - Tag passed both antennas (dwell calculated)
-- `ABANDONED` - Tag never reached exit antenna
-- `EXIT_ONLY` - Tag seen on exit without matching entry
-
-## Printer Utilities
-
-```bash
-# Encode a random RFID tag
-python printer/encode_rfid_only.py
-
-# Encode specific EPC
-python printer/encode_rfid_only.py --epc AABBCCDDEEFF001122334455
-
-# Print test labels
-python printer/print_labels.py
+```powershell
+python sim/run.py --ibus IBUS462064 --auto --duration 60
 ```
 
-## Configuration
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `LISTENER_HOST` | 0.0.0.0 | Bind address for HTTP server |
-| `LISTENER_PORT` | 5000 | Port for HTTP server |
-| `ENTRY_ANTENNA` | 1 | Antenna ID for entry reads |
-| `EXIT_ANTENNA` | 2 | Antenna ID for exit reads |
-| `RSSI_MIN` | -40 | Minimum valid signal strength (dBm) |
-| `IDLE_TIMEOUT_SEC` | 60 | Auto-close sessions after idle time |
-
-## Health Check
-
-```bash
-python tracking/listener.py --health
-```
-
-## File Structure
+## Architecture (summary)
 
 ```
-RFID_Tracking/
-├── .env                  # Your local configuration (not in git)
-├── .env.example          # Template for configuration
-├── config.py             # Configuration loader
-├── requirements.txt      # Python dependencies
-├── tracking/
-│   ├── listener.py       # HTTP server for RFID events
-│   ├── storage.py        # Database and session logic
-│   └── labels.json       # EPC to part metadata mapping
-├── database/
-│   └── rfid_reads.db     # SQLite database
-├── printer/
-│   ├── encode_rfid_only.py
-│   ├── print_labels.py
-│   └── RFID-Test-ZEBRA.lbl
-├── docs/
-│   └── architecture.html # System diagrams
-└── archive/              # Deprecated code
+Zebra FX9600  ──POST /tags──►  listener.py (:5000)
+                                      │
+                                      ▼
+                               DwellTracker / SQLite
+                                      │
+                    ┌─────────────────┴─────────────────┐
+                    ▼                                   ▼
+              api.py (:5001)                    Sewio RTLS (optional)
+                    │
+                    ▼
+            React dashboard (Vite)
 ```
+
+See [Architecture](docs/explanation/architecture.md) and [architecture.html](docs/architecture.html) for detail.
+
+## Project layout
+
+```
+material_tracking/
+├── api.py                 # REST API + Socket.IO + dashboard host
+├── config.py              # Environment configuration
+├── start.ps1              # Start API + listener
+├── tracking/              # Listener, session logic, RTLS clients
+├── database/              # SQLite + migrations
+├── dashboard/             # React SPA (Vite)
+├── sim/                   # Offline RFID simulator
+├── RTLS/                  # Floor plan JSON, zone mappings
+├── r41/                   # Work order ingest
+├── printer/               # Label encode/print
+├── tests/                 # Integration tests
+└── docs/                  # Documentation (Diátaxis)
+```
+
+## Tests
+
+```powershell
+.\start.ps1          # in one terminal
+.\tests\run_all.ps1  # in another
+```
+
+See [How to run tests](docs/how-to/run-tests.md).
+
+## License / context
+
+Proof-of-concept for Bobrick Washroom Equipment shop-floor visibility. Internal deployment — adjust `.env` per station.

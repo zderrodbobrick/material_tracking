@@ -17,6 +17,7 @@ from config import (
     DB_PATH,
     ENABLE_LIVE_INGESTION,
     MAX_OPERATORS_PER_PART,
+    MAX_OPERATORS_PER_STATION,
     RTLS_OPERATOR_CONFIRM_SECS,
     SEWIO_FEED_ID,
     SEWIO_LIVE_OFFSET_HOURS,
@@ -166,10 +167,82 @@ def _active_presence_count(conn: sqlite3.Connection, session_id: int) -> int:
     return int(row[0] or 0)
 
 
+def _stations_match(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return b in _station_name_candidates(a) or a in _station_name_candidates(b)
+
+
 def _part_operator_slots_available(conn: sqlite3.Connection, session_id: int) -> int:
     if MAX_OPERATORS_PER_PART <= 0:
         return 999
     return max(0, MAX_OPERATORS_PER_PART - _active_presence_count(conn, session_id))
+
+
+def _session_has_operator(conn: sqlite3.Connection, session_id: int) -> bool:
+    """True if this session has a pending or confirmed operator."""
+    row = conn.execute(
+        """SELECT 1 FROM session_operator_presence
+           WHERE session_id = ? AND left_at IS NULL
+           LIMIT 1""",
+        (session_id,),
+    ).fetchone()
+    if row:
+        return True
+    row = conn.execute(
+        "SELECT 1 FROM part_operator_assignments WHERE session_id = ? LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _active_operators_at_station(conn: sqlite3.Connection, station_id: int) -> set[int]:
+    """Operators currently working at this station (presence on open sessions or in zone)."""
+    active: set[int] = set()
+    for r in conn.execute(
+        """SELECT DISTINCT sop.operator_id
+           FROM session_operator_presence sop
+           JOIN part_station_sessions s ON s.session_id = sop.session_id
+           WHERE s.station_id = ? AND s.session_status = ?
+             AND sop.left_at IS NULL""",
+        (station_id, STATUS_OPEN),
+    ):
+        active.add(int(r["operator_id"]))
+
+    st = conn.execute(
+        "SELECT station_name FROM stations WHERE station_id = ?",
+        (station_id,),
+    ).fetchone()
+    if not st:
+        return active
+    names = _station_name_candidates(st["station_name"])
+    placeholders = ",".join("?" * len(names))
+    for r in conn.execute(
+        f"""SELECT operator_id, station_name FROM operator_current_zone
+            WHERE status = 'in' AND station_name IN ({placeholders})""",
+        names,
+    ):
+        if _stations_match(st["station_name"], r["station_name"]):
+            active.add(int(r["operator_id"]))
+    return active
+
+
+def _can_operator_work_at_station(
+    conn: sqlite3.Connection,
+    operator_id: int,
+    station_id: int,
+) -> bool:
+    """Enforce MAX_OPERATORS_PER_STATION — only one operator per machine at a time."""
+    if MAX_OPERATORS_PER_STATION <= 0:
+        return True
+    active = _active_operators_at_station(conn, station_id)
+    if not active:
+        return True
+    if operator_id in active and len(active) <= MAX_OPERATORS_PER_STATION:
+        return True
+    return len(active) < MAX_OPERATORS_PER_STATION
 
 
 def _confirm_assignment(
@@ -231,6 +304,8 @@ def _start_presence(
     entered_at: str,
 ) -> bool:
     """Begin tracking operator at a session (live until confirmed or left)."""
+    if not _can_operator_work_at_station(conn, operator_id, station_id):
+        return False
     if _part_operator_slots_available(conn, session_id) <= 0:
         return False
     active = conn.execute(
@@ -240,7 +315,6 @@ def _start_presence(
     ).fetchone()
     if active:
         return False
-    # Use server wall clock for dwell timer (avoids Sewio/reader clock skew)
     timer_start = _now_iso()
     conn.execute(
         """INSERT INTO session_operator_presence
@@ -282,14 +356,43 @@ def _link_operator_to_open_sessions(
     station_id: int,
     entered_at: str,
 ) -> int:
-    """Start presence tracking for all open sessions when operator enters station zone."""
+    """Start presence for open sessions at this station when operator enters zone."""
+    if not _can_operator_work_at_station(conn, operator_id, station_id):
+        return 0
     started = 0
     for row in _open_sessions_at_station(conn, station_id):
         session_id = int(row["session_id"])
+        if _session_has_operator(conn, session_id):
+            continue
         if _part_operator_slots_available(conn, session_id) <= 0:
             continue
         if _start_presence(conn, session_id, operator_id, station_id, entered_at):
             started += 1
+    return started
+
+
+def _relink_unassigned_open_sessions(conn: sqlite3.Connection) -> int:
+    """Retry linking zone operators to open parts missing operator coverage."""
+    started = 0
+    for row in conn.execute(
+        """SELECT s.session_id, s.station_id
+           FROM part_station_sessions s
+           WHERE s.session_status = ?""",
+        (STATUS_OPEN,),
+    ):
+        session_id = int(row["session_id"])
+        station_id = int(row["station_id"])
+        if _session_has_operator(conn, session_id):
+            continue
+        zone_ops = list(_operators_in_station_zone(conn, station_id))
+        zone_ops.sort(key=lambda r: r["zone_entered_at"] or "")
+        for op in zone_ops:
+            op_id = int(op["operator_id"])
+            if not _can_operator_work_at_station(conn, op_id, station_id):
+                continue
+            if _start_presence(conn, session_id, op_id, station_id, op["zone_entered_at"] or _now_iso()):
+                started += 1
+                break
     return started
 
 
@@ -346,9 +449,10 @@ def _sweeper_loop() -> None:
         try:
             conn = _conn()
             try:
+                relinked = _relink_unassigned_open_sessions(conn)
                 n = _confirm_ready_presences(conn)
                 conn.commit()
-                if n:
+                if relinked or n:
                     _notify("rtls_assignment")
             finally:
                 conn.close()
@@ -368,7 +472,7 @@ def start_presence_sweeper() -> None:
 
 
 def try_assign_on_session_open(session_id: int, station_id: int) -> bool:
-    """When a part enters, link any operators already in the station zone."""
+    """When a part enters, link the operator already in the station zone (one per station)."""
     conn = _conn()
     try:
         entry_row = conn.execute(
@@ -380,16 +484,50 @@ def try_assign_on_session_open(session_id: int, station_id: int) -> bool:
         zone_ops = list(_operators_in_station_zone(conn, station_id))
         zone_ops.sort(key=lambda r: r["zone_entered_at"] or "")
         for op in zone_ops:
-            if _part_operator_slots_available(conn, session_id) <= 0:
-                break
-            if _start_presence(
-                conn, session_id, int(op["operator_id"]), station_id, entry_at
-            ):
+            op_id = int(op["operator_id"])
+            if not _can_operator_work_at_station(conn, op_id, station_id):
+                continue
+            if _start_presence(conn, session_id, op_id, station_id, entry_at):
                 started += 1
+                break
         conn.commit()
         if started:
             _notify("rtls_presence")
         return started > 0
+    finally:
+        conn.close()
+
+
+def finalize_session_operators(session_id: int) -> None:
+    """Confirm operator work when a part session closes (even if confirm timer not met)."""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """SELECT presence_id, operator_id, station_id
+               FROM session_operator_presence
+               WHERE session_id = ? AND left_at IS NULL""",
+            (session_id,),
+        ).fetchall()
+        if not rows:
+            return
+        closed_at = _now_iso()
+        for row in rows:
+            confirmed_at = closed_at
+            _confirm_assignment(
+                conn,
+                session_id,
+                int(row["operator_id"]),
+                confirmed_at,
+                int(row["station_id"]) if row["station_id"] else None,
+            )
+            conn.execute(
+                """UPDATE session_operator_presence
+                   SET confirmed_at = COALESCE(confirmed_at, ?), left_at = ?
+                   WHERE presence_id = ?""",
+                (confirmed_at, closed_at, row["presence_id"]),
+            )
+        conn.commit()
+        _notify("rtls_assignment")
     finally:
         conn.close()
 
@@ -628,6 +766,7 @@ def get_live_state() -> dict:
         "station_name": STATION_NAME,
         "confirm_seconds": RTLS_OPERATOR_CONFIRM_SECS,
         "max_operators_per_part": MAX_OPERATORS_PER_PART,
+        "max_operators_per_station": MAX_OPERATORS_PER_STATION,
     }
 
 
