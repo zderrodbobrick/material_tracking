@@ -39,6 +39,16 @@ from config import (
     HIDDEN_IBUS_ORDERS,
 )
 from database.migrate import run_migrations
+from tracking.station_specs import (
+    canonical_station,
+    compare_to_target,
+    fetch_specs_by_name,
+    part_weighted_progress,
+    position_progress,
+    progress_spine_names,
+    spec_row_to_api,
+    upsert_spec,
+)
 
 DASH_DIST = Path(__file__).parent / "dashboard" / "dist"
 
@@ -349,6 +359,7 @@ def index():
             "GET  /api/raw-reads/recent",
             "GET  /api/summary",
             "GET  /api/analytics",
+            "GET  /api/analytics/operators",
             "GET  /api/report/stations",
             "GET  /api/report/sessions",
             "GET  /api/stations",
@@ -504,7 +515,10 @@ def _part_tag_label(session: dict) -> str:
     return epc
 
 
-def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
+def _build_ibus_journeys(
+    sessions: list[dict],
+    specs_by_name: dict | None = None,
+) -> list[dict]:
     """Group station sessions by IBUS order (work order), not individual part EPC."""
     groups: dict[str, list[dict]] = {}
     for s in sessions:
@@ -663,7 +677,8 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
 
             part_ops: dict[int, dict] = {}
             for m in part_machines:
-                for op in (m.get("operators") or []):
+                st = m.get("station_name")
+                for op in list(m.get("operators") or []) + list(m.get("rtls") or []):
                     oid = op.get("operator_id")
                     if oid is None:
                         continue
@@ -671,9 +686,11 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                         part_ops[oid] = {
                             "operator_id": oid,
                             "operator_name": op.get("operator_name"),
+                            "rtls_badge_id": op.get("rtls_badge_id"),
                             "stations": [],
                         }
-                    st = m.get("station_name")
+                    elif not part_ops[oid].get("operator_name") and op.get("operator_name"):
+                        part_ops[oid]["operator_name"] = op.get("operator_name")
                     if st and st not in part_ops[oid]["stations"]:
                         part_ops[oid]["stations"].append(st)
 
@@ -685,8 +702,13 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                 "station_name"
             )
             part_status = "open" if open_m else "completed"
-            # Current spine station (Tennoner=0% … Insert=100%). Resets if they return.
-            p_prog = _part_progress_at_station(part_station)
+            p_prog_pos = position_progress(part_station)
+            p_prog_weighted = (
+                part_weighted_progress(part_machines, specs_by_name or {})
+                if specs_by_name is not None
+                else None
+            )
+            p_prog = p_prog_weighted if p_prog_weighted is not None else p_prog_pos
             part_progresses.append(p_prog)
 
             parts_out.append({
@@ -701,6 +723,8 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
                 "current_station": part_station,
                 "status": part_status,
                 "progress": round(p_prog, 3),
+                "progress_position": round(p_prog_pos, 3),
+                "progress_method": "weighted" if p_prog_weighted is not None else "position",
             })
 
         # Order bar = average of tracked parts only (BOM lines never seen are ignored)
@@ -708,6 +732,8 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
             progress = sum(part_progresses) / len(part_progresses)
         else:
             progress = _progress_fraction(max_idx)
+
+        spine = progress_spine_names(specs_by_name or {}) if specs_by_name else list(PROGRESS_STATIONS)
 
         journeys.append({
             "key": key,
@@ -724,8 +750,9 @@ def _build_ibus_journeys(sessions: list[dict]) -> list[dict]:
             "status": status,
             "current_station": current_station,
             "progress": round(progress, 3),
+            "progress_method": "weighted" if specs_by_name else "position",
             "stations_done": len(stations_touched),
-            "stations_total": len(PROGRESS_STATIONS),
+            "stations_total": len(spine),
             "entry_time": start.isoformat() if start else sess_list[0].get("entry_time"),
             "exit_time": end.isoformat() if end else None,
             "total_production_seconds": total_sec,
@@ -753,9 +780,10 @@ def ibus_journeys():
     ).fetchall()
     sessions = [_session_dict(r) for r in rows]
     _attach_operators(db, sessions)
+    specs_by_name = fetch_specs_by_name(db)
     db.close()
 
-    journeys = _build_ibus_journeys(sessions)
+    journeys = _build_ibus_journeys(sessions, specs_by_name)
     if status in ("open", "live", "in"):
         journeys = [j for j in journeys if j["status"] == "open"]
     elif status in ("completed", "closed", "done"):
@@ -905,6 +933,92 @@ def list_stations():
     ).fetchall()
     db.close()
     return jsonify([dict(r) for r in rows])
+
+
+def _station_actual_dwells(db: sqlite3.Connection) -> tuple[dict[str, float], dict[str, float]]:
+    """Return (part_avg_by_station, operator_avg_by_station) keyed by station_name."""
+    part_map: dict[str, float] = {}
+    for r in db.execute(
+        """SELECT st.station_name, AVG(s.dwell_seconds) AS avg_dwell
+           FROM part_station_sessions s
+           JOIN stations st ON st.station_id = s.station_id
+           WHERE s.session_status = ? AND s.dwell_seconds IS NOT NULL
+           GROUP BY st.station_name""",
+        (STATUS_CLOSED,),
+    ):
+        part_map[r["station_name"]] = float(r["avg_dwell"])
+        canon = canonical_station(r["station_name"])
+        if canon:
+            part_map.setdefault(canon, float(r["avg_dwell"]))
+
+    op_map: dict[str, float] = {}
+    for r in db.execute(
+        """SELECT station_name, AVG(dwell_seconds) AS avg_dwell
+           FROM operator_zone_visits
+           WHERE exited_at IS NOT NULL AND dwell_seconds IS NOT NULL
+             AND station_name IS NOT NULL
+           GROUP BY station_name"""
+    ):
+        op_map[r["station_name"]] = float(r["avg_dwell"])
+        canon = canonical_station(r["station_name"])
+        if canon:
+            op_map.setdefault(canon, float(r["avg_dwell"]))
+
+    return part_map, op_map
+
+
+@app.route("/api/station-specifications")
+def list_station_specifications():
+    db = get_db()
+    specs = fetch_specs_by_name(db)
+    part_actuals, op_actuals = _station_actual_dwells(db)
+    db.close()
+
+    seen_ids: set[int] = set()
+    out = []
+    for row in sorted(specs.values(), key=lambda r: (not r.get("on_progress_spine"), r.get("progress_spine_index") or 99, r["station_id"])):
+        sid = row["station_id"]
+        if sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        name = row["station_name"]
+        out.append(spec_row_to_api(
+            row,
+            part_actuals.get(name) or part_actuals.get(canonical_station(name) or ""),
+            op_actuals.get(name) or op_actuals.get(canonical_station(name) or ""),
+        ))
+    return jsonify({
+        "specifications": out,
+        "progress_spine": progress_spine_names(specs),
+    })
+
+
+@app.route("/api/station-specifications/<int:station_id>", methods=["PUT"])
+def update_station_specification(station_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT station_id FROM stations WHERE station_id = ?", (station_id,)
+    ).fetchone()
+    if not row:
+        db.close()
+        return jsonify({"error": "Station not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    upsert_spec(db, station_id, body)
+    db.commit()
+
+    specs = fetch_specs_by_name(db)
+    part_actuals, op_actuals = _station_actual_dwells(db)
+    spec_row = next((r for r in specs.values() if r["station_id"] == station_id), None)
+    db.close()
+    if not spec_row:
+        return jsonify({"error": "Specification not found"}), 404
+    name = spec_row["station_name"]
+    return jsonify(spec_row_to_api(
+        spec_row,
+        part_actuals.get(name) or part_actuals.get(canonical_station(name) or ""),
+        op_actuals.get(name) or op_actuals.get(canonical_station(name) or ""),
+    ))
 
 
 @app.route("/api/readers")
@@ -1128,6 +1242,34 @@ def rtls_demo():
         "count": len(seeded),
         "zone_presence": seeded,
     })
+
+
+@app.route("/api/rtls/sim-zone", methods=["POST"])
+def rtls_sim_zone():
+    """Apply a zone in/out from the offline sim (updates API memory + DB + websocket)."""
+    sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+    from rtls_storage import record_zone_event
+
+    body = request.get_json(silent=True) or {}
+    try:
+        tag_id = int(body["tag_id"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "tag_id required"}), 400
+    zone_id = int(body.get("zone_id") or 0)
+    status = str(body.get("status") or "in").strip().lower()
+    if status not in ("in", "out"):
+        return jsonify({"error": "status must be in or out"}), 400
+    source = str(body.get("source") or "sim")
+
+    entry = record_zone_event(
+        tag_id, zone_id, status, at=body.get("at"), source=source,
+    )
+    ts = _now_utc()
+    if status == "in":
+        socketio.emit("rtls_zone", {"ts": ts, "zone": entry})
+    else:
+        socketio.emit("rtls_zone", {"ts": ts, "zone": {"tag_id": tag_id, "status": "out"}})
+    return jsonify({"ok": True, **entry})
 
 
 def _attach_last_antennas(db: sqlite3.Connection, sessions: list[dict]) -> list[dict]:
@@ -1666,6 +1808,320 @@ def _build_operator_analytics(db: sqlite3.Connection) -> dict:
     }
 
 
+def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
+    """Full operator analytics for the dedicated dashboard page."""
+    base = _build_operator_analytics(db)
+
+    # Who is in which zone right now (RTLS / demo seeds).
+    in_zone = db.execute(
+        """SELECT o.operator_id, o.operator_name, o.rtls_badge_id,
+                  ocz.station_name, ocz.zone_name, ocz.updated_at
+           FROM operator_current_zone ocz
+           JOIN operators o ON o.operator_id = ocz.operator_id
+           WHERE ocz.status = 'in' AND o.is_active = 1
+           ORDER BY ocz.station_name, o.operator_name"""
+    ).fetchall()
+
+    # Station coverage — how many operators and pieces per machine.
+    station_rows = db.execute(
+        """SELECT COALESCE(poa.station_name, st.station_name, ?) AS station_name,
+                  COUNT(DISTINCT poa.operator_id) AS operator_count,
+                  COUNT(*) AS assignment_count,
+                  COUNT(DISTINCT poa.session_id) AS session_count
+           FROM part_operator_assignments poa
+           JOIN part_station_sessions s ON s.session_id = poa.session_id
+           JOIN stations st ON st.station_id = s.station_id
+           GROUP BY COALESCE(poa.station_name, st.station_name, ?)
+           ORDER BY assignment_count DESC""",
+        (STATION_NAME, STATION_NAME),
+    ).fetchall()
+
+    # Hourly assignment volume (when operators get confirmed at machines).
+    hour_rows = db.execute(
+        """SELECT CAST(strftime('%H', poa.assigned_at) AS INTEGER) AS hour,
+                  COUNT(*) AS assignments
+           FROM part_operator_assignments poa
+           WHERE poa.assigned_at IS NOT NULL
+           GROUP BY hour
+           ORDER BY hour"""
+    ).fetchall()
+    hour_map = {int(r["hour"]): int(r["assignments"]) for r in hour_rows}
+    by_hour = [
+        {"hour": h, "assignments": hour_map.get(h, 0)}
+        for h in range(24)
+    ]
+
+    # RTLS presence confirmation stats.
+    pres = db.execute(
+        """SELECT
+             COUNT(*) AS total,
+             SUM(CASE WHEN confirmed_at IS NOT NULL THEN 1 ELSE 0 END) AS confirmed,
+             SUM(CASE WHEN confirmed_at IS NULL AND left_at IS NULL THEN 1 ELSE 0 END) AS pending,
+             SUM(CASE WHEN left_at IS NOT NULL AND confirmed_at IS NULL THEN 1 ELSE 0 END) AS left_unconfirmed
+           FROM session_operator_presence"""
+    ).fetchone()
+    confirm_secs = []
+    for r in db.execute(
+        """SELECT entered_at, confirmed_at FROM session_operator_presence
+           WHERE confirmed_at IS NOT NULL"""
+    ):
+        ent = _parse_ts(r["entered_at"])
+        conf = _parse_ts(r["confirmed_at"])
+        if ent and conf and conf >= ent:
+            confirm_secs.append(int((conf - ent).total_seconds()))
+    avg_confirm = sum(confirm_secs) / len(confirm_secs) if confirm_secs else None
+
+    # Full roster — every operator, even with zero assignments.
+    roster_rows = db.execute(
+        """SELECT o.operator_id, o.operator_name, o.employee_number, o.rtls_badge_id,
+                  o.is_active,
+                  COUNT(DISTINCT poa.session_id) AS sessions,
+                  COUNT(DISTINCT poa.station_name) AS stations,
+                  MAX(poa.assigned_at) AS last_assigned_at
+           FROM operators o
+           LEFT JOIN part_operator_assignments poa ON poa.operator_id = o.operator_id
+           GROUP BY o.operator_id
+           ORDER BY sessions DESC, o.operator_name"""
+    ).fetchall()
+
+    # Recent confirmed assignments (audit trail).
+    recent = db.execute(
+        """SELECT poa.assigned_at, o.operator_name, o.rtls_badge_id,
+                  COALESCE(poa.station_name, st.station_name) AS station_name,
+                  poa.zone_name, t.epc, s.dwell_seconds, s.session_status
+           FROM part_operator_assignments poa
+           JOIN operators o ON o.operator_id = poa.operator_id
+           JOIN part_station_sessions s ON s.session_id = poa.session_id
+           JOIN stations st ON st.station_id = s.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id
+           ORDER BY poa.assigned_at DESC
+           LIMIT 30"""
+    ).fetchall()
+
+    # Multi-station operators (versatility).
+    multi = [
+        o for o in base["leaderboard"]
+        if o.get("stations_worked", 0) >= 2
+    ]
+
+    total_pres = int(pres["total"] or 0)
+    confirmed_pres = int(pres["confirmed"] or 0)
+    confirm_rate = round(100.0 * confirmed_pres / total_pres, 1) if total_pres else None
+
+    return {
+        **base,
+        "presence": {
+            "total_records":      total_pres,
+            "confirmed":            confirmed_pres,
+            "pending":              int(pres["pending"] or 0),
+            "left_unconfirmed":     int(pres["left_unconfirmed"] or 0),
+            "confirmation_rate":    confirm_rate,
+            "avg_confirm_seconds":  round(avg_confirm, 1) if avg_confirm is not None else None,
+            "avg_confirm_display":  _dwell_display(avg_confirm),
+        },
+        "currently_in_zone": [dict(r) for r in in_zone],
+        "station_coverage": [
+            {
+                "station":          r["station_name"],
+                "operator_count":   int(r["operator_count"]),
+                "assignment_count": int(r["assignment_count"]),
+                "session_count":    int(r["session_count"]),
+            }
+            for r in station_rows
+        ],
+        "assignments_by_hour": by_hour,
+        "roster": [
+            {
+                "operator_id":      r["operator_id"],
+                "operator_name":    r["operator_name"],
+                "employee_number":  r["employee_number"],
+                "rtls_badge_id":    r["rtls_badge_id"],
+                "is_active":        bool(r["is_active"]),
+                "sessions":         int(r["sessions"] or 0),
+                "stations":         int(r["stations"] or 0),
+                "last_assigned_at": r["last_assigned_at"],
+            }
+            for r in roster_rows
+        ],
+        "recent_assignments": [
+            {
+                "assigned_at":    r["assigned_at"],
+                "operator_name":  r["operator_name"],
+                "rtls_badge_id":  r["rtls_badge_id"],
+                "station_name":   r["station_name"],
+                "zone_name":      r["zone_name"],
+                "epc":            r["epc"],
+                "dwell_seconds":  r["dwell_seconds"],
+                "dwell_display":  _dwell_display(r["dwell_seconds"]),
+                "session_status": r["session_status"],
+            }
+            for r in recent
+        ],
+        "multi_station_operators": multi,
+    }
+
+
+@app.route("/api/analytics/operators")
+def analytics_operators():
+    db = get_db()
+    data = _build_operator_analytics_extended(db)
+    db.close()
+    return jsonify(data)
+
+
+@app.route("/api/analytics/operators/<int:operator_id>")
+def analytics_operator_detail(operator_id: int):
+    db = get_db()
+    row = db.execute(
+        "SELECT operator_id, operator_name, employee_number, rtls_badge_id, is_active "
+        "FROM operators WHERE operator_id = ?",
+        (operator_id,),
+    ).fetchone()
+    if not row:
+        db.close()
+        return jsonify({"error": "Operator not found"}), 404
+
+    base = _build_operator_analytics(db)
+    stats = next(
+        (o for o in base["leaderboard"] if o["operator_id"] == operator_id),
+        None,
+    )
+
+    in_zone = db.execute(
+        """SELECT ocz.station_name, ocz.zone_name, ocz.updated_at
+           FROM operator_current_zone ocz
+           WHERE ocz.operator_id = ? AND ocz.status = 'in'""",
+        (operator_id,),
+    ).fetchone()
+
+    station_rows = db.execute(
+        """SELECT COALESCE(poa.station_name, st.station_name) AS station_name,
+                  COUNT(*) AS pieces,
+                  COUNT(DISTINCT poa.session_id) AS sessions,
+                  AVG(s.dwell_seconds) AS avg_dwell
+           FROM part_operator_assignments poa
+           JOIN part_station_sessions s ON s.session_id = poa.session_id
+           JOIN stations st ON st.station_id = s.station_id
+           WHERE poa.operator_id = ?
+           GROUP BY COALESCE(poa.station_name, st.station_name)
+           ORDER BY pieces DESC""",
+        (operator_id,),
+    ).fetchall()
+
+    hour_rows = db.execute(
+        """SELECT CAST(strftime('%H', poa.assigned_at) AS INTEGER) AS hour,
+                  COUNT(*) AS assignments
+           FROM part_operator_assignments poa
+           WHERE poa.operator_id = ? AND poa.assigned_at IS NOT NULL
+           GROUP BY hour ORDER BY hour""",
+        (operator_id,),
+    ).fetchall()
+    hour_map = {int(r["hour"]): int(r["assignments"]) for r in hour_rows}
+
+    recent = db.execute(
+        """SELECT poa.assigned_at,
+                  COALESCE(poa.station_name, st.station_name) AS station_name,
+                  poa.zone_name, t.epc, s.dwell_seconds, s.session_status
+           FROM part_operator_assignments poa
+           JOIN part_station_sessions s ON s.session_id = poa.session_id
+           JOIN stations st ON st.station_id = s.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id
+           WHERE poa.operator_id = ?
+           ORDER BY poa.assigned_at DESC LIMIT 40""",
+        (operator_id,),
+    ).fetchall()
+
+    pres = db.execute(
+        """SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN confirmed_at IS NOT NULL THEN 1 ELSE 0 END) AS confirmed
+           FROM session_operator_presence WHERE operator_id = ?""",
+        (operator_id,),
+    ).fetchone()
+
+    zone_dwell_rows = db.execute(
+        """SELECT station_name,
+                  COUNT(*) AS visits,
+                  SUM(COALESCE(dwell_seconds, 0)) AS total_dwell,
+                  AVG(dwell_seconds) AS avg_dwell
+           FROM operator_zone_visits
+           WHERE operator_id = ? AND exited_at IS NOT NULL AND station_name IS NOT NULL
+           GROUP BY station_name
+           ORDER BY visits DESC""",
+        (operator_id,),
+    ).fetchall()
+
+    recent_visits = db.execute(
+        """SELECT station_name, zone_name, entered_at, exited_at,
+                  dwell_seconds, source
+           FROM operator_zone_visits
+           WHERE operator_id = ?
+           ORDER BY entered_at DESC LIMIT 60""",
+        (operator_id,),
+    ).fetchall()
+
+    db.close()
+
+    stations = []
+    for r in station_rows:
+        avg = r["avg_dwell"]
+        stations.append({
+            "station":           r["station_name"],
+            "pieces":            int(r["pieces"]),
+            "sessions":          int(r["sessions"]),
+            "avg_dwell_seconds": round(float(avg), 1) if avg is not None else None,
+            "avg_dwell_display": _dwell_display(avg),
+        })
+
+    return jsonify({
+        "operator": dict(row),
+        "stats": stats,
+        "currently_in_zone": dict(in_zone) if in_zone else None,
+        "stations": stations,
+        "assignments_by_hour": [
+            {"hour": h, "assignments": hour_map.get(h, 0)} for h in range(24)
+        ],
+        "recent_assignments": [
+            {
+                "assigned_at":    r["assigned_at"],
+                "station_name":   r["station_name"],
+                "zone_name":      r["zone_name"],
+                "epc":            r["epc"],
+                "dwell_seconds":  r["dwell_seconds"],
+                "dwell_display":  _dwell_display(r["dwell_seconds"]),
+                "session_status": r["session_status"],
+            }
+            for r in recent
+        ],
+        "presence": {
+            "total":     int(pres["total"] or 0),
+            "confirmed": int(pres["confirmed"] or 0),
+        },
+        "zone_dwell_by_station": [
+            {
+                "station":           r["station_name"],
+                "visits":            int(r["visits"]),
+                "total_dwell_seconds": int(r["total_dwell"] or 0),
+                "total_dwell_display": _dwell_display(r["total_dwell"]),
+                "avg_dwell_seconds": round(float(r["avg_dwell"]), 1) if r["avg_dwell"] is not None else None,
+                "avg_dwell_display": _dwell_display(r["avg_dwell"]),
+            }
+            for r in zone_dwell_rows
+        ],
+        "zone_visits": [
+            {
+                "station_name":  r["station_name"],
+                "zone_name":     r["zone_name"],
+                "entered_at":    r["entered_at"],
+                "exited_at":     r["exited_at"],
+                "dwell_seconds": r["dwell_seconds"],
+                "dwell_display": _dwell_display(r["dwell_seconds"]),
+                "source":        r["source"],
+            }
+            for r in recent_visits
+        ],
+    })
+
+
 def _build_parts_summary(db: sqlite3.Connection, completed: list) -> dict:
     """Part-level aggregates beyond per-session dwell stats."""
     epcs_closed = {r["epc"] for r in completed if r["epc"]}
@@ -1767,7 +2223,8 @@ def analytics():
     ).fetchall()
     operators = _build_operator_analytics(db)
     parts_summary = _build_parts_summary(db, completed)
-    db.close()
+    specs_by_name = fetch_specs_by_name(db)
+    part_actuals, op_actuals = _station_actual_dwells(db)
 
     dwells = [int(r["dwell_seconds"]) for r in completed if r["dwell_seconds"] is not None]
     avg = sum(dwells) / len(dwells) if dwells else None
@@ -1783,6 +2240,9 @@ def analytics():
     stations = []
     for name, ds in station_acc.items():
         s_avg = sum(ds) / len(ds)
+        spec = specs_by_name.get(name) or specs_by_name.get(canonical_station(name) or "")
+        target = spec.get("target_part_dwell_seconds") if spec else None
+        cmp_ = compare_to_target(s_avg, target)
         stations.append({
             "station":           name,
             "completed":         len(ds),
@@ -1790,6 +2250,10 @@ def analytics():
             "avg_dwell_display": _dwell_display(s_avg),
             "max_dwell_seconds": max(ds),
             "max_dwell_display": _dwell_display(max(ds)),
+            "target_part_dwell_seconds": target,
+            "target_part_dwell_display": _dwell_display(target),
+            "vs_target_pct": cmp_["vs_target_pct"],
+            "vs_target_status": cmp_["vs_target_status"],
         })
     stations.sort(key=lambda s: s["avg_dwell_seconds"], reverse=True)
     longest_station = stations[0] if stations else None
@@ -1853,6 +2317,9 @@ def analytics():
         if completion_base else None
     )
 
+    progress_spine = progress_spine_names(specs_by_name)
+    db.close()
+
     return jsonify({
         "generated_at": _now_utc(),
         "totals": {
@@ -1883,6 +2350,8 @@ def analytics():
         "longest_parts":      longest_parts,
         "operators":          operators,
         "parts_summary":      parts_summary,
+        "progress_spine":     progress_spine,
+        "progress_method":    "weighted",
     })
 
 
@@ -1903,6 +2372,9 @@ def _direct_emit(action: str, **extra) -> None:
     ts = _now_utc()
     socketio.emit("rfid_update", {"ts": ts, "action": action})
     if action in ("rtls_zone", "rtls_presence", "rtls_zone_refresh"):
+        sys.path.insert(0, str(Path(__file__).parent / "tracking"))
+        from rtls_storage import sync_zone_presence_from_db
+        sync_zone_presence_from_db()
         zone = extra.get("zone")
         if zone:
             socketio.emit("rtls_zone", {"ts": ts, "zone": zone})

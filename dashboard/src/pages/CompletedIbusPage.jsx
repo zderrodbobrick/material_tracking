@@ -264,7 +264,13 @@ function OrderPartsView({ order, onSelectPart }) {
                       {formatWhen(p.exit_time)}
                     </td>
                     <td className="px-3 py-3 text-xs text-gray-700 dark:text-slate-300">
-                      {ops.length ? ops.join(', ') : '—'}
+                      {ops.length ? (
+                        <span title={(p.operators ?? []).map(o =>
+                          `${o.operator_name}${o.stations?.length ? ` (${o.stations.join(', ')})` : ''}`
+                        ).join('\n')}>
+                          {ops.join(', ')}
+                        </span>
+                      ) : '—'}
                     </td>
                   </tr>
                 )
@@ -280,8 +286,44 @@ function OrderPartsView({ order, onSelectPart }) {
   )
 }
 
+function collectPartOperators(part) {
+  const byId = new Map()
+  for (const op of part?.operators ?? []) {
+    const id = op.operator_id ?? op.operator_name
+    if (id == null) continue
+    byId.set(id, {
+      operator_id: op.operator_id,
+      operator_name: op.operator_name || '—',
+      rtls_badge_id: op.rtls_badge_id,
+      stations: [...(op.stations ?? [])],
+    })
+  }
+  for (const m of part?.machines ?? []) {
+    const st = m.station_name
+    for (const op of [...(m.rtls ?? []), ...(m.operators ?? [])]) {
+      const id = op.operator_id ?? op.operator_name
+      if (id == null) continue
+      const prev = byId.get(id)
+      if (!prev) {
+        byId.set(id, {
+          operator_id: op.operator_id,
+          operator_name: op.operator_name || '—',
+          rtls_badge_id: op.rtls_badge_id,
+          stations: st ? [st] : [],
+        })
+      } else if (st && !prev.stations.includes(st)) {
+        prev.stations.push(st)
+      }
+    }
+  }
+  return [...byId.values()].sort((a, b) =>
+    String(a.operator_name).localeCompare(String(b.operator_name)),
+  )
+}
+
 function PartMachineView({ part, orderLabel }) {
   const machines = part.machines ?? []
+  const allOperators = collectPartOperators(part)
 
   return (
     <div className="p-4 sm:p-5 space-y-4">
@@ -294,6 +336,43 @@ function PartMachineView({ part, orderLabel }) {
           {part.part_name ? ` · ${part.part_name}` : ''}
         </p>
       </div>
+
+      <section className="rounded-xl border border-violet-200/80 dark:border-violet-500/30
+                          bg-violet-50/50 dark:bg-violet-500/10 px-4 py-3">
+        <p className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider
+                      text-violet-700 dark:text-violet-300 mb-2">
+          <Users className="w-3.5 h-3.5" />
+          Operators who worked on this part
+          <span className="ml-auto tabular-nums font-mono normal-case tracking-normal text-violet-600/80 dark:text-violet-300/80">
+            {allOperators.length}
+          </span>
+        </p>
+        {allOperators.length === 0 ? (
+          <p className="text-sm text-violet-700/70 dark:text-violet-300/70">
+            No operators recorded while this part was on the line
+          </p>
+        ) : (
+          <ul className="flex flex-wrap gap-2">
+            {allOperators.map(op => (
+              <li
+                key={op.operator_id ?? op.operator_name}
+                className="rounded-lg bg-white/80 dark:bg-slate-900/50 border border-violet-200/60
+                           dark:border-violet-500/25 px-3 py-1.5 text-sm"
+                title={op.stations.join(', ') || undefined}
+              >
+                <span className="font-medium text-gray-900 dark:text-slate-100">
+                  {op.operator_name}
+                </span>
+                {op.stations.length > 0 && (
+                  <span className="ml-1.5 text-[11px] text-violet-700/80 dark:text-violet-300/80">
+                    · {op.stations.join(', ')}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       {machines.length === 0 ? (
         <p className="py-8 text-center text-sm text-gray-400 dark:text-slate-500">

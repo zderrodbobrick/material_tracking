@@ -25,6 +25,8 @@ Adding a new migration:
 from __future__ import annotations
 
 import sqlite3
+import sys
+from pathlib import Path
 
 _UTC_NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
 
@@ -457,6 +459,31 @@ def _m012_seed_line_antennas(
         )
 
 
+def _m014_operator_zone_visits(conn: sqlite3.Connection, **_) -> None:
+    """Historical operator zone dwell for analytics over time."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS operator_zone_visits (
+            visit_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            operator_id   INTEGER NOT NULL REFERENCES operators(operator_id),
+            tag_id        INTEGER,
+            zone_id       INTEGER NOT NULL,
+            station_name  TEXT,
+            zone_name     TEXT,
+            entered_at    TEXT NOT NULL,
+            exited_at     TEXT,
+            dwell_seconds INTEGER,
+            source        TEXT NOT NULL DEFAULT 'rtls'
+        );
+        CREATE INDEX IF NOT EXISTS IX_op_zone_visits_operator
+            ON operator_zone_visits (operator_id, entered_at DESC);
+        CREATE INDEX IF NOT EXISTS IX_op_zone_visits_station
+            ON operator_zone_visits (station_name, entered_at DESC);
+        CREATE INDEX IF NOT EXISTS IX_op_zone_visits_open
+            ON operator_zone_visits (operator_id)
+            WHERE exited_at IS NULL;
+    """)
+
+
 def _m013_work_order_bom(conn: sqlite3.Connection, **_) -> None:
     """Cut Rite / R41 work orders and expected component BOM lines."""
     conn.executescript(f"""
@@ -521,6 +548,59 @@ def _m013_work_order_bom(conn: sqlite3.Connection, **_) -> None:
     """)
 
 
+def _m015_station_specifications(conn: sqlite3.Connection, **_) -> None:
+    """Per-machine analytics targets (dwell benchmarks, progress weights)."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS station_specifications (
+            station_id                    INTEGER PRIMARY KEY
+                REFERENCES stations(station_id) ON DELETE CASCADE,
+            target_part_dwell_seconds       INTEGER,
+            target_operator_dwell_seconds   INTEGER,
+            max_dwell_seconds               INTEGER,
+            target_pieces_per_hour          REAL,
+            progress_spine_index            INTEGER,
+            on_progress_spine               INTEGER NOT NULL DEFAULT 0,
+            notes                           TEXT,
+            updated_at                      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS IX_station_specs_spine
+            ON station_specifications (on_progress_spine, progress_spine_index);
+    """)
+
+    # Local import — migrate runs before full app wiring.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tracking"))
+    from station_specs import default_seed_for_station  # noqa: WPS433
+
+    rows = conn.execute(
+        "SELECT station_id, station_name FROM stations WHERE is_active = 1"
+    ).fetchall()
+    for station_id, station_name in rows:
+        exists = conn.execute(
+            "SELECT 1 FROM station_specifications WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+        if exists:
+            continue
+        seed = default_seed_for_station(station_name)
+        conn.execute(
+            """INSERT INTO station_specifications
+               (station_id, target_part_dwell_seconds, target_operator_dwell_seconds,
+                max_dwell_seconds, target_pieces_per_hour, progress_spine_index,
+                on_progress_spine, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (
+                station_id,
+                seed.get("target_part_dwell_seconds"),
+                seed.get("target_operator_dwell_seconds"),
+                seed.get("max_dwell_seconds"),
+                seed.get("target_pieces_per_hour"),
+                seed.get("progress_spine_index"),
+                seed.get("on_progress_spine", 0),
+            ),
+        )
+
+
 # ── Migration registry ────────────────────────────────────────────────────────
 
 _MIGRATIONS: list[tuple[int, str, object]] = [
@@ -537,6 +617,8 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (11, "assignment_zone_snapshot", _m011_assignment_zone_snapshot),
     (12, "seed_line_antennas",      _m012_seed_line_antennas),
     (13, "work_order_bom",          _m013_work_order_bom),
+    (14, "operator_zone_visits",    _m014_operator_zone_visits),
+    (15, "station_specifications",  _m015_station_specifications),
 ]
 
 

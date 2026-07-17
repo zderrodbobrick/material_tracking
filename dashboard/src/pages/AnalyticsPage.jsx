@@ -100,7 +100,10 @@ function PartsTab({ a }) {
   const stationData = a.stations.map(s => ({
     label: s.station,
     value: s.avg_dwell_seconds,
-    display: s.avg_dwell_display,
+    display: s.target_part_dwell_display
+      ? `${s.avg_dwell_display} (target ${s.target_part_dwell_display})`
+      : s.avg_dwell_display,
+    sub: s.vs_target_pct != null ? `${s.vs_target_pct}% of target` : null,
   }))
 
   const distData = a.dwell_distribution.map(d => ({ label: d.label, value: d.count }))
@@ -190,7 +193,7 @@ function PartsTab({ a }) {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Panel title="Average Dwell by Station" icon={Factory} iconColor="text-violet-500 dark:text-violet-400"
-               subtitle="Lower is faster throughput">
+               subtitle="Actual vs target — configure targets in Settings">
           <div className="px-5 py-5">
             <HorizontalBars data={stationData} accent="amber" emptyText="No completed parts yet" />
           </div>

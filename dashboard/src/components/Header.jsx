@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Radio, LayoutDashboard, FileBarChart, LineChart, Home, CheckCircle } from 'lucide-react'
+import { Radio, LayoutDashboard, FileBarChart, LineChart, Home, CheckCircle, Users, Settings } from 'lucide-react'
 import { ThemeToggle } from './ThemeToggle'
 
 const TABS = [
@@ -7,6 +7,8 @@ const TABS = [
   { id: 'completed', label: 'Completed IBUS', icon: CheckCircle },
   { id: 'report',    label: 'Full Report',    icon: FileBarChart },
   { id: 'analytics', label: 'Analytics',      icon: LineChart },
+  { id: 'operators', label: 'Operators',      icon: Users },
+  { id: 'settings',  label: 'Settings',       icon: Settings },
 ]
 
 function NavTabs({ activeTab, onTabChange }) {

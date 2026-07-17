@@ -12,7 +12,7 @@ function mergeZone(prev, zone) {
   if (zone.status === 'out') {
     if (idx >= 0) zone_presence.splice(idx, 1)
   } else if (idx >= 0) {
-    zone_presence[idx] = zone
+    zone_presence[idx] = { ...zone_presence[idx], ...zone }
   } else {
     zone_presence.push(zone)
   }

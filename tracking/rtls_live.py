@@ -269,6 +269,28 @@ def set_connected(connected: bool) -> None:
     _connected = connected
 
 
+def hydrate_zone_presence(entries: list[dict]) -> int:
+    """Replace in-memory zone presence from DB (no re-persist). Used when sim writes DB out-of-process."""
+    with _lock:
+        global _last_message_at, _connected
+        _zone_presence.clear()
+        for raw in entries:
+            tag_id = int(raw["tag_id"])
+            _zone_presence[tag_id] = {
+                "tag_id": tag_id,
+                "zone_id": int(raw["zone_id"]),
+                "zone_name": raw.get("zone_name"),
+                "station_name": raw.get("station_name"),
+                "operator_name": raw.get("operator_name") or operator_name(tag_id),
+                "status": "in",
+                "at": raw.get("at"),
+            }
+        if entries:
+            _connected = True
+            _last_message_at = datetime.now().astimezone().isoformat()
+    return len(entries)
+
+
 def _public_position(pos: dict) -> dict:
     return {k: v for k, v in pos.items() if not str(k).startswith("_")}
 
@@ -313,23 +335,32 @@ def clear_live_state() -> None:
         _zone_presence.clear()
 
 
-# Stations with floor-plan shapes → (tag_id, zone_id) for offline UI demos.
-_DEMO_ZONE_SEEDS = (
-    (38, 7),   # Lilly → Gannomat
-    (37, 12),  # Pedro → Anderson
+# One demo operator per production station (tag_id, zone_id) for offline UI.
+DEMO_ZONE_SEEDS = (
     (22, 18),  # Victor → Tenoner
+    (38, 7),   # Lilly → Gannomat
     (27, 11),  # Nicholas M → Insert Station
+    (28, 22),  # Michael → Evolve Edge Finisher
+    (30, 23),  # Benjamin → Evolve Drilling
+    (37, 12),  # Pedro → Anderson
     (26, 21),  # Keith → Pack out
+    (24, 5),   # Winston → LBD
     (36, 9),   # Nicholas R → LB Installation
+    (21, 3),   # Angel → 1/2 Edgefinisher
+    (32, 19),  # Jeff → Holzma
+    (34, 20),  # Juan → Holzma.Falloff
 )
 
 
 def seed_demo_zones() -> list[dict]:
-    """Inject fake zone-presence for dashboard testing without Sewio."""
+    """Inject fake zone-presence and persist to DB so sessions can link operators."""
+    # Persist via rtls_storage so operator_current_zone + session links work.
+    import rtls_storage
+
     at = datetime.now().astimezone().isoformat()
     seeded: list[dict] = []
-    for tag_id, zone_id in _DEMO_ZONE_SEEDS:
-        entry = record_zone_event(tag_id, zone_id, "in", at=at)
+    for tag_id, zone_id in DEMO_ZONE_SEEDS:
+        entry = rtls_storage.record_zone_event(tag_id, zone_id, "in", at=at)
         seeded.append(entry)
     set_connected(True)
     _notify("rtls_zone_refresh")
@@ -337,14 +368,16 @@ def seed_demo_zones() -> list[dict]:
 
 
 def clear_demo_zones() -> int:
-    """Remove demo (and any) zone presence for the demo tag ids."""
+    """Remove demo zone presence (memory + operator_current_zone)."""
+    import rtls_storage
+
     removed = 0
-    demo_tags = {tag_id for tag_id, _ in _DEMO_ZONE_SEEDS}
+    demo_tags = {tag_id for tag_id, _ in DEMO_ZONE_SEEDS}
     for tag_id in demo_tags:
         with _lock:
             existed = tag_id in _zone_presence
+        rtls_storage.record_zone_event(tag_id, 0, "out", at=None)
         if existed:
-            record_zone_event(tag_id, 0, "out")
             removed += 1
     _notify("rtls_zone_refresh")
     return removed

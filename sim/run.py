@@ -7,11 +7,21 @@ updates live.
 
 Usage (from repo root):
     python sim/run.py
+    python sim/run.py --ibus IBUS462064 --auto          # 34-part WO, ~60s pipeline
+    python sim/run.py --ibus IBUS462064 --auto --duration 90
+
+On start, clears RFID session history (keeps work orders / BOM) so the
+dashboard shows a clean run. Pass --no-clear to keep prior history.
+
+The sim calls the same DwellTracker.ingest_batch() as the Zebra listener —
+only the antenna reads are fake. Dashboard/API/DB behavior matches production.
 
 Move syntax (pick one):
     1 4                 part #1 -> antenna 4
     S17 1               REF S17 -> antenna 1
     move 1 3            same as above
+    move end            all parts -> Insert (100% complete)
+    auto [seconds]      pipeline all parts through the line
 
 Keep the API running (`python api.py`) for live dashboard chips.
 """
@@ -30,17 +40,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tracking"))
+sys.path.insert(0, str(ROOT / "sim"))
 
 from config import (  # noqa: E402
     ANTENNA_CATALOG,
+    DB_PATH,
     MIN_READS_FOR_SESSION,
+    RTLS_OPERATOR_CONFIRM_SECS,
+    SIM_OPERATOR_MAX_DWELL_SEC,
+    SIM_OPERATOR_MIN_DWELL_SEC,
 )
+from operator_move import start_operator_movement, stop_operator_movement  # noqa: E402
 from r41.parse_r41 import list_r41_files, parse_r41_file  # noqa: E402
 from storage import DwellTracker  # noqa: E402
 
 DEFAULT_RSSI = -45
 START_ANTENNA = 7  # Tennoner Entry
+END_ANTENNA = 3    # Insert Station (= 100% / complete)
+# Real RFID spine after Tennoner entrance (same ports the listener uses).
+AUTO_PATH = (4, 6, 1, 2, 3)  # table → LBD → Gannomat → exit → Insert
 NOTIFY = {"url": "http://127.0.0.1:5001/api/notify"}
+
+# Tracking tables wiped on sim start (work orders / BOM / stations kept).
+_TRACKING_CLEAR_TABLES = (
+    "part_operator_assignments",
+    "session_operator_presence",
+    "operator_zone_visits",
+    "operator_current_zone",
+    "operator_station_presence",
+    "part_station_sessions",
+    "part_station_events",
+    "rfid_raw_reads",
+)
 
 
 def _epc_to_hex(epc: str) -> str:
@@ -63,6 +94,66 @@ def _notify_dashboard(action: str = "sim_move") -> bool:
         return False
 
 
+def _api_base_url() -> str:
+    url = NOTIFY["url"].rstrip("/")
+    if url.endswith("/api/notify"):
+        return url[: -len("/api/notify")]
+    return url.rsplit("/api/", 1)[0] if "/api/" in url else url
+
+
+def _seed_demo_operators() -> int:
+    """POST /api/rtls/demo — one test operator at each production station."""
+    url = NOTIFY["url"].rstrip("/")
+    if url.endswith("/api/notify"):
+        url = url[: -len("/api/notify")] + "/api/rtls/demo"
+    else:
+        url = url.rstrip("/") + "/api/rtls/demo"
+    try:
+        req = urllib.request.Request(
+            url,
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+            if isinstance(body.get("count"), int):
+                return body["count"]
+            seeded = body.get("zone_presence") or body.get("seeded") or []
+            return len(seeded) if isinstance(seeded, list) else 0
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError):
+        return -1
+
+
+def _clear_tracking_db() -> dict[str, int]:
+    """Wipe RFID session history so the dashboard starts from a clean slate.
+
+    Keeps work_orders, BOM components, stations, readers, and antenna layout.
+    """
+    import sqlite3
+
+    cleared: dict[str, int] = {}
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        existing = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for table in _TRACKING_CLEAR_TABLES:
+            if table not in existing:
+                continue
+            before = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            conn.execute(f"DELETE FROM {table}")
+            cleared[table] = before
+        conn.commit()
+    finally:
+        conn.close()
+    return cleared
+
+
 # Short labels for the always-visible top map
 ANT_SHORT = {
     1: "Gannomat ENTRY",
@@ -75,7 +166,11 @@ ANT_SHORT = {
 }
 
 
-def _load_parts(path: Path | None) -> tuple[list[dict], dict]:
+def _load_parts(
+    path: Path | None,
+    *,
+    ibus: str | None = None,
+) -> tuple[list[dict], dict]:
     """Load parts from DB work_order_components when present, else parse .R41."""
     try:
         import sqlite3
@@ -84,12 +179,23 @@ def _load_parts(path: Path | None) -> tuple[list[dict], dict]:
         conn.row_factory = sqlite3.Row
         try:
             wo = None
-            if path and path.is_file():
+            if ibus:
+                key = ibus.strip().upper()
+                if not key.startswith("IBUS"):
+                    key = f"IBUS{key}"
+                wo = conn.execute(
+                    "SELECT * FROM work_orders WHERE UPPER(ibus_number) = ? "
+                    "OR work_order = ?",
+                    (key, key.replace("IBUS", "")),
+                ).fetchone()
+                if wo is None:
+                    raise SystemExit(f"Work order not found in DB: {key}")
+            if path and path.is_file() and wo is None:
                 order_preview = parse_r41_file(path)
-                ibus = order_preview.get("ibus") or ""
-                if ibus:
+                ibus_key = order_preview.get("ibus") or ""
+                if ibus_key:
                     wo = conn.execute(
-                        "SELECT * FROM work_orders WHERE ibus_number = ?", (ibus,)
+                        "SELECT * FROM work_orders WHERE ibus_number = ?", (ibus_key,)
                     ).fetchone()
             if wo is None:
                 wo = conn.execute(
@@ -166,6 +272,7 @@ def _print_antenna_map() -> None:
     print("  |                                                        |")
     print("  |   Example:  1 4         part #1 -> Tennoner table      |")
     print("  |             move all 7  every part -> Tennoner entry   |")
+    print("  |             move end    every part -> Insert (complete)|")
     print("  +--------------------------------------------------------+")
     print()
 
@@ -274,11 +381,12 @@ def _start_all_at(
     antenna: int = START_ANTENNA,
 ) -> None:
     where = ANT_SHORT.get(antenna) or ANTENNA_CATALOG[antenna][0]
-    print(f"  Seeding {len(parts)} parts at [{antenna}] {where} …")
+    print(f"  Resetting {len(parts)} parts to [{antenna}] {where} …")
+    print("  (Brings completed orders back to the start for retesting)")
     print("  Closing open sessions so dwell timers restart …")
     placed = 0
     for p in parts:
-        # Drop any open dwell/presence so the next read opens a fresh timer
+        # Drop any open dwell/presence so the next entry starts a fresh timer
         tracker.close_open_sessions_for_epc(p["epc"])
         _move(tracker, p, antenna, locations, burst, quiet=True, notify=False)
         if locations.get(p["epc"]) == antenna:
@@ -290,6 +398,113 @@ def _start_all_at(
     print()
 
 
+def _finish_all(
+    tracker: DwellTracker,
+    parts: list[dict],
+    locations: dict[str, int],
+    burst: int,
+) -> None:
+    """Send every part to Insert Station so the order hits 100% and completes."""
+    where = ANT_SHORT.get(END_ANTENNA) or ANTENNA_CATALOG[END_ANTENNA][0]
+    print(f"  Finishing order — moving {len(parts)} parts to [{END_ANTENNA}] {where} …")
+    for p in parts:
+        _move(tracker, p, END_ANTENNA, locations, burst, quiet=True, notify=False)
+    # Safety net if the last Insert open didn't already close the order
+    if parts:
+        tracker.try_complete_ibus_order(parts[0]["epc"])
+    live = _notify_dashboard("sim_finish")
+    dash = "dashboard live" if live else "dashboard offline"
+    print(f"  Done — all parts at Insert (100%). Order should be Completed. ({dash})")
+    print()
+
+
+def _auto_run(
+    tracker: DwellTracker,
+    parts: list[dict],
+    locations: dict[str, int],
+    burst: int,
+    *,
+    duration_sec: float = 60.0,
+    path: tuple[int, ...] = AUTO_PATH,
+) -> None:
+    """Pipeline all parts through the real antenna spine in ~duration_sec.
+
+    Uses the same DwellTracker.ingest_batch path as the Zebra listener — only
+    the read timestamps/RSSI are synthetic.
+    """
+    if not parts:
+        print("  No parts to auto-run.")
+        return
+
+    n = len(parts)
+    hops = len(path)
+    # Stagger starts (~35% of budget) + dwell per station (~65%).
+    release_gap = max(0.12, (duration_sec * 0.35) / max(n - 1, 1))
+    step_dwell = max(0.35, (duration_sec * 0.65) / max(hops, 1))
+    eta = (n - 1) * release_gap + hops * step_dwell
+
+    path_labels = " → ".join(
+        f"{a}:{ANT_SHORT.get(a, ANTENNA_CATALOG.get(a, ('?',))[0])}" for a in path
+    )
+    print(f"  AUTO RUN  {n} parts  |  target ~{duration_sec:.0f}s (eta {eta:.0f}s)")
+    print(f"  Path: [{START_ANTENNA}] entrance → {path_labels}")
+    print(f"  Release gap {release_gap:.2f}s  |  dwell/station {step_dwell:.2f}s")
+    print("  (Same ingest_batch logic as the live listener)")
+    print()
+
+    _start_all_at(tracker, parts, locations, burst, START_ANTENNA)
+
+    # Schedule every hop for every part, then play in time order.
+    events: list[tuple[float, int, int]] = []
+    for i in range(n):
+        t0 = i * release_gap
+        for h, ant in enumerate(path):
+            events.append((t0 + h * step_dwell, i, ant))
+    events.sort(key=lambda e: e[0])
+
+    t_wall = time.monotonic()
+    last_notify = 0.0
+    done_moves = 0
+    total_moves = len(events)
+
+    try:
+        for t_abs, idx, ant in events:
+            wait = (t_wall + t_abs) - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            part = parts[idx]
+            # Notify the dashboard every ~0.75s so the UI stays live without flooding.
+            now = time.monotonic()
+            should_notify = (now - last_notify) >= 0.75 or done_moves + 1 == total_moves
+            _move(
+                tracker, part, ant, locations, burst,
+                quiet=True, notify=should_notify,
+            )
+            if should_notify:
+                last_notify = now
+            done_moves += 1
+            label = part.get("tag_label") or part["epc"]
+            where = ANT_SHORT.get(ant) or ant
+            elapsed = time.monotonic() - t_wall
+            print(
+                f"  [{elapsed:5.1f}s] {done_moves}/{total_moves}  "
+                f"{label} → [{ant}] {where}",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        print("\n  AUTO interrupted — finishing remaining parts at Insert …")
+        _finish_all(tracker, parts, locations, burst)
+        return
+
+    if parts:
+        tracker.try_complete_ibus_order(parts[0]["epc"])
+    _notify_dashboard("sim_auto_done")
+    elapsed = time.monotonic() - t_wall
+    print()
+    print(f"  AUTO complete in {elapsed:.1f}s — order should be Completed IBUS.")
+    print()
+
+
 def _print_help() -> None:
     print(
         f"""
@@ -297,6 +512,8 @@ def _print_help() -> None:
   --------
   <part> <ant>             Move part to antenna  (e.g. 1 4  or  S17 1)
   move all <ant>           Move every part  (e.g.  move all 7  or  all 7)
+  move end / end / finish  Move every part to Insert → 100% complete
+  auto [seconds]           Pipeline all parts through the line (~60s default)
   list / l                 Show all parts
   map / ants / a           Show antenna map 1-7
   start / reset            Same as  move all {START_ANTENNA}
@@ -352,9 +569,35 @@ def main() -> int:
     parser.add_argument("path", nargs="?", help="Optional .R41 file or folder")
     parser.add_argument("--burst", type=int, default=None)
     parser.add_argument(
+        "--ibus",
+        default=None,
+        help="Work order to load (e.g. IBUS462064 or 462064)",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Pipeline all parts through the line then exit",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=60.0,
+        help="Auto-run length in seconds (default 60)",
+    )
+    parser.add_argument(
         "--no-start",
         action="store_true",
         help="Do not auto-place all parts at Tennoner entrance",
+    )
+    parser.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Keep existing session history (default: clear tracking tables on start)",
+    )
+    parser.add_argument(
+        "--no-operator-move",
+        action="store_true",
+        help="Disable random operator movement between stations",
     )
     parser.add_argument(
         "--notify-url",
@@ -369,7 +612,11 @@ def main() -> int:
     target = Path(args.path) if args.path else None
     if target and not target.is_absolute():
         target = (Path.cwd() / target).resolve()
-    parts, order = _load_parts(target)
+    # Default auto runs to the 34-part order when --ibus omitted.
+    ibus = args.ibus
+    if args.auto and not ibus and not target:
+        ibus = "IBUS462064"
+    parts, order = _load_parts(target, ibus=ibus)
     locations: dict[str, int] = {}
 
     print("=" * 72)
@@ -377,9 +624,61 @@ def main() -> int:
     print(f"  {len(parts)} parts  |  live ping -> {NOTIFY['url']}")
     print("=" * 72)
 
+    if not args.no_clear:
+        cleared = _clear_tracking_db()
+        total = sum(cleared.values())
+        print(f"  Cleared tracking DB ({total} rows) — clean slate for this run")
+        for table, n in cleared.items():
+            if n:
+                print(f"    {table}: {n}")
+        _notify_dashboard("sim_clear")
+
     tracker = DwellTracker()
+    operator_mover_started = False
     try:
+        n_ops = _seed_demo_operators()
+        if n_ops > 0:
+            print(f"  Demo operators: {n_ops} loaded (one per station)")
+        elif n_ops < 0:
+            print("  Demo operators: skipped (API offline — start api.py first)")
+        else:
+            print("  Demo operators: none seeded")
+
+        if not args.no_operator_move:
+            n_moving = start_operator_movement(
+                notify=lambda: _notify_dashboard("rtls_zone_refresh"),
+                api_base=_api_base_url(),
+            )
+            operator_mover_started = n_moving > 0
+            if operator_mover_started:
+                print(
+                    f"  Operator movement: {n_moving} badges roaming "
+                    f"({SIM_OPERATOR_MIN_DWELL_SEC:.0f}–{SIM_OPERATOR_MAX_DWELL_SEC:.0f}s dwell)"
+                )
+                if RTLS_OPERATOR_CONFIRM_SECS > SIM_OPERATOR_MIN_DWELL_SEC:
+                    print(
+                        f"  Tip: set RTLS_OPERATOR_CONFIRM_SECS={SIM_OPERATOR_MIN_DWELL_SEC:.0f} "
+                        "in .env so short station visits count toward part assignments"
+                    )
+
         _print_antenna_map()
+
+        if args.auto:
+            _auto_run(
+                tracker, parts, locations, burst,
+                duration_sec=max(5.0, args.duration),
+            )
+            _print_parts(parts, locations)
+            if operator_mover_started:
+                print()
+                print("  Auto pipeline done — operators still roaming (Ctrl+C to stop)")
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    print()
+            return 0
+
         if not args.no_start:
             _start_all_at(tracker, parts, locations, burst, START_ANTENNA)
         _print_parts(parts, locations)
@@ -411,6 +710,28 @@ def main() -> int:
                 _start_all_at(tracker, parts, locations, burst, START_ANTENNA)
                 _print_parts(parts, locations)
                 continue
+            if cmd in ("end", "finish") or (
+                cmd in ("m", "move", "go")
+                and len(bits) >= 2
+                and bits[1].lower() in ("end", "finish", "complete", "done")
+            ):
+                _finish_all(tracker, parts, locations, burst)
+                _print_parts(parts, locations)
+                continue
+            if cmd == "auto":
+                dur = args.duration
+                if len(bits) >= 2:
+                    try:
+                        dur = float(bits[1])
+                    except ValueError:
+                        print("  Usage: auto [seconds]   e.g. auto 60")
+                        continue
+                _auto_run(
+                    tracker, parts, locations, burst,
+                    duration_sec=max(5.0, dur),
+                )
+                _print_parts(parts, locations)
+                continue
 
             if cmd == "path":
                 if len(bits) < 2:
@@ -434,6 +755,8 @@ def main() -> int:
 
             print(f"  Unknown: {raw!r}  — try  1 4   or type help")
     finally:
+        if operator_mover_started:
+            stop_operator_movement()
         tracker.close()
 
     print("  Bye.")

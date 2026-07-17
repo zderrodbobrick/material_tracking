@@ -116,6 +116,22 @@ def _valid_exit_rssi(rssi) -> bool:
     return r >= EXIT_RSSI_MIN and r <= 0
 
 
+def _wo_digits_from_epc(epc: str | None) -> str | None:
+    """Extract 6-digit work-order suffix from a compact or labeled EPC."""
+    if not epc:
+        return None
+    s = str(epc).strip().upper()
+    m = re.search(r"IBUS(\d{6})", s)
+    if m:
+        return m.group(1)
+    # Compact: 1T10900001 → 900001 (qty + ref + 0 + wo)
+    if len(s) >= 7 and s[-7] == "0" and s[-6:].isdigit():
+        return s[-6:]
+    if len(s) >= 6 and s[-6:].isdigit():
+        return s[-6:]
+    return None
+
+
 def _valid_third_rssi(rssi) -> bool:
     """True when an antenna-3 read is strong enough to end Gannomat dwell."""
     if rssi is None:
@@ -681,6 +697,8 @@ class DwellTracker:
         if sess is not None and sess.station_id == station_id:
             sess.last_seen_wall = datetime.now(timezone.utc)
             self._touch_session(sess.session_id)
+            if station_id == self._insert_station_id:
+                self._maybe_complete_ibus_order(epc, summary)
             return
 
         self._close_other_buckets(epc, self._presence_open, summary)
@@ -715,6 +733,77 @@ class DwellTracker:
             f"[map] hold OPEN at {st_name} epc={epc!r} session={new_sess.session_id}",
             flush=True,
         )
+        if station_id == self._insert_station_id:
+            self._maybe_complete_ibus_order(epc, summary)
+
+    def _expected_epcs_for_wo(self, wo_digits: str) -> list[str]:
+        """BOM EPCs for this work order, else any currently-open siblings."""
+        rows = self._conn.execute(
+            "SELECT woc.epc FROM work_order_components woc "
+            "JOIN work_orders wo ON wo.work_order_id = woc.work_order_id "
+            "WHERE UPPER(wo.ibus_number) = ? OR wo.work_order = ?",
+            (f"IBUS{wo_digits}", wo_digits),
+        ).fetchall()
+        epcs = [r[0] for r in rows if r and r[0]]
+        if epcs:
+            return epcs
+        found: list[str] = []
+        for bucket in self._all_open_buckets():
+            for e in bucket:
+                if _wo_digits_from_epc(e) == wo_digits and e not in found:
+                    found.append(e)
+        return found
+
+    def _maybe_complete_ibus_order(self, epc: str, summary: dict) -> None:
+        """When every BOM part is at Insert, close Insert holds → journey completed."""
+        if self._insert_station_id is None:
+            return
+        wo = _wo_digits_from_epc(epc)
+        if not wo:
+            return
+        expected = self._expected_epcs_for_wo(wo)
+        if not expected:
+            return
+
+        for e in expected:
+            sess = self._presence_open.get(e)
+            if (
+                sess is None
+                or sess.station_id != self._insert_station_id
+                or not self._session_still_open(sess.session_id)
+            ):
+                return
+            for bucket in (self._open, self._tenoner_open):
+                other = bucket.get(e)
+                if other is not None and self._session_still_open(other.session_id):
+                    return
+
+        now = datetime.now(timezone.utc)
+        closed = 0
+        for e in expected:
+            sess = self._presence_open.get(e)
+            if sess is None:
+                continue
+            if sess.entry_ts is not None and not sess.has_exit:
+                sess.exit_ts = now
+                sess.has_exit = True
+            self._finalize(sess, STATUS_CLOSED, self._presence_open)
+            closed += 1
+            summary["session_closed"] = summary.get("session_closed", 0) + 1
+
+        if closed:
+            summary["order_completed"] = summary.get("order_completed", 0) + 1
+            print(
+                f"[ibus] IBUS{wo} COMPLETE — {closed} parts finished at Insert",
+                flush=True,
+            )
+
+    def try_complete_ibus_order(self, epc: str) -> bool:
+        """Public hook (sim/tests): complete order if every part is at Insert."""
+        summary: dict = {}
+        with self._lock:
+            self._maybe_complete_ibus_order(epc, summary)
+        return bool(summary.get("order_completed"))
 
     # ── DB write helpers ──────────────────────────────────────────────────
 

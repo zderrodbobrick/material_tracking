@@ -174,3 +174,10 @@ RTLS_DATA_DIR = Path(os.getenv("RTLS_DATA_DIR", BASE_DIR / "RTLS"))
 
 # Seconds an operator must be in-station zone before counting as "worked on" the part
 RTLS_OPERATOR_CONFIRM_SECS = float(os.getenv("RTLS_OPERATOR_CONFIRM_SECS", "10"))
+
+# Max operators linked to one part (session) at once — additional RTLS matches are ignored.
+MAX_OPERATORS_PER_PART = int(os.getenv("MAX_OPERATORS_PER_PART", "2"))
+
+# Offline sim: random operator movement between production zones
+SIM_OPERATOR_MIN_DWELL_SEC = float(os.getenv("SIM_OPERATOR_MIN_DWELL_SEC", "5"))
+SIM_OPERATOR_MAX_DWELL_SEC = float(os.getenv("SIM_OPERATOR_MAX_DWELL_SEC", "30"))

@@ -164,9 +164,7 @@ function FloorPlanMap({
 
 const MemoFloorPlanMap = memo(FloorPlanMap)
 
-const IBUS_REFRESH_MS = 20000
-
-export function LiveDashboard({ liveSessions = [] }) {
+export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   const { rtls, health, error, refresh } = useRtlsLive()
 
   // Shapes still load as a fallback for part chips — map regions are hidden.
@@ -215,17 +213,10 @@ export function LiveDashboard({ liveSessions = [] }) {
       .catch(() => {})
   }, [])
 
+  // Refresh progress bars on every rfid_update (and socket fallback tick).
   useEffect(() => {
     loadOpenIbus()
-    const id = setInterval(loadOpenIbus, IBUS_REFRESH_MS)
-    return () => clearInterval(id)
-  }, [loadOpenIbus])
-
-  // Refresh IBUS when live session count changes (new part entered/exited).
-  const liveSessionCount = liveSessions.length
-  useEffect(() => {
-    loadOpenIbus()
-  }, [liveSessionCount, loadOpenIbus])
+  }, [tick, loadOpenIbus])
 
   useEffect(() => {
     let cancelled = false

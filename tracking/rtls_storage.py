@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (
     DB_PATH,
     ENABLE_LIVE_INGESTION,
+    MAX_OPERATORS_PER_PART,
     RTLS_OPERATOR_CONFIRM_SECS,
     SEWIO_FEED_ID,
     SEWIO_LIVE_OFFSET_HOURS,
@@ -104,12 +105,33 @@ def _operator_id(conn: sqlite3.Connection, tag_id: int) -> int | None:
     return int(row["operator_id"]) if row else None
 
 
-def _station_id(conn: sqlite3.Connection, station_name: str) -> int | None:
-    row = conn.execute(
-        "SELECT station_id FROM stations WHERE station_name = ?",
-        (station_name,),
-    ).fetchone()
-    return int(row["station_id"]) if row else None
+# Zone map / UI names → DB stations.station_name
+_STATION_NAME_ALIASES = {
+    "Tenoner": ("Tennoner", "Tenoner"),
+    "Tennoner": ("Tennoner", "Tenoner"),
+    "Pack out": ("Final Packing", "Pack out", "Packing"),
+    "Final Packing": ("Final Packing", "Pack out", "Packing"),
+}
+
+
+def _station_name_candidates(station_name: str | None) -> list[str]:
+    if not station_name:
+        return []
+    aliases = _STATION_NAME_ALIASES.get(station_name)
+    if aliases:
+        return list(aliases)
+    return [station_name]
+
+
+def _station_id(conn: sqlite3.Connection, station_name: str | None) -> int | None:
+    for name in _station_name_candidates(station_name):
+        row = conn.execute(
+            "SELECT station_id FROM stations WHERE station_name = ?",
+            (name,),
+        ).fetchone()
+        if row:
+            return int(row["station_id"])
+    return None
 
 
 def _upsert_current_zone(
@@ -132,6 +154,22 @@ def _upsert_current_zone(
              updated_at = excluded.updated_at""",
         (operator_id, zone_id, station_name, zone_label(zone_id), status, updated_at),
     )
+
+
+def _active_presence_count(conn: sqlite3.Connection, session_id: int) -> int:
+    """Operators currently on this part session (pending or confirmed, not left)."""
+    row = conn.execute(
+        """SELECT COUNT(*) FROM session_operator_presence
+           WHERE session_id = ? AND left_at IS NULL""",
+        (session_id,),
+    ).fetchone()
+    return int(row[0] or 0)
+
+
+def _part_operator_slots_available(conn: sqlite3.Connection, session_id: int) -> int:
+    if MAX_OPERATORS_PER_PART <= 0:
+        return 999
+    return max(0, MAX_OPERATORS_PER_PART - _active_presence_count(conn, session_id))
 
 
 def _confirm_assignment(
@@ -165,10 +203,15 @@ def _confirm_assignment(
            WHERE operator_id = ? AND status = 'in'""",
         (operator_id,),
     ).fetchone()
-    if ocz and (not station_name or ocz["station_name"] == station_name):
+    aliases = set(_station_name_candidates(station_name))
+    if ocz and (
+        not station_name
+        or ocz["station_name"] in aliases
+        or station_name in set(_station_name_candidates(ocz["station_name"]))
+    ):
         zone_id = ocz["zone_id"]
         zone_name = ocz["zone_name"]
-        station_name = ocz["station_name"] or station_name
+        station_name = station_name or ocz["station_name"]
 
     conn.execute(
         """INSERT INTO part_operator_assignments
@@ -188,6 +231,8 @@ def _start_presence(
     entered_at: str,
 ) -> bool:
     """Begin tracking operator at a session (live until confirmed or left)."""
+    if _part_operator_slots_available(conn, session_id) <= 0:
+        return False
     active = conn.execute(
         """SELECT presence_id FROM session_operator_presence
            WHERE session_id = ? AND operator_id = ? AND left_at IS NULL""",
@@ -215,12 +260,19 @@ def _open_sessions_at_station(conn: sqlite3.Connection, station_id: int) -> list
 
 
 def _operators_in_station_zone(conn: sqlite3.Connection, station_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        """SELECT ocz.operator_id, ocz.updated_at AS zone_entered_at
-           FROM operator_current_zone ocz
-           JOIN stations s ON s.station_id = ?
-           WHERE ocz.status = 'in' AND ocz.station_name = s.station_name""",
+    st = conn.execute(
+        "SELECT station_name FROM stations WHERE station_id = ?",
         (station_id,),
+    ).fetchone()
+    if not st:
+        return []
+    names = _station_name_candidates(st["station_name"])
+    placeholders = ",".join("?" * len(names))
+    return conn.execute(
+        f"""SELECT ocz.operator_id, ocz.updated_at AS zone_entered_at
+            FROM operator_current_zone ocz
+            WHERE ocz.status = 'in' AND ocz.station_name IN ({placeholders})""",
+        names,
     ).fetchall()
 
 
@@ -233,7 +285,10 @@ def _link_operator_to_open_sessions(
     """Start presence tracking for all open sessions when operator enters station zone."""
     started = 0
     for row in _open_sessions_at_station(conn, station_id):
-        if _start_presence(conn, int(row["session_id"]), operator_id, station_id, entered_at):
+        session_id = int(row["session_id"])
+        if _part_operator_slots_available(conn, session_id) <= 0:
+            continue
+        if _start_presence(conn, session_id, operator_id, station_id, entered_at):
             started += 1
     return started
 
@@ -322,7 +377,11 @@ def try_assign_on_session_open(session_id: int, station_id: int) -> bool:
         ).fetchone()
         entry_at = entry_row["entry_time"] if entry_row else _now_iso()
         started = 0
-        for op in _operators_in_station_zone(conn, station_id):
+        zone_ops = list(_operators_in_station_zone(conn, station_id))
+        zone_ops.sort(key=lambda r: r["zone_entered_at"] or "")
+        for op in zone_ops:
+            if _part_operator_slots_available(conn, session_id) <= 0:
+                break
             if _start_presence(
                 conn, session_id, int(op["operator_id"]), station_id, entry_at
             ):
@@ -377,6 +436,38 @@ def bootstrap_current_zones_from_rest() -> int:
     return loaded
 
 
+def sync_zone_presence_from_db() -> int:
+    """Reload API in-memory zone chips from operator_current_zone after external writers (sim)."""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            """SELECT o.rtls_badge_id, o.operator_name, ocz.zone_id, ocz.station_name,
+                      ocz.zone_name, ocz.updated_at
+               FROM operator_current_zone ocz
+               JOIN operators o ON o.operator_id = ocz.operator_id
+               WHERE ocz.status = 'in' AND o.is_active = 1
+                 AND o.rtls_badge_id IS NOT NULL AND o.rtls_badge_id != ''"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    entries = []
+    for r in rows:
+        try:
+            tag_id = int(r["rtls_badge_id"])
+        except (TypeError, ValueError):
+            continue
+        entries.append({
+            "tag_id": tag_id,
+            "zone_id": int(r["zone_id"]),
+            "station_name": r["station_name"],
+            "zone_name": r["zone_name"] or zone_label(int(r["zone_id"])),
+            "operator_name": r["operator_name"],
+            "at": r["updated_at"],
+        })
+    return rtls_live.hydrate_zone_presence(entries)
+
+
 def bootstrap_positions_from_rest() -> int:
     """Load current tag positions from Sewio REST (WebSocket only sends changes)."""
     import httpx
@@ -419,12 +510,60 @@ def record_position(tag_id: int, x: float, y: float, at: str | None, **extra) ->
     rtls_live.record_position(tag_id, x, y, at, **extra)
 
 
+def _close_open_zone_visit(
+    conn: sqlite3.Connection,
+    operator_id: int,
+    exited_at: str,
+) -> int | None:
+    """Close the operator's open zone visit and return dwell seconds."""
+    row = conn.execute(
+        """SELECT visit_id, entered_at FROM operator_zone_visits
+           WHERE operator_id = ? AND exited_at IS NULL
+           ORDER BY entered_at DESC LIMIT 1""",
+        (operator_id,),
+    ).fetchone()
+    if not row:
+        return None
+    ent = _parse_iso(row["entered_at"])
+    ex = _parse_iso(exited_at)
+    dwell = None
+    if ent and ex and ex >= ent:
+        dwell = int((ex - ent).total_seconds())
+    conn.execute(
+        """UPDATE operator_zone_visits
+           SET exited_at = ?, dwell_seconds = ?
+           WHERE visit_id = ?""",
+        (exited_at, dwell, row["visit_id"]),
+    )
+    return dwell
+
+
+def _open_zone_visit(
+    conn: sqlite3.Connection,
+    operator_id: int,
+    tag_id: int,
+    zone_id: int,
+    station_name: str | None,
+    zone_name: str | None,
+    entered_at: str,
+    source: str = "rtls",
+) -> None:
+    conn.execute(
+        """INSERT INTO operator_zone_visits
+           (operator_id, tag_id, zone_id, station_name, zone_name, entered_at, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (operator_id, tag_id, zone_id, station_name, zone_name, entered_at, source),
+    )
+
+
 def record_zone_event(
     tag_id: int,
     zone_id: int,
     status: str,
     at: str | None,
     duration: float | None = None,
+    *,
+    source: str = "rtls",
 ) -> dict:
     detected_at = _parse_sewio_ts(at)
     station_name = station_for_zone(zone_id)
@@ -443,6 +582,15 @@ def record_zone_event(
 
         if op_id:
             _upsert_current_zone(conn, op_id, zone_id, station_name, status, detected_at)
+
+            if status == "out":
+                _close_open_zone_visit(conn, op_id, detected_at)
+            elif status == "in" and zone_id > 0 and station_name:
+                _close_open_zone_visit(conn, op_id, detected_at)
+                _open_zone_visit(
+                    conn, op_id, tag_id, zone_id, station_name,
+                    zone_label(zone_id), detected_at, source=source,
+                )
 
         if op_id and st_id:
             conn.execute(
@@ -479,6 +627,7 @@ def get_live_state() -> dict:
         "zone_presence": snap["zone_presence"],
         "station_name": STATION_NAME,
         "confirm_seconds": RTLS_OPERATOR_CONFIRM_SECS,
+        "max_operators_per_part": MAX_OPERATORS_PER_PART,
     }
 
 

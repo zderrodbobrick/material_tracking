@@ -86,6 +86,17 @@ body {
   to   { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes ibus-complete-glow {
+  0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55); transform: scale(1); }
+  40%  { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0.12); transform: scale(1.03); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); transform: scale(1); }
+}
+
+@keyframes ibus-depart {
+  0%   { opacity: 1; transform: scale(1) translateY(0); filter: saturate(1); }
+  100% { opacity: 0; transform: scale(0.82) translateY(-18px); filter: saturate(1.2); }
+}
+
 @keyframes grid-drift {
   from { background-position: 0 0; }
   to   { background-position: 40px 40px; }
@@ -102,6 +113,8 @@ body {
 .animate-ping-slow     { animation: ping-slow 3s cubic-bezier(0, 0, 0.2, 1) infinite; }
 .animate-float-up      { animation: float-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
 .animate-grid-drift    { animation: grid-drift 3s linear infinite; }
+.animate-ibus-complete { animation: ibus-complete-glow 0.85s ease-out both; }
+.animate-ibus-depart   { animation: ibus-depart 1.05s cubic-bezier(0.4, 0, 0.2, 1) both; }
 
 /* Respect reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {

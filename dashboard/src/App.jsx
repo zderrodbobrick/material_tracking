@@ -5,6 +5,8 @@ import { LiveDashboard } from './pages/LiveDashboard'
 import { CompletedIbusPage } from './pages/CompletedIbusPage'
 import { FullReport } from './pages/FullReport'
 import { AnalyticsPage } from './pages/AnalyticsPage'
+import { OperatorAnalyticsPage } from './pages/OperatorAnalyticsPage'
+import { StationSettingsPage } from './pages/StationSettingsPage'
 import { useTheme } from './hooks/useTheme'
 import { useLiveSocket } from './hooks/useLiveSocket'
 import { apiFetch } from './api'
@@ -77,11 +79,13 @@ export default function App() {
       />
       <main className="w-full px-3 sm:px-4 py-3">
         {tab === 'live' && (
-          <LiveDashboard liveSessions={liveSessions} />
+          <LiveDashboard liveSessions={liveSessions} tick={tick} />
         )}
         {tab === 'completed' && <CompletedIbusPage tick={tick} />}
         {tab === 'report' && <FullReport tick={tick} />}
         {tab === 'analytics' && <AnalyticsPage />}
+        {tab === 'operators' && <OperatorAnalyticsPage tick={tick} />}
+        {tab === 'settings' && <StationSettingsPage />}
       </main>
     </div>
   )
