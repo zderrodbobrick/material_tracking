@@ -19,7 +19,7 @@ Move syntax (pick one):
     S17 1               REF S17 -> antenna 1
     move 1 3            same as above
     move end            all parts -> Insert antenna (completion via DwellTracker)
-    auto [seconds]      pipeline all parts through the line antennas
+    auto [seconds]      each part through Tennoner 2–4 times, then Gannomat line
 
 Keep the API running (`python api.py` / start.ps1) for live dashboard chips.
 """
@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -55,8 +56,12 @@ from storage import DwellTracker  # noqa: E402
 DEFAULT_RSSI = -45
 START_ANTENNA = 7  # Tennoner Entry — first antenna on a typical walk
 END_ANTENNA = 3    # Insert Station — last antenna on AUTO_PATH
-# Antenna ports only. Completion rules live in DwellTracker, not here.
-AUTO_PATH = (4, 6, 1, 2, 3)  # table → LBD → Gannomat → exit → Insert
+TENONER_TABLE_ANTENNA = 4
+# After Tennoner loops finish, continue toward Gannomat / Insert (reads only).
+AFTER_TENONER_PATH = (6, 1, 2, 3)  # LBD → Gannomat → exit → Insert
+# Legacy default single-pass table hop (unused by auto; kept for reference).
+AUTO_PATH = (4, 6, 1, 2, 3)
+TENONER_PASS_CHOICES = (2, 3, 4)
 NOTIFY = {"url": "http://127.0.0.1:5001/api/notify"}
 
 # Tracking tables wiped on sim start (work orders / BOM / stations kept).
@@ -416,6 +421,26 @@ def _finish_all(
     print()
 
 
+def _tenoner_passes_then_line(passes: int) -> tuple[int, ...]:
+    """Antenna hops after START_ANTENNA for N Tennoner cycles (2–4), then Gannomat line.
+
+    Pass 1: table (4). Each extra pass: entry (7) → table (4).
+    Then LBD → Gannomat → exit → Insert.
+    """
+    n = max(1, int(passes))
+    hops: list[int] = [TENONER_TABLE_ANTENNA]
+    for _ in range(n - 1):
+        hops.extend((START_ANTENNA, TENONER_TABLE_ANTENNA))
+    hops.extend(AFTER_TENONER_PATH)
+    return tuple(hops)
+
+
+def _assign_tenoner_passes(n_parts: int) -> list[int]:
+    """Give each part 2, 3, or 4 Tennoner cycles (round-robin for variety)."""
+    choices = list(TENONER_PASS_CHOICES)
+    return [choices[i % len(choices)] for i in range(n_parts)]
+
+
 def _auto_run(
     tracker: DwellTracker,
     parts: list[dict],
@@ -423,9 +448,9 @@ def _auto_run(
     burst: int,
     *,
     duration_sec: float = 60.0,
-    path: tuple[int, ...] = AUTO_PATH,
+    path: tuple[int, ...] | None = None,
 ) -> None:
-    """Pipeline all parts through the real antenna spine in ~duration_sec.
+    """Pipeline all parts through Tennoner (2–4 passes) then toward Gannomat.
 
     Uses the same DwellTracker.ingest_batch path as the Zebra listener — only
     the read timestamps/RSSI are synthetic.
@@ -435,18 +460,23 @@ def _auto_run(
         return
 
     n = len(parts)
-    hops = len(path)
-    # Stagger starts (~35% of budget) + dwell per station (~65%).
+    pass_counts = _assign_tenoner_passes(n)
+    part_paths: list[tuple[int, ...]] = [
+        path if path is not None else _tenoner_passes_then_line(pc)
+        for pc in pass_counts
+    ]
+    max_hops = max(len(p) for p in part_paths)
+    # Stagger starts (~35% of budget) + dwell per hop (~65% of longest path).
     release_gap = max(0.12, (duration_sec * 0.35) / max(n - 1, 1))
-    step_dwell = max(0.35, (duration_sec * 0.65) / max(hops, 1))
-    eta = (n - 1) * release_gap + hops * step_dwell
+    step_dwell = max(0.25, (duration_sec * 0.65) / max(max_hops, 1))
+    eta = (n - 1) * release_gap + max_hops * step_dwell
 
-    path_labels = " -> ".join(
-        f"{a}:{ANT_SHORT.get(a, ANTENNA_CATALOG.get(a, ('?',))[0])}" for a in path
-    )
+    pc = Counter(pass_counts)
+    mix = ", ".join(f"{k}x{pc[k]} parts" for k in sorted(pc))
     print(f"  AUTO RUN  {n} parts  |  target ~{duration_sec:.0f}s (eta {eta:.0f}s)")
-    print(f"  Path: [{START_ANTENNA}] entrance -> {path_labels}")
-    print(f"  Release gap {release_gap:.2f}s  |  dwell/station {step_dwell:.2f}s")
+    print(f"  Tennoner cycles: {mix} (each part 2–4 passes, then LBD→Gannomat→Insert)")
+    print(f"  Start: [{START_ANTENNA}] entrance; then per-part table/return loops")
+    print(f"  Release gap {release_gap:.2f}s  |  dwell/hop {step_dwell:.2f}s")
     print("  (Same ingest_batch logic as the live listener)")
     print()
 
@@ -456,7 +486,7 @@ def _auto_run(
     events: list[tuple[float, int, int]] = []
     for i in range(n):
         t0 = i * release_gap
-        for h, ant in enumerate(path):
+        for h, ant in enumerate(part_paths[i]):
             events.append((t0 + h * step_dwell, i, ant))
     events.sort(key=lambda e: e[0])
 
@@ -522,7 +552,7 @@ def _print_help() -> None:
   list / l                 Show all parts
   map / ants / a           Show antenna map 1-7
   start / reset            Same as  move all {START_ANTENNA}
-  path <part>              Walk 4 -> 1 -> 2 -> 3
+  path <part> [2|3|4]      Tennoner loops then LBD→Gannomat→Insert
   help / h
   quit / q
 """
@@ -749,15 +779,30 @@ def main() -> int:
 
             if cmd == "path":
                 if len(bits) < 2:
-                    print("  Usage: path <n|REF>")
+                    print("  Usage: path <n|REF> [2|3|4]")
                     continue
                 part = _resolve_part(bits[1], parts)
                 if part is None:
                     print(f"  Part not found: {bits[1]}")
                     continue
-                seq = (4, 1, 2, 3)
+                passes = 3
+                if len(bits) >= 3:
+                    try:
+                        passes = int(bits[2])
+                    except ValueError:
+                        print("  Usage: path <n|REF> [2|3|4]")
+                        continue
+                if passes not in TENONER_PASS_CHOICES:
+                    print(f"  Tennoner passes must be one of {TENONER_PASS_CHOICES}")
+                    continue
+                # Ensure part is at entrance before looping.
+                if locations.get(part["epc"]) != START_ANTENNA:
+                    _move(tracker, part, START_ANTENNA, locations, burst)
+                seq = _tenoner_passes_then_line(passes)
                 label = part.get("tag_label") or part["epc"]
-                print(f"  Walking {label} through {list(seq)} …")
+                print(
+                    f"  Walking {label} Tennoner x{passes} then line: {list(seq)} …"
+                )
                 for ant in seq:
                     _move(tracker, part, ant, locations, burst)
                     time.sleep(0.05)

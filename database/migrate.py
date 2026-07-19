@@ -601,6 +601,40 @@ def _m015_station_specifications(conn: sqlite3.Connection, **_) -> None:
         )
 
 
+def _m016_tenoner_return_count(conn: sqlite3.Connection, **_) -> None:
+    """Count Tennoner return trips (ant 7 after ant 4/5) on each part."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(parts)")}
+    if "tenoner_return_count" not in cols:
+        conn.execute(
+            "ALTER TABLE parts ADD COLUMN tenoner_return_count "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
+    # Refresh live view so dashboard/API can read the counter.
+    conn.executescript("""
+        DROP VIEW IF EXISTS vw_live_part_status;
+        CREATE VIEW vw_live_part_status AS
+        SELECT
+            s.session_id,
+            p.part_id,
+            p.part_name,
+            p.part_type,
+            p.part_number,
+            p.ibus_number,
+            p.job_number,
+            p.tenoner_return_count,
+            t.epc,
+            st.station_name,
+            s.entry_time,
+            s.exit_time,
+            s.dwell_seconds,
+            s.session_status
+        FROM part_station_sessions s
+        JOIN rfid_tags t   ON s.tag_id     = t.tag_id
+        LEFT JOIN parts p  ON s.part_id    = p.part_id
+        JOIN stations st   ON s.station_id = st.station_id;
+    """)
+
+
 # ── Migration registry ────────────────────────────────────────────────────────
 
 _MIGRATIONS: list[tuple[int, str, object]] = [
@@ -619,6 +653,7 @@ _MIGRATIONS: list[tuple[int, str, object]] = [
     (13, "work_order_bom",          _m013_work_order_bom),
     (14, "operator_zone_visits",    _m014_operator_zone_visits),
     (15, "station_specifications",  _m015_station_specifications),
+    (16, "tenoner_return_count",    _m016_tenoner_return_count),
 ]
 
 

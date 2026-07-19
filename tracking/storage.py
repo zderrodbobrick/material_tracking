@@ -15,7 +15,8 @@ Session modes
     Entry antenna opens a session; a dedicated closer ends it with dwell_seconds.
     Gannomat: ant 1 opens; ant 2 = at exit (does NOT close); ant 3 Insert closes.
     Tennoner: ant 7 opens; ant 4/5 mark exit-table (dwell timer stops, session
-    stays open for map); LBD ant 6 closes the Tennoner visit (one session per part).
+    stays open for map); LBD / next machine closes via move-on. Each return to
+    ant 7 after ant 4/5 increments parts.tenoner_return_count.
 
   Presence (LBD, Insert Station):
     A valid read means the part is there. LBD closes on short idle (left zone).
@@ -238,6 +239,8 @@ class DwellTracker:
         self._tenoner_open: dict[str, _Session] = {}   # Tennoner dwell
         self._presence_open: dict[str, _Session] = {}  # LBD / Insert presence
         self._completed_wos: set[str] = set()          # WO digits already completed
+        # EPCs last seen at Tennoner exit table (ant 4/5); cleared on return to ant 7.
+        self._tenoner_saw_table: set[str] = set()
         self._last_raw: dict[tuple[str, int], float] = {}
         self._read_counts: dict[tuple[str, int], int] = {}
 
@@ -519,12 +522,20 @@ class DwellTracker:
                             epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
                         )
                 elif antenna_port == TENONER_ENTRY_ANTENNA:
+                    open_ten = self._tenoner_open.get(epc)
+                    ten_ready = (
+                        open_ten is not None
+                        and self._session_still_open(open_ten.session_id)
+                    ) or self._read_counts.get(key, 0) >= MIN_READS_FOR_SESSION
+                    if ten_ready:
+                        self._maybe_increment_tenoner_return(epc, part_id)
                     self._handle_dwell_entry(
                         epc, tag_id, part_id, reader_dt, reader_iso, key, summary,
                         bucket=self._tenoner_open, station_id=self._tenoner_station_id,
                     )
                 elif antenna_port in TENONER_EXIT_ANTENNAS:
                     if _valid_exit_rssi(rssi):
+                        self._tenoner_saw_table.add(epc)
                         at_table = self._handle_tennoner_exit_sighting(
                             epc, tag_id, part_id, reader_dt, rssi, summary,
                         )
@@ -560,6 +571,28 @@ class DwellTracker:
         return summary
 
     # ── entry / exit / presence handlers ────────────────────────────────────
+
+    def _maybe_increment_tenoner_return(self, epc: str, part_id: Optional[int]) -> None:
+        """Count a return to ant 7 after the part was seen at the exit table (4/5)."""
+        if epc not in self._tenoner_saw_table:
+            return
+        self._tenoner_saw_table.discard(epc)
+        if part_id is None:
+            return
+        self._conn.execute(
+            "UPDATE parts SET tenoner_return_count = "
+            "COALESCE(tenoner_return_count, 0) + 1 WHERE part_id = ?",
+            (part_id,),
+        )
+        row = self._conn.execute(
+            "SELECT tenoner_return_count FROM parts WHERE part_id = ?",
+            (part_id,),
+        ).fetchone()
+        count = int(row[0]) if row and row[0] is not None else None
+        print(
+            f"[map] Tennoner return epc={epc!r} count={count}",
+            flush=True,
+        )
 
     def _close_other_buckets(self, epc: str, keep: dict, summary: dict) -> None:
         for bucket in self._all_open_buckets():

@@ -206,6 +206,10 @@ def _parse_ts(ts: str | None) -> datetime | None:
 def _session_dict(r: sqlite3.Row) -> dict:
     """Shape a row from vw_live_part_status into a dashboard-friendly dict."""
     dwell = int(r["dwell_seconds"]) if r["dwell_seconds"] is not None else None
+    keys = set(r.keys())
+    ret_count = None
+    if "tenoner_return_count" in keys and r["tenoner_return_count"] is not None:
+        ret_count = int(r["tenoner_return_count"])
     return {
         "id":                 r["session_id"],
         "session_id":         r["session_id"],
@@ -223,6 +227,8 @@ def _session_dict(r: sqlite3.Row) -> dict:
         "dwell_seconds":      dwell,
         "dwell_time_display": _dwell_display(dwell),
         "status":             r["session_status"],
+        "tenoner_return_count": ret_count if ret_count is not None else 0,
+        "drawing":            "",
         "operator_name":      None,
         "operator_id":        None,
         "operator_zone":      None,
@@ -537,6 +543,7 @@ def live_sessions():
         sessions = [s for s in sessions if not _is_hidden_ibus(s)]
     _attach_operators(db, sessions)
     _attach_last_antennas(db, sessions)
+    _attach_drawings(db, sessions)
     db.close()
     return jsonify(sessions)
 
@@ -556,6 +563,7 @@ def completed_sessions():
     ).fetchall()
     sessions = [_session_dict(r) for r in rows]
     _attach_operators(db, sessions)
+    _attach_drawings(db, sessions)
     db.close()
     return jsonify(sessions)
 
@@ -628,11 +636,54 @@ def _part_tag_label(session: dict) -> str:
     return epc
 
 
+def _drawing_label(raw: str | None) -> str:
+    """Human drawing text from R41 DRAWING field (segment after first ';')."""
+    if not raw:
+        return ""
+    bits = [b.strip() for b in str(raw).split(";")]
+    if len(bits) > 1 and bits[1]:
+        return bits[1]
+    return bits[0] if bits and bits[0] else ""
+
+
+def _drawings_by_epc(db: sqlite3.Connection) -> dict[str, str]:
+    """Map component EPC → display drawing string from work_order_components."""
+    rows = db.execute(
+        """SELECT epc, drawing FROM work_order_components
+           WHERE epc IS NOT NULL AND TRIM(epc) != ''
+             AND drawing IS NOT NULL AND TRIM(drawing) != ''"""
+    ).fetchall()
+    out: dict[str, str] = {}
+    for r in rows:
+        epc = (r["epc"] or "").strip()
+        if not epc or epc in out:
+            continue
+        label = _drawing_label(r["drawing"])
+        if label:
+            out[epc] = label
+    return out
+
+
+def _attach_drawings(db: sqlite3.Connection, sessions: list[dict]) -> None:
+    """Add `drawing` (R41 display text) onto each session by EPC."""
+    if not sessions:
+        return
+    drawings = _drawings_by_epc(db)
+    if not drawings:
+        for s in sessions:
+            s.setdefault("drawing", "")
+        return
+    for s in sessions:
+        epc = (s.get("epc") or "").strip()
+        s["drawing"] = drawings.get(epc) or ""
+
+
 def _build_ibus_journeys(
     sessions: list[dict],
     specs_by_name: dict | None = None,
     part_actuals: dict[str, float] | None = None,
     wo_parts_by_ibus: dict[str, int] | None = None,
+    drawings_by_epc: dict[str, str] | None = None,
 ) -> list[dict]:
     """Group station sessions by IBUS order (work order), not individual part EPC."""
     groups: dict[str, list[dict]] = {}
@@ -642,6 +693,7 @@ def _build_ibus_journeys(
 
     journeys = []
     now = datetime.now(timezone.utc)
+    drawings = drawings_by_epc or {}
 
     for key, sess_list in groups.items():
         sess_list.sort(key=lambda x: x.get("entry_time") or "")
@@ -672,7 +724,19 @@ def _build_ibus_journeys(
                     "part_type": s.get("part_type"),
                     "work_order": s.get("work_order"),
                     "ibus_number": s.get("ibus_number") or tag,
+                    "tenoner_return_count": int(s.get("tenoner_return_count") or 0),
+                    "drawing": drawings.get(s.get("epc") or "") or drawings.get(epc) or "",
                 }
+            else:
+                # Keep the latest counter from any session row for this part.
+                prev = int(part_map[epc].get("tenoner_return_count") or 0)
+                cur = int(s.get("tenoner_return_count") or 0)
+                if cur > prev:
+                    part_map[epc]["tenoner_return_count"] = cur
+                if not part_map[epc].get("drawing"):
+                    part_map[epc]["drawing"] = (
+                        drawings.get(s.get("epc") or "") or drawings.get(epc) or ""
+                    )
 
             machine_ops = []
             for op in (s.get("operators_worked") or []):
@@ -909,10 +973,11 @@ def ibus_journeys():
     specs_by_name = fetch_specs_by_name(db)
     part_actuals, _ = _station_actual_dwells(db)
     wo_parts_by_ibus = _work_order_parts_by_ibus(db)
+    drawings_by_epc = _drawings_by_epc(db)
     db.close()
 
     journeys = _build_ibus_journeys(
-        sessions, specs_by_name, part_actuals, wo_parts_by_ibus
+        sessions, specs_by_name, part_actuals, wo_parts_by_ibus, drawings_by_epc
     )
     if status in ("open", "live", "in"):
         journeys = [j for j in journeys if j["status"] == "open"]
@@ -1015,6 +1080,35 @@ def summary():
         (STATUS_CLOSED, today),
     ).fetchone()[0]
 
+    # Unique parts that finished at Insert today (daily parts-completed KPI).
+    parts_completed_today = db.execute(
+        """SELECT COUNT(DISTINCT t.epc)
+           FROM part_station_sessions s
+           JOIN rfid_tags t ON s.tag_id = t.tag_id
+           JOIN stations st ON s.station_id = st.station_id
+           WHERE s.session_status = ?
+             AND (st.station_name = ? OR st.station_name LIKE ?)
+             AND date(s.exit_time) = date(?)""",
+        (STATUS_CLOSED, INSERT_STATION_NAME, "%Insert%", today),
+    ).fetchone()[0]
+
+    # Distinct IBUS orders with at least one Insert completion today.
+    orders_completed_today = db.execute(
+        """SELECT COUNT(DISTINCT COALESCE(
+                NULLIF(TRIM(p.job_number), ''),
+                NULLIF(TRIM(p.ibus_number), ''),
+                substr(t.epc, -6)
+           ))
+           FROM part_station_sessions s
+           JOIN rfid_tags t ON s.tag_id = t.tag_id
+           LEFT JOIN parts p ON s.part_id = p.part_id
+           JOIN stations st ON s.station_id = st.station_id
+           WHERE s.session_status = ?
+             AND (st.station_name = ? OR st.station_name LIKE ?)
+             AND date(s.exit_time) = date(?)""",
+        (STATUS_CLOSED, INSERT_STATION_NAME, "%Insert%", today),
+    ).fetchone()[0]
+
     avg_dwell = db.execute(
         "SELECT AVG(dwell_seconds) FROM part_station_sessions "
         "WHERE session_status = ? AND exit_time >= ?",
@@ -1043,6 +1137,9 @@ def summary():
         "station_name":                STATION_NAME,
         "parts_in_process":            in_process,
         "completed_today":             completed_today,
+        "parts_completed_today":       int(parts_completed_today or 0),
+        "orders_completed_today":      int(orders_completed_today or 0),
+        "parts_goal_daily":            200,
         "average_dwell_seconds_today": round(float(avg_dwell), 1) if avg_dwell else None,
         "average_dwell_display_today": _dwell_display(int(avg_dwell)) if avg_dwell else None,
         "missing_exit_count":          missing_exit,
@@ -1860,6 +1957,7 @@ def report_sessions():
     ).fetchall()
     sessions = [_session_dict(r) for r in rows]
     _attach_operators(db, sessions)
+    _attach_drawings(db, sessions)
     db.close()
 
     return jsonify({

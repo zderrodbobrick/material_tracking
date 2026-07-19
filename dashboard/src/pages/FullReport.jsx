@@ -44,7 +44,7 @@ function csvEscape(v) {
 
 function downloadCsv(filename, rows) {
  const headers = [
-  'Session ID', 'Part / EPC', 'Work Order', 'Station', 'Operator',
+  'Session ID', 'Part / EPC', 'Drawing', 'Work Order', 'Station', 'Operator',
   'Entered', 'Exited', 'Dwell (sec)', 'Dwell', 'Status',
  ]
  const lines = [headers.join(',')]
@@ -53,6 +53,7 @@ function downloadCsv(filename, rows) {
   lines.push([
    s.id,
    s.part_name ?? s.part_number ?? p.partNumber ?? s.epc ?? s.ibus_number ?? '',
+   s.drawing ?? '',
    s.work_order ?? p.workOrder ?? s.ibus_number ?? '',
    s.station_name ?? '',
    operatorLabel(s),
@@ -336,6 +337,7 @@ function SessionHistory({ tick, stationOptions }) {
        <tr>
         <th className="text-right">ID</th>
         <th>Part / EPC</th>
+        <th>Drawing</th>
         <th>Work Order</th>
         <th>Station</th>
         <th>Operator</th>
@@ -353,6 +355,9 @@ function SessionHistory({ tick, stationOptions }) {
           <td className="text-right font-mono text-xs text-[#8b939e] tabular-nums">{s.id}</td>
           <td className="font-mono text-xs font-semibold text-[#eef2f7] whitespace-nowrap">
            {s.part_name ?? s.part_number ?? p.partNumber ?? s.epc ?? s.ibus_number}
+          </td>
+          <td className="text-xs text-[#eef2f7] max-w-[12rem] truncate" title={s.drawing || ''}>
+           {s.drawing || '—'}
           </td>
           <td className="font-mono text-xs text-[#8b939e] whitespace-nowrap">
            {s.work_order ?? p.workOrder ?? '—'}

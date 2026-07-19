@@ -26,6 +26,9 @@ import { ibusOrderKey } from '../utils/ibusOrder'
 import floorPlanImg from '../assets/floor_plan.png'
 
 const MAP_OPEN_KEY = 'liveDashboard.mapOpen'
+const PARTS_GOAL_DAILY = 200
+/** Placeholder until behind-order logic exists. */
+const ORDERS_BEHIND_PLACEHOLDER = 0
 
 function sessionDwellSeconds(session) {
  const ms = session.entry_epoch_ms
@@ -181,6 +184,7 @@ function StationDetailPanel({ stationKey, stationName, status, sessions, onClose
       <thead className="bb-table-head">
        <tr>
         <th>Part</th>
+        <th>Drawing</th>
         <th>Work order</th>
         <th className="text-right">Dwell</th>
        </tr>
@@ -190,6 +194,9 @@ function StationDetailPanel({ stationKey, stationName, status, sessions, onClose
         <tr key={s.id ?? s.session_id} className="bb-table-row">
          <td className="font-mono text-xs">
           {s.part_number || s.part_name || s.epc || '—'}
+         </td>
+         <td className="text-xs text-[#eef2f7] max-w-[10rem] truncate" title={s.drawing || ''}>
+          {s.drawing || '—'}
          </td>
          <td className="font-mono text-xs text-[#8b939e]">
           {s.work_order || s.ibus_number || ibusOrderKey(s) || '—'}
@@ -225,6 +232,12 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
  const [statusMessage, setStatusMessage] = useState(null)
  const [selectedOrderKey, setSelectedOrderKey] = useState(null)
  const [selectedStationKey, setSelectedStationKey] = useState(null)
+ const [showDelays, setShowDelays] = useState(false)
+ const [shiftSummary, setShiftSummary] = useState({
+  orders_completed_today: 0,
+  parts_completed_today: 0,
+  parts_goal_daily: PARTS_GOAL_DAILY,
+ })
  const [mapOpen, setMapOpen] = useState(() => {
   try {
    return localStorage.getItem(MAP_OPEN_KEY) === 'true'
@@ -240,7 +253,21 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
    .catch(() => {})
  }, [])
 
+ const loadShiftSummary = useCallback(() => {
+  apiFetch('/api/summary')
+   .then(s => {
+    if (!s || typeof s !== 'object') return
+    setShiftSummary({
+     orders_completed_today: Number(s.orders_completed_today) || 0,
+     parts_completed_today: Number(s.parts_completed_today) || 0,
+     parts_goal_daily: Number(s.parts_goal_daily) || PARTS_GOAL_DAILY,
+    })
+   })
+   .catch(() => {})
+ }, [])
+
  useEffect(() => { loadOpenIbus() }, [tick, loadOpenIbus])
+ useEffect(() => { loadShiftSummary() }, [tick, loadShiftSummary])
 
  useEffect(() => {
   let cancelled = false
@@ -382,52 +409,25 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   return 'ok'
  }, [specsByStation])
 
- const delayedSessionCount = useMemo(
+ const delayedSessions = useMemo(
   () => liveSessions.filter(s => {
    const level = getDelayLevel(s)
    return level === 'warn' || level === 'critical'
-  }).length,
+  }),
   [liveSessions, getDelayLevel],
  )
-
- const stationsDelayed = useMemo(() => {
-  return allMachineStatuses.filter(st => {
-   const station = PRODUCTION_LINE_STATIONS.find(s => s.station === st.stationKey)
-   if (!station) return st.light === 'amber'
-   const sessions = sessionsForStation(sessionsByStation, station)
-    .filter(s => s.status === 'open' || s.status === 'exit_only')
-   return sessions.some(s => {
-    const level = getDelayLevel(s)
-    return level === 'warn' || level === 'critical'
-   }) || st.light === 'amber'
-  }).length
- }, [allMachineStatuses, sessionsByStation, getDelayLevel])
+ const delayedSessionCount = delayedSessions.length
 
  const unstaffedStations = useMemo(
   () => allMachineStatuses.filter(s => s.hasPart && !s.hasOperator).length,
   [allMachineStatuses],
  )
 
- const ordersBehind = useMemo(() => {
-  return openIbusJourneys.filter(j => {
-   if (j.actual_vs_estimated_seconds != null && j.actual_vs_estimated_seconds > 0) return true
-   // Any open part over dwell target
-   for (const p of j.parts ?? []) {
-    const openM = [...(p.machines ?? [])].reverse().find(m => m.status === 'open' || m.status === 'Open')
-    if (!openM) continue
-    const level = getDelayLevel({
-     ...openM,
-     station_name: openM.station_name,
-     entry_time: openM.entry_time,
-     entry_epoch_ms: openM.entry_epoch_ms,
-    })
-    if (level === 'warn' || level === 'critical') return true
-   }
-   return false
-  }).length
- }, [openIbusJourneys, getDelayLevel])
+ const ordersBehind = ORDERS_BEHIND_PLACEHOLDER
+ const ordersCompleted = shiftSummary.orders_completed_today
+ const partsCompleted = shiftSummary.parts_completed_today
+ const partsGoal = shiftSummary.parts_goal_daily || PARTS_GOAL_DAILY
 
- const partsInProcess = liveSessions.length
  const activePartsOnMap = useMemo(
   () => liveSessions.filter(s => s.status === 'open' || s.status === 'exit_only').length,
   [liveSessions],
@@ -485,34 +485,109 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
 
  const alerts = useMemo(() => {
   const list = []
-  if (ordersBehind > 0) list.push(`${ordersBehind} order${ordersBehind === 1 ? '' : 's'} behind target`)
-  if (stationsDelayed > 0) list.push(`${stationsDelayed} station${stationsDelayed === 1 ? '' : 's'} delayed`)
   if (unstaffedStations > 0) list.push(`${unstaffedStations} unstaffed station${unstaffedStations === 1 ? '' : 's'}`)
-  if (delayedSessionCount > 0) list.push(`${delayedSessionCount} part${delayedSessionCount === 1 ? '' : 's'} over dwell target`)
   return list
- }, [ordersBehind, stationsDelayed, unstaffedStations, delayedSessionCount])
+ }, [unstaffedStations])
 
  return (
   <div className="space-y-3">
    {/* Shift status */}
    <div className="bb-kpi-strip">
     <div>
+     <p className="bb-kpi-label">Orders completed</p>
+     <p className="bb-kpi-value">{ordersCompleted}</p>
+    </div>
+    <div>
      <p className="bb-kpi-label">Orders behind</p>
-     <p className={`bb-kpi-value ${ordersBehind > 0 ? 'text-[#fbbf24]' : ''}`}>{ordersBehind}</p>
+     <p className={`bb-kpi-value ${ordersBehind >= 1 ? 'text-[#f87171]' : 'text-[#34d399]'}`}>
+      {ordersBehind}
+     </p>
     </div>
     <div>
-     <p className="bb-kpi-label">Parts in process</p>
-     <p className="bb-kpi-value">{partsInProcess}</p>
+     <p className="bb-kpi-label">Parts completed</p>
+     <p className="bb-kpi-value">
+      {partsCompleted}
+      <span className="text-sm font-normal text-[#8b939e]">/{partsGoal}</span>
+     </p>
     </div>
-    <div>
-     <p className="bb-kpi-label">Stations delayed</p>
-     <p className={`bb-kpi-value ${stationsDelayed > 0 ? 'text-[#fbbf24]' : ''}`}>{stationsDelayed}</p>
-    </div>
-    <div>
-     <p className="bb-kpi-label">Unstaffed stations</p>
-     <p className={`bb-kpi-value ${unstaffedStations > 0 ? 'text-[#fbbf24]' : ''}`}>{unstaffedStations}</p>
-    </div>
+    <button
+     type="button"
+     onClick={() => setShowDelays(v => !v)}
+     className="text-left hover:bg-white/[0.02] transition-colors"
+     title={delayedSessionCount > 0 ? 'Show delayed parts' : 'No delays'}
+    >
+     <p className="bb-kpi-label">Delays</p>
+     <p className={`bb-kpi-value ${delayedSessionCount > 0 ? 'text-[#fbbf24]' : ''}`}>
+      {delayedSessionCount}
+     </p>
+    </button>
    </div>
+
+   {showDelays && (
+    <div className="bb-panel px-3 py-2 space-y-2">
+     <div className="flex items-center justify-between gap-2">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-[#8b939e]">
+       Delayed parts
+      </p>
+      <button
+       type="button"
+       onClick={() => setShowDelays(false)}
+       className="bb-btn-ghost p-1"
+       aria-label="Close delays"
+      >
+       <X className="w-3.5 h-3.5" />
+      </button>
+     </div>
+     {delayedSessions.length === 0 ? (
+      <p className="bb-empty py-2">No parts over dwell target</p>
+     ) : (
+      <div className="bb-table-wrap">
+       <table className="bb-table">
+        <thead className="bb-table-head">
+         <tr>
+          <th>Machine</th>
+          <th>Part</th>
+          <th>Operator</th>
+          <th className="text-right">Dwell</th>
+         </tr>
+        </thead>
+        <tbody>
+         {delayedSessions.map(s => {
+          const ops = (s.operators_worked ?? s.operators_present ?? [])
+           .map(o => o.operator_name)
+           .filter(Boolean)
+          const opLabel = s.operator_name || (ops.length ? ops.join(', ') : '—')
+          return (
+           <tr
+            key={s.id ?? s.session_id}
+            className="bb-table-row cursor-pointer"
+            onClick={() => {
+             const key = ibusOrderKey(s) || s.ibus_number || s.work_order
+             if (key) setSelectedOrderKey(key)
+            }}
+           >
+            <td className="text-xs text-[#eef2f7]">{s.station_name || '—'}</td>
+            <td className="font-mono text-xs text-[#eef2f7]">
+             {s.part_number || s.part_name || s.epc || '—'}
+            </td>
+            <td className="text-xs text-[#8b939e]">{opLabel}</td>
+            <td className="text-right font-mono text-xs">
+             <DwellTimer
+              entranceTime={s.entry_time}
+              entranceEpochMs={s.entry_epoch_ms}
+              exitTime={null}
+              dwellSeconds={null}
+             />
+            </td>
+           </tr>
+          )
+         })}
+        </tbody>
+       </table>
+      </div>
+     )}
+    </div>
+   )}
 
    {(alerts.length > 0 || showConfigWarning || showDisconnected || error) && (
     <div className="flex flex-wrap items-center gap-2 text-xs">

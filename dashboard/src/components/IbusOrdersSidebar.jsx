@@ -338,7 +338,9 @@ function OrderPartsDetail({ order, accent }) {
      <thead className="bb-table-head">
       <tr>
        <th>Part</th>
+       <th>Drawing</th>
        <th>Station</th>
+       <th className="text-right">Tennoner</th>
        <th className="text-right">Dwell</th>
       </tr>
      </thead>
@@ -347,6 +349,7 @@ function OrderPartsDetail({ order, accent }) {
        const tag = p.part_tag || partTagLabel(p) || p.epc || '—'
        const station = partCurrentStation(p)
        const openM = partOpenMachine(p)
+       const tenonerPasses = p.tenoner_return_count ?? 0
        return (
         <tr key={p.epc || tag} className="bb-table-row">
          <td>
@@ -363,7 +366,13 @@ function OrderPartsDetail({ order, accent }) {
            </div>
           </div>
          </td>
+         <td className="text-[10px] text-[#eef2f7] max-w-[9rem] truncate" title={p.drawing || ''}>
+          {p.drawing || '—'}
+         </td>
          <td className="text-xs text-[#8b939e]">{shortStation(station)}</td>
+         <td className="text-right font-mono text-[11px] tabular-nums text-[#4dc4f4]">
+          {tenonerPasses > 0 ? tenonerPasses : '—'}
+         </td>
          <td className="text-right font-mono text-[11px] text-[#8b939e]">
           {openM ? (
            <DwellTimer

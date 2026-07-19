@@ -416,6 +416,7 @@ function OrderPartsView({ order, onSelectPart }) {
      <thead className="bb-table-head">
       <tr>
        <th>Part</th>
+       <th>Drawing</th>
        <th className="text-right">Production time</th>
        <th>Start</th>
        <th>End</th>
@@ -425,7 +426,7 @@ function OrderPartsView({ order, onSelectPart }) {
      <tbody>
       {parts.length === 0 ? (
        <tr>
-        <td colSpan={5} className="bb-empty">No parts in this order</td>
+        <td colSpan={6} className="bb-empty">No parts in this order</td>
        </tr>
       ) : (
        parts.map(p => {
@@ -444,6 +445,9 @@ function OrderPartsView({ order, onSelectPart }) {
            <p className="text-[11px] text-[#8b939e] mt-0.5">
             {[p.part_number, p.part_name].filter(Boolean).join(' · ') || '—'}
            </p>
+          </td>
+          <td className="text-xs text-[#eef2f7] max-w-[14rem]">
+           {p.drawing || '—'}
           </td>
           <td className="text-right font-mono tabular-nums text-xs">
            {p.total_production_display ?? formatDwell(p.total_production_seconds) ?? '—'}
@@ -498,8 +502,55 @@ function collectPartOperators(part) {
  )
 }
 
+function isTennonerStation(name) {
+ const n = (name || '').toLowerCase()
+ return n === 'tennoner' || n === 'tenoner'
+}
+
+/** Collapse every Tennoner visit into one row with a pass counter. */
+function collapseTennonerMachines(machines, tenonerReturnCount = 0) {
+ const list = machines ?? []
+ const tenoner = list.filter(m => isTennonerStation(m.station_name))
+ if (tenoner.length === 0) return list
+
+ const rest = list.filter(m => !isTennonerStation(m.station_name))
+ const firstIdx = list.findIndex(m => isTennonerStation(m.station_name))
+
+ const entries = tenoner.map(m => m.entry_time).filter(Boolean).sort()
+ const exits = tenoner.map(m => m.exit_time).filter(Boolean).sort()
+ const dwellSum = tenoner.reduce((s, m) => s + (Number(m.dwell_seconds) || 0), 0)
+ const opNames = new Set()
+ for (const m of tenoner) {
+  for (const op of [...(m.rtls ?? []), ...(m.operators ?? [])]) {
+   if (op?.operator_name) opNames.add(op.operator_name)
+  }
+ }
+
+ // Prefer return-trip counter; fall back to collapsed session count.
+ const passes = tenonerReturnCount > 0 ? tenonerReturnCount : tenoner.length
+ const summary = {
+  session_id: `tenoner-summary-${tenoner[0]?.session_id ?? 'x'}`,
+  station_name: 'Tennoner',
+  tenoner_passes: passes,
+  entry_time: entries[0] || tenoner[0]?.entry_time || null,
+  exit_time: exits[exits.length - 1] || tenoner[tenoner.length - 1]?.exit_time || null,
+  dwell_seconds: dwellSum || null,
+  dwell_time_display: formatDwell(dwellSum) || tenoner[0]?.dwell_time_display || null,
+  operators: [...opNames].map(name => ({ operator_name: name })),
+  rtls: [...opNames].map(name => ({ operator_name: name })),
+  _collapsed: true,
+ }
+
+ const out = [...rest]
+ out.splice(Math.min(firstIdx, out.length), 0, summary)
+ return out
+}
+
 function PartMachineView({ part, orderLabel }) {
- const machines = part.machines ?? []
+ const machines = collapseTennonerMachines(
+  part.machines ?? [],
+  part.tenoner_return_count ?? 0,
+ )
  const allOperators = collectPartOperators(part)
 
  return (
@@ -512,6 +563,11 @@ function PartMachineView({ part, orderLabel }) {
      {orderLabel} · {part.part_number || '—'}
      {part.part_name ? ` · ${part.part_name}` : ''}
     </p>
+    {part.drawing ? (
+     <p className="text-xs text-[#eef2f7] mt-1">
+      <span className="text-[#8b939e]">Drawing · </span>{part.drawing}
+     </p>
+    ) : null}
    </div>
 
    {allOperators.length > 0 && (
@@ -535,6 +591,7 @@ function PartMachineView({ part, orderLabel }) {
       <thead className="bb-table-head">
        <tr>
         <th>Station</th>
+        <th className="text-right">Passes</th>
         <th>Entered</th>
         <th>Exited</th>
         <th className="text-right">Dwell</th>
@@ -544,9 +601,15 @@ function PartMachineView({ part, orderLabel }) {
       <tbody>
        {machines.map(m => {
         const rtls = m.rtls ?? m.operators ?? []
+        const passes = isTennonerStation(m.station_name)
+         ? (m.tenoner_passes ?? part.tenoner_return_count ?? 1)
+         : null
         return (
          <tr key={m.session_id ?? `${m.station_name}-${m.entry_time}`} className="bb-table-row">
           <td className="font-medium text-[#eef2f7]">{m.station_name || '—'}</td>
+          <td className="text-right font-mono text-xs tabular-nums text-[#4dc4f4]">
+           {passes != null ? passes : '—'}
+          </td>
           <td className="text-xs text-[#8b939e] whitespace-nowrap">{formatWhen(m.entry_time)}</td>
           <td className="text-xs text-[#8b939e] whitespace-nowrap">{formatWhen(m.exit_time)}</td>
           <td className="text-right font-mono text-xs tabular-nums">
