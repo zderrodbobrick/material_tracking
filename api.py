@@ -646,6 +646,14 @@ def _drawing_label(raw: str | None) -> str:
     return bits[0] if bits and bits[0] else ""
 
 
+def _series_from_drawing(drawing: str | None) -> str:
+    """Derive series family from a drawing label (leading digit run, e.g. 2082G.67P → 2082)."""
+    if not drawing:
+        return ""
+    m = re.match(r"^(\d+)", str(drawing).strip())
+    return m.group(1) if m else str(drawing).strip()[:8]
+
+
 def _drawings_by_epc(db: sqlite3.Connection) -> dict[str, str]:
     """Map component EPC → display drawing string from work_order_components."""
     rows = db.execute(
@@ -3526,20 +3534,33 @@ def _build_machine_analytics(
     return machines
 
 
+def _normalize_ibus_key(ibus_number: str | None, job_number: str | None = None) -> str:
+    key = (ibus_number or job_number or "").strip().upper()
+    if not key:
+        return ""
+    if not key.startswith("IBUS") and job_number:
+        return f"IBUS{job_number}".upper()
+    if not key.startswith("IBUS") and key.isdigit():
+        return f"IBUS{key}"
+    return key
+
+
+def _final_spine_station(spine: list[str]) -> str:
+    """Prefer Insert Station on the spine for RFID-complete definition."""
+    if not spine:
+        return INSERT_STATION_NAME
+    insert_canon = canonical_station(INSERT_STATION_NAME) or INSERT_STATION_NAME
+    for name in spine:
+        if (canonical_station(name) or name) == insert_canon or name == INSERT_STATION_NAME:
+            return name
+    return spine[-1]
+
+
 def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> list[dict]:
     """Work-order progress: BOM expected vs RFID-completed parts."""
     spine = progress_spine_names(specs_by_name)
-    # Prefer Insert Station when it is on the spine — later off-line machines
-    # (e.g. Anderson) must not redefine "RFID complete".
-    final_station = INSERT_STATION_NAME
-    if spine:
-        insert_canon = canonical_station(INSERT_STATION_NAME) or INSERT_STATION_NAME
-        for name in spine:
-            if (canonical_station(name) or name) == insert_canon or name == INSERT_STATION_NAME:
-                final_station = name
-                break
-        else:
-            final_station = spine[-1]
+    final_station = _final_spine_station(spine)
+    spine_set = set(spine)
 
     orders = db.execute(
         "SELECT * FROM work_orders ORDER BY ingested_at DESC"
@@ -3554,11 +3575,9 @@ def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> 
 
     ibus_acc: dict[str, dict] = {}
     for r in session_rows:
-        key = (r["ibus_number"] or r["job_number"] or "").strip().upper()
+        key = _normalize_ibus_key(r["ibus_number"], r["job_number"])
         if not key:
             continue
-        if not key.startswith("IBUS") and r["job_number"]:
-            key = f"IBUS{r['job_number']}"
         acc = ibus_acc.setdefault(key, {
             "epcs": set(),
             "completed_epcs": set(),
@@ -3568,22 +3587,127 @@ def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> 
             "closed_count": 0,
             "entries": [],
             "exits": [],
+            "last_activity": None,
+            "open_by_station": {},
+            "closed_by_station": {},
+            "dwell_by_station": {},
         })
         epc = r["epc"]
         acc["epcs"].add(epc)
         st = r["station_name"] or ""
         acc["stations_touched"].add(st)
+        for ts in (r["entry_time"], r["exit_time"]):
+            if ts and (not acc["last_activity"] or ts > acc["last_activity"]):
+                acc["last_activity"] = ts
         if r["session_status"] == STATUS_CLOSED:
             acc["closed_count"] += 1
             if r["dwell_seconds"]:
-                acc["dwell_sum"] += int(r["dwell_seconds"])
+                dwell = int(r["dwell_seconds"])
+                acc["dwell_sum"] += dwell
+                acc["dwell_by_station"].setdefault(st, []).append(dwell)
             acc["exits"].append(r["exit_time"])
+            acc["closed_by_station"][st] = acc["closed_by_station"].get(st, 0) + 1
             if st == final_station or canonical_station(st) == canonical_station(final_station):
                 acc["completed_epcs"].add(epc)
         elif r["session_status"] == STATUS_OPEN:
             acc["open_epcs"].add(epc)
+            acc["open_by_station"][st] = acc["open_by_station"].get(st, 0) + 1
         if r["entry_time"]:
             acc["entries"].append(r["entry_time"])
+
+    def _enrich(ibus: str, base: dict, rfid: dict) -> dict:
+        expected = int(base.get("expected_parts") or 0)
+        rfid_completed = len(rfid.get("completed_epcs", set()))
+        rfid_unique = len(rfid.get("epcs", set()))
+        rfid_in_progress = len(rfid.get("open_epcs", set()))
+        missing = max(0, expected - rfid_unique) if expected else 0
+        completion_base = expected or rfid_unique or 1
+        completion_pct = round(100.0 * rfid_completed / completion_base, 1) if completion_base else None
+
+        entries = rfid.get("entries", [])
+        exits = rfid.get("exits", [])
+        cycle_sec = None
+        start_time = None
+        if entries:
+            entry_dts = [_parse_ts(t) for t in entries if _parse_ts(t)]
+            if entry_dts:
+                start_time = min(entry_dts).isoformat()
+        if entries and exits:
+            entry_dt = min(_parse_ts(t) for t in entries if _parse_ts(t))
+            exit_dt = max(_parse_ts(t) for t in exits if _parse_ts(t))
+            if entry_dt and exit_dt and exit_dt > entry_dt:
+                cycle_sec = int((exit_dt - entry_dt).total_seconds())
+
+        stations_done = len(rfid.get("stations_touched", set()) & spine_set)
+        progress = round(stations_done / len(spine), 3) if spine else None
+
+        # Bottleneck = spine station with highest open WIP, else highest avg closed dwell
+        bottleneck = None
+        open_by = rfid.get("open_by_station") or {}
+        if open_by:
+            bottleneck = max(open_by.items(), key=lambda kv: kv[1])[0]
+        else:
+            dwell_by = rfid.get("dwell_by_station") or {}
+            avgs = {
+                st: (sum(ds) / len(ds))
+                for st, ds in dwell_by.items() if ds
+            }
+            if avgs:
+                bottleneck = max(avgs.items(), key=lambda kv: kv[1])[0]
+
+        station_progress = []
+        for st in spine:
+            open_n = 0
+            closed_n = 0
+            dwells = []
+            for raw_st, n in open_by.items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    open_n += n
+            for raw_st, n in (rfid.get("closed_by_station") or {}).items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    closed_n += n
+            for raw_st, ds in (rfid.get("dwell_by_station") or {}).items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    dwells.extend(ds)
+            avg = sum(dwells) / len(dwells) if dwells else None
+            mx = max(dwells) if dwells else None
+            station_progress.append({
+                "station": st,
+                "completed": closed_n,
+                "in_process": open_n,
+                "avg_dwell_seconds": round(avg, 1) if avg is not None else None,
+                "avg_dwell_display": _dwell_display(avg),
+                "max_dwell_seconds": mx,
+                "max_dwell_display": _dwell_display(mx),
+            })
+
+        status_label = (
+            "Complete" if (completion_pct or 0) >= 100
+            else "In process" if rfid_in_progress > 0
+            else base.get("status") or "Open"
+        )
+
+        return {
+            **base,
+            "ibus_number":            ibus,
+            "rfid_completed":         rfid_completed,
+            "rfid_unique_tags":       rfid_unique,
+            "rfid_in_progress":       rfid_in_progress,
+            "missing_parts":          missing,
+            "completion_pct":         completion_pct,
+            "stations_done":          stations_done,
+            "stations_total":         len(spine),
+            "progress":               progress,
+            "avg_cycle_seconds":      round(rfid["dwell_sum"] / rfid["closed_count"], 1) if rfid.get("closed_count") else None,
+            "avg_cycle_display":      _dwell_display(rfid["dwell_sum"] / rfid["closed_count"]) if rfid.get("closed_count") else None,
+            "total_cycle_seconds":    cycle_sec,
+            "total_cycle_display":    _dwell_display(cycle_sec),
+            "start_time":             start_time,
+            "last_activity":          rfid.get("last_activity"),
+            "current_bottleneck":     bottleneck,
+            "status_label":           status_label,
+            "station_progress":       station_progress,
+        }
 
     out = []
     seen_ibus: set[str] = set()
@@ -3604,30 +3728,10 @@ def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> 
         ).fetchone()
         bom_total = int(comp_row["total"] or 0)
         bom_complete = int(comp_row["bom_complete"] or 0)
-
-        rfid = ibus_acc.get(ibus, {})
         expected = int(wo["parts_count"] or bom_total or 0)
-        rfid_completed = len(rfid.get("completed_epcs", set()))
-        rfid_unique = len(rfid.get("epcs", set()))
-        rfid_in_progress = len(rfid.get("open_epcs", set()))
-        completion_base = expected or rfid_unique or 1
-        completion_pct = round(100.0 * rfid_completed / completion_base, 1) if completion_base else None
         bom_pct = round(100.0 * bom_complete / bom_total, 1) if bom_total else None
 
-        entries = rfid.get("entries", [])
-        exits = rfid.get("exits", [])
-        cycle_sec = None
-        if entries and exits:
-            entry_dt = min(_parse_ts(t) for t in entries if _parse_ts(t))
-            exit_dt = max(_parse_ts(t) for t in exits if _parse_ts(t))
-            if entry_dt and exit_dt and exit_dt > entry_dt:
-                cycle_sec = int((exit_dt - entry_dt).total_seconds())
-
-        stations_done = len(rfid.get("stations_touched", set()) & set(spine))
-        progress = round(stations_done / len(spine), 3) if spine else None
-
-        out.append({
-            "ibus_number":            ibus,
+        out.append(_enrich(ibus, {
             "work_order":             wo["work_order"],
             "customer":               wo["customer"],
             "prod_date":              wo["prod_date"],
@@ -3637,18 +3741,7 @@ def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> 
             "bom_complete":           bom_complete,
             "bom_in_process":         int(comp_row["bom_in_process"] or 0),
             "bom_completion_pct":     bom_pct,
-            "rfid_completed":         rfid_completed,
-            "rfid_unique_tags":       rfid_unique,
-            "rfid_in_progress":       rfid_in_progress,
-            "completion_pct":         completion_pct,
-            "stations_done":          stations_done,
-            "stations_total":         len(spine),
-            "progress":               progress,
-            "avg_cycle_seconds":      round(rfid["dwell_sum"] / rfid["closed_count"], 1) if rfid.get("closed_count") else None,
-            "avg_cycle_display":      _dwell_display(rfid["dwell_sum"] / rfid["closed_count"]) if rfid.get("closed_count") else None,
-            "total_cycle_seconds":      cycle_sec,
-            "total_cycle_display":    _dwell_display(cycle_sec),
-        })
+        }, ibus_acc.get(ibus, {})))
 
     for key, rfid in ibus_acc.items():
         if key in seen_ibus or (HIDDEN_IBUS_ORDERS and key in HIDDEN_IBUS_ORDERS):
@@ -3656,9 +3749,7 @@ def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> 
         if not rfid.get("epcs"):
             continue
         expected = len(rfid["epcs"])
-        rfid_completed = len(rfid.get("completed_epcs", set()))
-        out.append({
-            "ibus_number":        key,
+        out.append(_enrich(key, {
             "work_order":         None,
             "customer":           None,
             "prod_date":          None,
@@ -3668,27 +3759,492 @@ def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> 
             "bom_complete":       0,
             "bom_in_process":     0,
             "bom_completion_pct": None,
-            "rfid_completed":     rfid_completed,
-            "rfid_unique_tags":   expected,
-            "rfid_in_progress":   len(rfid.get("open_epcs", set())),
-            "completion_pct":     round(100.0 * rfid_completed / max(expected, 1), 1),
-            "stations_done":      len(rfid.get("stations_touched", set()) & set(spine)),
-            "stations_total":     len(spine),
-            "progress":           round(len(rfid.get("stations_touched", set()) & set(spine)) / len(spine), 3) if spine else None,
-            "avg_cycle_seconds":  None,
-            "avg_cycle_display":  None,
-            "total_cycle_seconds": None,
-            "total_cycle_display": None,
+        }, rfid))
+
+    out.sort(key=lambda o: (
+        0 if (o.get("rfid_in_progress") or 0) > 0 and (o.get("completion_pct") or 0) < 100 else 1,
+        o.get("completion_pct") or 0,
+        o.get("rfid_completed") or 0,
+    ))
+    return out
+
+
+def _build_attention_items(
+    db: sqlite3.Connection,
+    specs_by_name: dict,
+    ibus_orders: list[dict],
+    days: int | None = 1,
+) -> list[dict]:
+    """Actionable exception cards for the Today view."""
+    spine = progress_spine_names(specs_by_name)
+    first_station = spine[0] if spine else None
+    items: list[dict] = []
+    now = datetime.now(timezone.utc)
+
+    # Overdue open sessions
+    open_rows = db.execute(
+        """SELECT v.epc, v.part_name, v.ibus_number, v.job_number, v.station_name,
+                  v.entry_time, v.dwell_seconds
+           FROM vw_live_part_status v
+           WHERE v.session_status = ?""",
+        (STATUS_OPEN,),
+    ).fetchall()
+    for r in open_rows:
+        spec = _spec_for_station(specs_by_name, r["station_name"] or "")
+        target = spec.get("target_part_dwell_seconds") if spec else None
+        max_lim = spec.get("max_dwell_seconds") if spec else None
+        entry_dt = _parse_ts(r["entry_time"])
+        dwell = int(r["dwell_seconds"] or 0)
+        if entry_dt:
+            dwell = max(dwell, int((now - entry_dt).total_seconds()))
+        severity = None
+        if max_lim and dwell >= max_lim:
+            severity = "critical"
+        elif target and dwell >= target:
+            severity = "warn"
+        if not severity:
+            continue
+        items.append({
+            "type": "overdue_session",
+            "severity": severity,
+            "title": f"Part has remained at {r['station_name']} for {_dwell_display(dwell)}",
+            "detail": r["part_name"] or r["epc"],
+            "epc": r["epc"],
+            "ibus_number": _normalize_ibus_key(r["ibus_number"], r["job_number"]),
+            "station": r["station_name"],
+            "dwell_seconds": dwell,
+            "dwell_display": _dwell_display(dwell),
         })
 
-    out.sort(key=lambda o: (o["completion_pct"] or 0, o["rfid_completed"]), reverse=True)
-    return out
+    # Missing first-station entry for BOM parts
+    if first_station:
+        for o in ibus_orders:
+            missing = o.get("missing_parts") or 0
+            if missing <= 0 or (o.get("completion_pct") or 0) >= 100:
+                continue
+            items.append({
+                "type": "missing_parts",
+                "severity": "warn",
+                "title": f"{missing} expected part{'s' if missing != 1 else ''} have not entered {first_station}",
+                "detail": o.get("ibus_number"),
+                "ibus_number": o.get("ibus_number"),
+                "count": missing,
+                "station": first_station,
+            })
+
+    # Stale orders (no activity ≥ 2h, still incomplete)
+    for o in ibus_orders:
+        if (o.get("completion_pct") or 0) >= 100:
+            continue
+        if (o.get("rfid_in_progress") or 0) == 0 and (o.get("rfid_unique_tags") or 0) == 0:
+            continue
+        last = o.get("last_activity")
+        last_dt = _parse_ts(last)
+        if not last_dt:
+            continue
+        idle_sec = int((now - last_dt).total_seconds())
+        if idle_sec < 2 * 3600:
+            continue
+        items.append({
+            "type": "stale_order",
+            "severity": "warn",
+            "title": f"{o.get('ibus_number')} has had no activity for {_dwell_display(idle_sec)}",
+            "detail": o.get("customer") or o.get("work_order") or "Incomplete order",
+            "ibus_number": o.get("ibus_number"),
+            "idle_seconds": idle_sec,
+            "idle_display": _dwell_display(idle_sec),
+        })
+
+    # Exit-only / skipped / wrong-order samples (recent)
+    bad_rows = db.execute(
+        """SELECT v.epc, v.part_name, v.ibus_number, v.job_number, v.station_name,
+                  v.session_status, v.exit_time, v.entry_time
+           FROM vw_live_part_status v
+           WHERE v.session_status IN (?, ?)
+           ORDER BY COALESCE(v.exit_time, v.entry_time) DESC
+           LIMIT 25""",
+        (STATUS_EXIT_ONLY, STATUS_ABANDONED),
+    ).fetchall()
+    for r in bad_rows:
+        if days is not None and not _in_analytics_period(r["exit_time"] or r["entry_time"], days):
+            continue
+        st = r["session_status"]
+        items.append({
+            "type": "exit_only" if st == STATUS_EXIT_ONLY else "abandoned",
+            "severity": "critical" if st == STATUS_ABANDONED else "warn",
+            "title": (
+                f"Part read at {r['station_name']} without a matching entry"
+                if st == STATUS_EXIT_ONLY
+                else f"Abandoned session at {r['station_name']}"
+            ),
+            "detail": r["part_name"] or r["epc"],
+            "epc": r["epc"],
+            "ibus_number": _normalize_ibus_key(r["ibus_number"], r["job_number"]),
+            "station": r["station_name"],
+        })
+
+    # Sequence anomalies from closed visits
+    status_rows = db.execute(
+        """SELECT t.epc, st.station_name, s.entry_time, s.exit_time, p.ibus_number, p.job_number
+           FROM part_station_sessions s
+           JOIN stations st ON st.station_id = s.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id
+           LEFT JOIN parts p ON p.part_id = s.part_id
+           WHERE s.session_status = ? AND t.epc IS NOT NULL""",
+        (STATUS_CLOSED,),
+    ).fetchall()
+    spine_idx = {canonical_station(s) or s: i for i, s in enumerate(spine)}
+    epc_visits: dict[str, list] = {}
+    for r in status_rows:
+        if days is not None and not _in_analytics_period(r["exit_time"], days):
+            continue
+        epc_visits.setdefault(r["epc"], []).append(r)
+
+    seen_skip = 0
+    for epc, visits in epc_visits.items():
+        if seen_skip >= 8:
+            break
+        ordered = sorted(visits, key=lambda x: x["entry_time"] or "")
+        visited = []
+        prev = -1
+        wrong = False
+        for v in ordered:
+            canon = canonical_station(v["station_name"]) or v["station_name"]
+            if canon not in spine_idx:
+                continue
+            idx = spine_idx[canon]
+            if idx < prev:
+                wrong = True
+                break
+            prev = max(prev, idx)
+            if idx not in visited:
+                visited.append(idx)
+        if wrong:
+            v0 = ordered[-1]
+            items.append({
+                "type": "wrong_order",
+                "severity": "warn",
+                "title": f"Unexpected station sequence for part {epc[-8:]}",
+                "detail": v0["station_name"],
+                "epc": epc,
+                "ibus_number": _normalize_ibus_key(v0["ibus_number"], v0["job_number"]),
+                "station": v0["station_name"],
+            })
+            seen_skip += 1
+            continue
+        if visited:
+            expected = set(range(max(visited) + 1))
+            if set(visited) != expected:
+                missing_idx = sorted(expected - set(visited))
+                miss_name = spine[missing_idx[0]] if missing_idx and missing_idx[0] < len(spine) else "prior station"
+                v0 = ordered[-1]
+                items.append({
+                    "type": "skipped_station",
+                    "severity": "warn",
+                    "title": f"Part read at {v0['station_name']} without a {miss_name} exit",
+                    "detail": epc,
+                    "epc": epc,
+                    "ibus_number": _normalize_ibus_key(v0["ibus_number"], v0["job_number"]),
+                    "station": v0["station_name"],
+                })
+                seen_skip += 1
+
+    severity_rank = {"critical": 0, "warn": 1, "info": 2}
+    items.sort(key=lambda x: (severity_rank.get(x.get("severity"), 9), x.get("title") or ""))
+    return items[:40]
+
+
+def _build_drawing_analytics(
+    db: sqlite3.Connection,
+    specs_by_name: dict,
+    days: int | None = None,
+) -> dict:
+    """Aggregate station dwell / totals by drawing + series."""
+    spine = progress_spine_names(specs_by_name)
+    drawings_by_epc = _drawings_by_epc(db)
+
+    rows = db.execute(
+        """SELECT v.epc, v.station_name, v.dwell_seconds, v.exit_time, v.entry_time,
+                  v.ibus_number, v.job_number, v.part_name, v.session_status
+           FROM vw_live_part_status v
+           WHERE v.session_status = ? AND v.dwell_seconds IS NOT NULL AND v.epc IS NOT NULL""",
+        (STATUS_CLOSED,),
+    ).fetchall()
+
+    # drawing -> station -> dwells; drawing -> epc totals
+    by_drawing: dict[str, dict] = {}
+    for r in rows:
+        if not _in_analytics_period(r["exit_time"], days):
+            continue
+        drawing = drawings_by_epc.get((r["epc"] or "").strip()) or ""
+        if not drawing:
+            continue
+        acc = by_drawing.setdefault(drawing, {
+            "series": _series_from_drawing(drawing),
+            "station_dwells": {},
+            "epc_station_dwells": {},
+            "epcs": set(),
+            "over_target": 0,
+            "closed": 0,
+        })
+        st = r["station_name"] or ""
+        dwell = int(r["dwell_seconds"])
+        acc["station_dwells"].setdefault(st, []).append(dwell)
+        acc["epcs"].add(r["epc"])
+        acc["closed"] += 1
+        epc_map = acc["epc_station_dwells"].setdefault(r["epc"], {})
+        epc_map[st] = epc_map.get(st, 0) + dwell
+        spec = _spec_for_station(specs_by_name, st)
+        target = spec.get("target_part_dwell_seconds") if spec else None
+        if target and dwell > target:
+            acc["over_target"] += 1
+
+    drawings = []
+    for drawing, acc in by_drawing.items():
+        station_avgs = {}
+        total_avgs = []
+        slowest_station = None
+        slowest_avg = -1
+        for st in spine:
+            dwells = []
+            for raw_st, ds in acc["station_dwells"].items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    dwells.extend(ds)
+            avg = sum(dwells) / len(dwells) if dwells else None
+            med = _median(dwells) if dwells else None
+            p90 = _percentile(dwells, 90) if dwells else None
+            mn = min(dwells) if dwells else None
+            mx = max(dwells) if dwells else None
+            station_avgs[st] = {
+                "avg_seconds": round(avg, 1) if avg is not None else None,
+                "avg_display": _dwell_display(avg),
+                "median_seconds": med,
+                "median_display": _dwell_display(med),
+                "p90_seconds": round(p90, 1) if p90 is not None else None,
+                "p90_display": _dwell_display(p90),
+                "min_seconds": mn,
+                "min_display": _dwell_display(mn),
+                "max_seconds": mx,
+                "max_display": _dwell_display(mx),
+                "sample_size": len(dwells),
+            }
+            if avg is not None and avg > slowest_avg:
+                slowest_avg = avg
+                slowest_station = st
+
+        # Total process time per part = sum of station dwells for that EPC
+        part_totals = []
+        for epc, st_map in acc["epc_station_dwells"].items():
+            part_totals.append(sum(st_map.values()))
+        total_avg = sum(part_totals) / len(part_totals) if part_totals else None
+        total_med = _median(part_totals) if part_totals else None
+        total_p90 = _percentile(part_totals, 90) if part_totals else None
+
+        # Coefficient of variation on total times for "most variable"
+        variance_score = None
+        if len(part_totals) >= 2 and total_avg:
+            mean = total_avg
+            var = sum((x - mean) ** 2 for x in part_totals) / len(part_totals)
+            variance_score = round((var ** 0.5) / mean, 3) if mean else None
+
+        over_pct = round(100.0 * acc["over_target"] / acc["closed"], 1) if acc["closed"] else 0
+
+        drawings.append({
+            "drawing": drawing,
+            "series": acc["series"],
+            "parts_completed": len(acc["epcs"]),
+            "sessions_closed": acc["closed"],
+            "stations": station_avgs,
+            "total_avg_seconds": round(total_avg, 1) if total_avg is not None else None,
+            "total_avg_display": _dwell_display(total_avg),
+            "total_median_seconds": total_med,
+            "total_median_display": _dwell_display(total_med),
+            "total_p90_seconds": round(total_p90, 1) if total_p90 is not None else None,
+            "total_p90_display": _dwell_display(total_p90),
+            "total_min_seconds": min(part_totals) if part_totals else None,
+            "total_min_display": _dwell_display(min(part_totals) if part_totals else None),
+            "total_max_seconds": max(part_totals) if part_totals else None,
+            "total_max_display": _dwell_display(max(part_totals) if part_totals else None),
+            "slowest_station": slowest_station,
+            "parts_over_target": acc["over_target"],
+            "parts_over_target_pct": over_pct,
+            "variance_score": variance_score,
+        })
+
+    drawings.sort(key=lambda d: d.get("total_avg_seconds") or 0, reverse=True)
+
+    kpis = {
+        "slowest_drawing": None,
+        "fastest_drawing": None,
+        "most_variable_drawing": None,
+        "most_over_target_drawing": None,
+    }
+    with_avg = [d for d in drawings if d.get("total_avg_seconds") is not None]
+    if with_avg:
+        kpis["slowest_drawing"] = max(with_avg, key=lambda d: d["total_avg_seconds"])["drawing"]
+        kpis["fastest_drawing"] = min(with_avg, key=lambda d: d["total_avg_seconds"])["drawing"]
+    with_var = [d for d in drawings if d.get("variance_score") is not None]
+    if with_var:
+        kpis["most_variable_drawing"] = max(with_var, key=lambda d: d["variance_score"])["drawing"]
+    with_over = [d for d in drawings if d.get("parts_over_target_pct")]
+    if with_over:
+        kpis["most_over_target_drawing"] = max(with_over, key=lambda d: d["parts_over_target_pct"])["drawing"]
+
+    # Grouped bar chart payload: top drawings by volume
+    comparison = []
+    for d in sorted(drawings, key=lambda x: x["parts_completed"], reverse=True)[:12]:
+        row = {"drawing": d["drawing"], "series": d["series"], "stations": {}}
+        for st in spine:
+            st_stats = d["stations"].get(st) or {}
+            row["stations"][st] = st_stats.get("avg_seconds")
+        comparison.append(row)
+
+    return {
+        "drawings": drawings,
+        "kpis": kpis,
+        "comparison": comparison,
+        "spine": spine,
+    }
+
+
+def _build_trend_series(
+    db: sqlite3.Connection,
+    specs_by_name: dict,
+    days: int,
+) -> dict:
+    """Daily trend series for throughput, dwell, exceptions, orders completed."""
+    spine = progress_spine_names(specs_by_name)
+    final_station = _final_spine_station(spine)
+    today = datetime.now().astimezone().date()
+    day_keys = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days - 1, -1, -1)]
+
+    completed = db.execute(
+        """SELECT v.epc, v.station_name, v.dwell_seconds, v.exit_time, v.ibus_number, v.job_number
+           FROM vw_live_part_status v
+           WHERE v.session_status = ? AND v.dwell_seconds IS NOT NULL""",
+        (STATUS_CLOSED,),
+    ).fetchall()
+
+    day_total: dict[str, int] = {k: 0 for k in day_keys}
+    day_station: dict[str, dict[str, int]] = {k: {} for k in day_keys}
+    day_dwell: dict[str, dict[str, list]] = {k: {} for k in day_keys}
+    day_over: dict[str, int] = {k: 0 for k in day_keys}
+    day_closed: dict[str, int] = {k: 0 for k in day_keys}
+    day_orders: dict[str, set] = {k: set() for k in day_keys}
+
+    for r in completed:
+        local = _local_dt(r["exit_time"])
+        if not local:
+            continue
+        key = local.strftime("%Y-%m-%d")
+        if key not in day_total:
+            continue
+        st = r["station_name"] or STATION_NAME
+        day_total[key] += 1
+        day_closed[key] += 1
+        day_station[key][st] = day_station[key].get(st, 0) + 1
+        day_dwell[key].setdefault(st, []).append(int(r["dwell_seconds"]))
+        spec = _spec_for_station(specs_by_name, st)
+        target = spec.get("target_part_dwell_seconds") if spec else None
+        if target and int(r["dwell_seconds"]) > target:
+            day_over[key] += 1
+        if st == final_station or canonical_station(st) == canonical_station(final_station):
+            ibus = _normalize_ibus_key(r["ibus_number"], r["job_number"])
+            if ibus:
+                day_orders[key].add(ibus)
+
+    # Exception counts by day
+    day_exit_only = {k: 0 for k in day_keys}
+    day_abandoned = {k: 0 for k in day_keys}
+    for r in db.execute(
+        """SELECT session_status, exit_time, entry_time, updated_at
+           FROM part_station_sessions
+           WHERE session_status IN (?, ?)""",
+        (STATUS_EXIT_ONLY, STATUS_ABANDONED),
+    ):
+        ts = r["exit_time"] or r["entry_time"] or r["updated_at"]
+        local = _local_dt(ts)
+        if not local:
+            continue
+        key = local.strftime("%Y-%m-%d")
+        if key not in day_exit_only:
+            continue
+        if r["session_status"] == STATUS_EXIT_ONLY:
+            day_exit_only[key] += 1
+        else:
+            day_abandoned[key] += 1
+
+    throughput_by_day = [{"date": k, "completed": day_total[k]} for k in day_keys]
+    throughput_by_station_by_day = []
+    for k in day_keys:
+        row = {"date": k}
+        for st in spine:
+            total = 0
+            for raw_st, n in day_station[k].items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    total += n
+            row[st] = total
+        throughput_by_station_by_day.append(row)
+
+    dwell_by_station_by_day = []
+    for k in day_keys:
+        row = {"date": k}
+        for st in spine:
+            dwells = []
+            for raw_st, ds in day_dwell[k].items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    dwells.extend(ds)
+            avg = sum(dwells) / len(dwells) if dwells else None
+            row[st] = round(avg, 1) if avg is not None else None
+        dwell_by_station_by_day.append(row)
+
+    orders_completed_by_day = [
+        {"date": k, "completed": len(day_orders[k])} for k in day_keys
+    ]
+    pct_over_target_by_day = [
+        {
+            "date": k,
+            "pct": round(100.0 * day_over[k] / day_closed[k], 1) if day_closed[k] else 0,
+            "over": day_over[k],
+            "closed": day_closed[k],
+        }
+        for k in day_keys
+    ]
+    exceptions_by_day = [
+        {
+            "date": k,
+            "exit_only": day_exit_only[k],
+            "abandoned": day_abandoned[k],
+            "over_target": day_over[k],
+            "total": day_exit_only[k] + day_abandoned[k] + day_over[k],
+        }
+        for k in day_keys
+    ]
+
+    return {
+        "throughput_by_day": throughput_by_day,
+        "throughput_by_station_by_day": throughput_by_station_by_day,
+        "dwell_by_station_by_day": dwell_by_station_by_day,
+        "orders_completed_by_day": orders_completed_by_day,
+        "pct_over_target_by_day": pct_over_target_by_day,
+        "exceptions_by_day": exceptions_by_day,
+    }
 
 
 @app.route("/api/analytics")
 def analytics():
     db = get_db()
     days = request.args.get("days", type=int)
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+    # Custom range → approximate day window for period filters
+    if date_from and date_to and days is None:
+        try:
+            d0 = datetime.strptime(date_from[:10], "%Y-%m-%d").date()
+            d1 = datetime.strptime(date_to[:10], "%Y-%m-%d").date()
+            days = max(1, (d1 - d0).days + 1)
+        except ValueError:
+            days = 14
 
     counts = {STATUS_CLOSED: 0, STATUS_OPEN: 0, STATUS_EXIT_ONLY: 0, STATUS_ABANDONED: 0}
     for r in db.execute(
@@ -3710,6 +4266,10 @@ def analytics():
     specs_by_name = fetch_specs_by_name(db)
     machines = _build_machine_analytics(db, specs_by_name, days=days)
     ibus_orders = _build_ibus_order_analytics(db, specs_by_name)
+    attention = _build_attention_items(db, specs_by_name, ibus_orders, days=days if days is not None else 1)
+    drawing_analytics = _build_drawing_analytics(db, specs_by_name, days=days)
+    trend_days = days if days is not None else 14
+    trends = _build_trend_series(db, specs_by_name, days=trend_days)
 
     dwells = [int(r["dwell_seconds"]) for r in completed if r["dwell_seconds"] is not None]
     avg = sum(dwells) / len(dwells) if dwells else None
@@ -3743,23 +4303,12 @@ def analytics():
     stations.sort(key=lambda s: s["avg_dwell_seconds"], reverse=True)
     longest_station = stations[0] if stations else None
 
-    day_counts: dict[str, int] = {}
     hour_counts = [0] * 24
     for r in completed:
-        dt = _parse_ts(r["exit_time"])
-        if not dt:
-            continue
-        local = dt.astimezone()
-        key = local.strftime("%Y-%m-%d")
-        day_counts[key] = day_counts.get(key, 0) + 1
-        hour_counts[local.hour] += 1
+        h = _local_hour(r["exit_time"])
+        if h is not None:
+            hour_counts[h] += 1
 
-    today = datetime.now()
-    throughput_by_day = [
-        {"date": (today - timedelta(days=i)).strftime("%Y-%m-%d"),
-         "completed": day_counts.get((today - timedelta(days=i)).strftime("%Y-%m-%d"), 0)}
-        for i in range(13, -1, -1)
-    ]
     throughput_by_hour = [{"hour": h, "completed": hour_counts[h]} for h in range(24)]
     busiest_hour = None
     if any(hour_counts):
@@ -3779,6 +4328,7 @@ def analytics():
         for label, lo, hi in buckets
     ]
 
+    drawings_by_epc = _drawings_by_epc(db)
     longest_parts = sorted(
         completed,
         key=lambda r: int(r["dwell_seconds"]) if r["dwell_seconds"] is not None else 0,
@@ -3788,6 +4338,7 @@ def analytics():
         "epc":                r["epc"],
         "part_name":          r["part_name"],
         "part_type":          r["part_type"],
+        "drawing":            drawings_by_epc.get((r["epc"] or "").strip(), ""),
         "ibus_number":        r["ibus_number"],
         "work_order":         r["job_number"],
         "station_name":       r["station_name"],
@@ -3803,8 +4354,16 @@ def analytics():
     )
 
     progress_spine = progress_spine_names(specs_by_name)
-    bottleneck = max(machines, key=lambda m: m.get("avg_dwell_seconds") or 0) if machines else None
+    bottleneck = max(
+        (m for m in machines if m.get("on_progress_spine")),
+        key=lambda m: m.get("avg_dwell_seconds") or 0,
+        default=None,
+    )
     total_exceeding = sum(m.get("exceeding_target", 0) for m in machines)
+    parts_in_process = counts[STATUS_OPEN]
+    exception_attention = sum(
+        1 for i in attention if i.get("severity") in ("warn", "critical")
+    )
     db.close()
 
     return jsonify({
@@ -3825,6 +4384,7 @@ def analytics():
             "repeat_visits":    machines[0]["repeat_visits"] if machines else 0,
             "skipped_parts":    machines[0]["skipped_parts"] if machines else 0,
             "wrong_order_parts": machines[0]["wrong_order_parts"] if machines else 0,
+            "attention_count":  exception_attention,
         },
         "dwell": {
             "avg_seconds":     round(avg, 1) if avg is not None else None,
@@ -3840,9 +4400,17 @@ def analytics():
         "stations":           stations,
         "machines":           machines,
         "ibus_orders":        ibus_orders,
+        "attention_items":    attention,
+        "drawing_performance": drawing_analytics,
         "bottleneck":         bottleneck,
         "longest_station":    longest_station,
-        "throughput_by_day":  throughput_by_day,
+        "parts_in_process":   parts_in_process,
+        "throughput_by_day":  trends["throughput_by_day"],
+        "throughput_by_station_by_day": trends["throughput_by_station_by_day"],
+        "dwell_by_station_by_day": trends["dwell_by_station_by_day"],
+        "orders_completed_by_day": trends["orders_completed_by_day"],
+        "pct_over_target_by_day": trends["pct_over_target_by_day"],
+        "exceptions_by_day":  trends["exceptions_by_day"],
         "throughput_by_hour": throughput_by_hour,
         "busiest_hour":       busiest_hour,
         "dwell_distribution": distribution,
@@ -3851,6 +4419,260 @@ def analytics():
         "parts_summary":      parts_summary,
         "progress_spine":     progress_spine,
         "progress_method":    "weighted",
+    })
+
+
+@app.route("/api/analytics/orders/<ibus_number>")
+def analytics_order_detail(ibus_number: str):
+    """Detailed IBUS order analysis for the Orders drill-down."""
+    db = get_db()
+    ibus = _normalize_ibus_key(ibus_number)
+    specs_by_name = fetch_specs_by_name(db)
+    spine = progress_spine_names(specs_by_name)
+    orders = _build_ibus_order_analytics(db, specs_by_name)
+    order = next((o for o in orders if o.get("ibus_number") == ibus), None)
+    if not order:
+        db.close()
+        return jsonify({"error": "Order not found"}), 404
+
+    drawings_by_epc = _drawings_by_epc(db)
+    sessions = db.execute(
+        """SELECT v.*,
+                  (SELECT GROUP_CONCAT(o.operator_name, ', ')
+                   FROM part_operator_assignments poa
+                   JOIN operators o ON o.operator_id = poa.operator_id
+                   WHERE poa.session_id = v.session_id) AS operators
+           FROM vw_live_part_status v
+           WHERE UPPER(COALESCE(v.ibus_number, '')) = ?
+              OR UPPER('IBUS' || COALESCE(v.job_number, '')) = ?
+           ORDER BY COALESCE(v.entry_time, v.exit_time) DESC""",
+        (ibus, ibus),
+    ).fetchall()
+
+    parts: dict[str, dict] = {}
+    for r in sessions:
+        epc = r["epc"] or ""
+        if not epc:
+            continue
+        p = parts.setdefault(epc, {
+            "epc": epc,
+            "part_name": r["part_name"],
+            "drawing": drawings_by_epc.get(epc, ""),
+            "current_station": None,
+            "status": "pending",
+            "stations": {st: None for st in spine},
+            "total_dwell_seconds": 0,
+        })
+        st = r["station_name"] or ""
+        if r["session_status"] == STATUS_OPEN:
+            p["current_station"] = st
+            p["status"] = "in_process"
+        elif r["session_status"] == STATUS_CLOSED and p["status"] != "in_process":
+            # complete if finished insert; else in_process-ish
+            if st == _final_spine_station(spine) or (
+                canonical_station(st) == canonical_station(_final_spine_station(spine))
+            ):
+                p["status"] = "complete"
+            elif p["status"] == "pending":
+                p["status"] = "tracked"
+        for spine_st in spine:
+            if st == spine_st or (canonical_station(st) or st) == (canonical_station(spine_st) or spine_st):
+                if r["session_status"] == STATUS_CLOSED and r["dwell_seconds"] is not None:
+                    p["stations"][spine_st] = {
+                        "dwell_seconds": int(r["dwell_seconds"]),
+                        "dwell_display": _dwell_display(int(r["dwell_seconds"])),
+                        "exit_time": r["exit_time"],
+                        "operators": r["operators"],
+                    }
+                    p["total_dwell_seconds"] += int(r["dwell_seconds"])
+                elif r["session_status"] == STATUS_OPEN:
+                    p["stations"][spine_st] = {
+                        "dwell_seconds": None,
+                        "dwell_display": "in process",
+                        "entry_time": r["entry_time"],
+                        "operators": r["operators"],
+                    }
+
+    # BOM components not yet seen
+    wo = db.execute(
+        "SELECT * FROM work_orders WHERE UPPER(ibus_number) = ?", (ibus,)
+    ).fetchone()
+    missing_components = []
+    if wo:
+        comps = db.execute(
+            """SELECT epc, ref, drawing, status, product
+               FROM work_order_components WHERE work_order_id = ?""",
+            (wo["work_order_id"],),
+        ).fetchall()
+        seen = set(parts.keys())
+        for c in comps:
+            epc = (c["epc"] or "").strip()
+            if epc and epc not in seen:
+                missing_components.append({
+                    "epc": epc,
+                    "ref": c["ref"],
+                    "drawing": _drawing_label(c["drawing"]),
+                    "status": c["status"],
+                    "product": c["product"],
+                })
+
+    for p in parts.values():
+        p["total_dwell_display"] = _dwell_display(p["total_dwell_seconds"] or None)
+
+    # Exceptions for this order
+    attention = [
+        i for i in _build_attention_items(db, specs_by_name, [order], days=None)
+        if i.get("ibus_number") == ibus
+    ]
+
+    # ETA: remaining parts × avg cycle, rough
+    avg_cycle = order.get("avg_cycle_seconds")
+    remaining = max(0, (order.get("expected_parts") or 0) - (order.get("rfid_completed") or 0))
+    eta_seconds = int(avg_cycle * remaining) if avg_cycle and remaining else None
+
+    db.close()
+    return jsonify({
+        "order": order,
+        "parts": sorted(parts.values(), key=lambda p: (p["status"] != "in_process", p["epc"])),
+        "missing_components": missing_components,
+        "exceptions": attention,
+        "estimated_completion_seconds": eta_seconds,
+        "estimated_completion_display": _dwell_display(eta_seconds),
+        "progress_spine": spine,
+    })
+
+
+@app.route("/api/analytics/drawings/<path:drawing>")
+def analytics_drawing_detail(drawing: str):
+    """Drill-down: part times, distribution, operators for one drawing."""
+    db = get_db()
+    days = request.args.get("days", type=int)
+    specs_by_name = fetch_specs_by_name(db)
+    spine = progress_spine_names(specs_by_name)
+    drawings_by_epc = _drawings_by_epc(db)
+    target_drawing = drawing.strip()
+
+    matching_epcs = {epc for epc, d in drawings_by_epc.items() if d == target_drawing}
+    if not matching_epcs:
+        db.close()
+        return jsonify({"error": "Drawing not found"}), 404
+
+    rows = db.execute(
+        """SELECT v.*,
+                  (SELECT GROUP_CONCAT(o.operator_name, ', ')
+                   FROM part_operator_assignments poa
+                   JOIN operators o ON o.operator_id = poa.operator_id
+                   WHERE poa.session_id = v.session_id) AS operators
+           FROM vw_live_part_status v
+           WHERE v.session_status = ? AND v.dwell_seconds IS NOT NULL""",
+        (STATUS_CLOSED,),
+    ).fetchall()
+
+    sessions = []
+    by_day: dict[str, dict] = {}
+    for r in rows:
+        if (r["epc"] or "") not in matching_epcs:
+            continue
+        if days is not None and not _in_analytics_period(r["exit_time"], days):
+            continue
+        dwell = int(r["dwell_seconds"])
+        sessions.append({
+            "epc": r["epc"],
+            "part_name": r["part_name"],
+            "ibus_number": _normalize_ibus_key(r["ibus_number"], r["job_number"]),
+            "work_order": r["job_number"],
+            "station": r["station_name"],
+            "dwell_seconds": dwell,
+            "dwell_display": _dwell_display(dwell),
+            "exit_time": r["exit_time"],
+            "entry_time": r["entry_time"],
+            "operators": r["operators"],
+            "shift": _local_hour(r["exit_time"]),
+        })
+        local = _local_dt(r["exit_time"])
+        if local:
+            key = local.strftime("%Y-%m-%d")
+            day = by_day.setdefault(key, {"date": key, "completed_epcs": set(), "station_dwells": {}, "totals": []})
+            day["completed_epcs"].add(r["epc"])
+            day["station_dwells"].setdefault(r["station_name"] or "", []).append(dwell)
+
+    # Per-part totals
+    part_map: dict[str, dict] = {}
+    for s in sessions:
+        p = part_map.setdefault(s["epc"], {
+            "epc": s["epc"],
+            "part_name": s["part_name"],
+            "ibus_number": s["ibus_number"],
+            "stations": {},
+            "total_seconds": 0,
+            "operators": set(),
+        })
+        p["stations"][s["station"]] = {
+            "dwell_seconds": s["dwell_seconds"],
+            "dwell_display": s["dwell_display"],
+            "operators": s["operators"],
+            "exit_time": s["exit_time"],
+        }
+        p["total_seconds"] += s["dwell_seconds"]
+        if s["operators"]:
+            for name in str(s["operators"]).split(","):
+                name = name.strip()
+                if name:
+                    p["operators"].add(name)
+
+    parts = []
+    for p in part_map.values():
+        parts.append({
+            "epc": p["epc"],
+            "part_name": p["part_name"],
+            "ibus_number": p["ibus_number"],
+            "stations": p["stations"],
+            "total_seconds": p["total_seconds"],
+            "total_display": _dwell_display(p["total_seconds"]),
+            "operators": sorted(p["operators"]),
+        })
+    parts.sort(key=lambda x: x["total_seconds"], reverse=True)
+
+    summary = _build_drawing_analytics(db, specs_by_name, days=days)
+    drawing_row = next((d for d in summary["drawings"] if d["drawing"] == target_drawing), None)
+
+    trend = []
+    for key in sorted(by_day.keys()):
+        day = by_day[key]
+        row = {
+            "date": key,
+            "parts_completed": len(day["completed_epcs"]),
+            "stations": {},
+        }
+        totals = []
+        # approximate total = sum avg station? better: from part_map filtered by day — skip, use sum of dwells / epcs
+        epc_day_totals: dict[str, int] = {}
+        for s in sessions:
+            local = _local_dt(s["exit_time"])
+            if local and local.strftime("%Y-%m-%d") == key:
+                epc_day_totals[s["epc"]] = epc_day_totals.get(s["epc"], 0) + s["dwell_seconds"]
+        if epc_day_totals:
+            totals = list(epc_day_totals.values())
+        row["avg_total_seconds"] = round(sum(totals) / len(totals), 1) if totals else None
+        row["avg_total_display"] = _dwell_display(row["avg_total_seconds"])
+        for st in spine:
+            dwells = []
+            for raw_st, ds in day["station_dwells"].items():
+                if raw_st == st or (canonical_station(raw_st) or raw_st) == (canonical_station(st) or st):
+                    dwells.extend(ds)
+            avg = sum(dwells) / len(dwells) if dwells else None
+            row["stations"][st] = round(avg, 1) if avg is not None else None
+        trend.append(row)
+
+    db.close()
+    return jsonify({
+        "drawing": target_drawing,
+        "series": _series_from_drawing(target_drawing),
+        "summary": drawing_row,
+        "parts": parts,
+        "sessions": sessions[:200],
+        "trend": trend,
+        "progress_spine": spine,
     })
 
 

@@ -92,25 +92,46 @@ export function HorizontalBars({
  formatValue = v => v,
  accent = 'bobrick',
  emptyText = 'No data',
+ /** When true, each bar width = value / (d.target || max) — use for dwell÷target */
+ ratioMode = false,
 }) {
  if (!data || data.length === 0) {
   return <p className="text-sm text-[#8b939e] py-8 text-center">{emptyText}</p>
  }
- const max = Math.max(1, ...data.map(d => d.value ?? 0))
+ const peerMax = Math.max(1, ...data.map(d => d.value ?? 0))
  const barColor = {
   blue: BOBRICK_GRAD,
   violet: BOBRICK_GRAD,
   green: 'from-[#34d399] to-[#10b981]',
   amber: 'from-[#fbbf24] to-[#f59e0b]',
   bobrick: BOBRICK_GRAD,
+  danger: 'from-[#f87171] to-[#ef4444]',
  }[accent] ?? BOBRICK_GRAD
 
  return (
   <div className="space-y-3">
    {data.map((d, i) => {
-    const pct = ((d.value ?? 0) / max) * 100
+    const val = d.value ?? 0
+    let pct
+    let overTarget = false
+    if (ratioMode && d.target != null && d.target > 0) {
+     const ratio = val / d.target
+     pct = Math.min(ratio, 1) * 100
+     overTarget = ratio > 1
+    } else if (d.max != null && d.max > 0) {
+     pct = (val / d.max) * 100
+    } else {
+     pct = (val / peerMax) * 100
+    }
     const isSelected = !!d.highlight || !!d.is_selected
     const isMedian = !!d.is_median
+    const fillClass = overTarget
+     ? 'bg-gradient-to-r from-[#fbbf24] to-[#f59e0b]'
+     : isSelected
+      ? 'bg-gradient-to-r from-[#fbbf24] to-[#f59e0b]'
+      : isMedian
+       ? 'bg-[#4a5560]'
+       : `bg-gradient-to-r ${barColor}`
     return (
      <div key={i} className="group">
       <div className="flex items-center justify-between mb-1 text-sm">
@@ -122,23 +143,22 @@ export function HorizontalBars({
         {d.label}
        </span>
        <span className={`font-mono font-semibold tabular-nums shrink-0 ${
-        isSelected ? 'text-[#fbbf24]' : 'text-[#4dc4f4]'
+        overTarget ? 'text-[#fbbf24]' : isSelected ? 'text-[#fbbf24]' : 'text-[#4dc4f4]'
        }`}>
         {d.display ?? formatValue(d.value)}
        </span>
       </div>
       <div className="h-2.5 rounded-full bg-[#27272f] overflow-hidden">
        <div
-        style={{ width: `${Math.max(pct, (d.value ?? 0) > 0 ? 3 : 0)}%`, transitionDelay: `${i * 40}ms` }}
-        className={`h-full rounded-full transition-all duration-700 ${
-         isSelected
-          ? 'bg-gradient-to-r from-[#fbbf24] to-[#f59e0b]'
-          : isMedian
-           ? 'bg-[#4a5560]'
-           : `bg-gradient-to-r ${barColor}`
-        }`}
+        style={{ width: `${Math.max(pct, val > 0 ? 2 : 0)}%`, transitionDelay: `${i * 40}ms` }}
+        className={`h-full rounded-full transition-all duration-700 ${fillClass}`}
        />
       </div>
+      {ratioMode && d.target != null && d.target > 0 && (
+       <p className="text-[10px] text-[#8b939e] mt-0.5 tabular-nums">
+        {((val / d.target) * 100).toFixed(1)}% of target
+       </p>
+      )}
      </div>
     )
    })}
@@ -151,8 +171,8 @@ export function AreaChart({
  data,
  compareData,
  formatValue = v => v,
- primaryLabel = 'Operator',
- compareLabel = 'Station average',
+ primaryLabel = 'Throughput',
+ compareLabel = 'Compare',
 }) {
  const W = 600
  const H = 180
@@ -235,6 +255,153 @@ export function AreaChart({
    <div className="flex justify-between mt-1 text-[10px] text-[#8b939e]">
     {data.map((d, i) => (
      <span key={i} className={n > 8 && i % 2 !== 0 ? 'opacity-0' : ''}>{d.short ?? d.label}</span>
+    ))}
+   </div>
+  </div>
+ )
+}
+
+const SERIES_COLORS = ['#4dc4f4', '#34d399', '#fbbf24', '#f87171', '#a78bfa', '#fb7185', '#2dd4bf']
+
+/* ── Multi-series line chart ────────────────────────────────────────────────── */
+export function MultiLineChart({
+ series,
+ formatValue = v => v,
+ emptyText = 'No data',
+}) {
+ /** series: [{ id, label, color?, points: [{ label, short?, value }] }] */
+ if (!series?.length || !series.some(s => s.points?.length)) {
+  return <p className="text-sm text-[#8b939e] py-8 text-center">{emptyText}</p>
+ }
+ const W = 640
+ const H = 200
+ const PAD = { t: 14, r: 10, b: 10, l: 10 }
+ const allVals = series.flatMap(s => (s.points || []).map(p => p.value).filter(v => v != null && !Number.isNaN(v)))
+ const max = Math.max(1, ...allVals, 0.01)
+ const n = Math.max(...series.map(s => s.points?.length || 0), 1)
+ const innerW = W - PAD.l - PAD.r
+ const innerH = H - PAD.t - PAD.b
+ const stepX = n > 1 ? innerW / (n - 1) : 0
+ const y = v => PAD.t + innerH - ((v ?? 0) / max) * innerH
+ const x = i => PAD.l + i * stepX
+ const labels = series[0]?.points || []
+
+ return (
+  <div className="w-full">
+   <div className="flex flex-wrap gap-3 mb-2 text-[10px] text-[#8b939e]">
+    {series.map((s, i) => (
+     <span key={s.id || i} className="inline-flex items-center gap-1.5">
+      <span className="w-3 h-0.5 rounded" style={{ background: s.color || SERIES_COLORS[i % SERIES_COLORS.length] }} />
+      {s.label}
+     </span>
+    ))}
+   </div>
+   <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-48" preserveAspectRatio="none">
+    {series.map((s, si) => {
+     const color = s.color || SERIES_COLORS[si % SERIES_COLORS.length]
+     const pts = (s.points || []).map((p, i) => `${x(i)},${y(p.value ?? 0)}`).join(' ')
+     const dashed = s.dashed
+     return (
+      <g key={s.id || si}>
+       {pts && (
+        <polyline
+         points={pts}
+         fill="none"
+         stroke={color}
+         strokeWidth={dashed ? 1.75 : 2.25}
+         strokeLinejoin="round"
+         strokeLinecap="round"
+         strokeDasharray={dashed ? '5 4' : undefined}
+         opacity={dashed ? 0.85 : 1}
+        />
+       )}
+       {(s.points || []).map((p, i) => (
+        p.value == null ? null : (
+         <circle key={i} cx={x(i)} cy={y(p.value)} r="3" fill={color}>
+          <title>{`${s.label} · ${p.label}: ${formatValue(p.value)}`}</title>
+         </circle>
+        )
+       ))}
+      </g>
+     )
+    })}
+   </svg>
+   <div className="flex justify-between mt-1 text-[10px] text-[#8b939e]">
+    {labels.map((d, i) => (
+     <span key={i} className={n > 10 && i % 2 !== 0 ? 'opacity-0' : ''}>{d.short ?? d.label}</span>
+    ))}
+   </div>
+  </div>
+ )
+}
+
+/* ── Grouped vertical bars (e.g. drawing × station) ─────────────────────────── */
+export function GroupedBars({
+ groups,
+ keys,
+ colors = SERIES_COLORS,
+ formatValue = v => v,
+ emptyText = 'No data',
+ onSelect,
+}) {
+ /** groups: [{ label, short?, values: { [key]: number } }] */
+ if (!groups?.length || !keys?.length) {
+  return <p className="text-sm text-[#8b939e] py-8 text-center">{emptyText}</p>
+ }
+ const max = Math.max(
+  1,
+  ...groups.flatMap(g => keys.map(k => g.values?.[k] ?? 0)),
+ )
+
+ return (
+  <div className="space-y-2">
+   <div className="flex flex-wrap gap-3 text-[11px] text-[#8b939e]">
+    {keys.map((k, i) => (
+     <span key={k} className="inline-flex items-center gap-1.5">
+      <span className="w-2.5 h-2.5 rounded-sm" style={{ background: colors[i % colors.length] }} />
+      {k}
+     </span>
+    ))}
+   </div>
+   <div className="flex items-end gap-2 h-52 w-full overflow-x-auto">
+    {groups.map((g, gi) => (
+     <button
+      key={gi}
+      type="button"
+      onClick={() => onSelect?.(g)}
+      className="group/bar relative flex flex-col items-center justify-end h-full min-w-[3.25rem] flex-1 basis-0"
+     >
+      <div className="opacity-0 group-hover/bar:opacity-100 transition-opacity absolute -top-1
+ -translate-y-full z-10 px-2 py-1 rounded-md text-xs whitespace-nowrap
+               bg-[#18181d] text-[#eef2f7] border border-[#27272f] shadow-lg pointer-events-none">
+       <div className="font-semibold mb-0.5">{g.label}</div>
+       {keys.map((k, i) => (
+        <div key={k} className="text-[#8b939e]">
+         {k}: {g.values?.[k] != null ? formatValue(g.values[k]) : '—'}
+        </div>
+       ))}
+      </div>
+      <div className="flex items-end justify-center gap-0.5 w-full h-full">
+       {keys.map((k, i) => {
+        const val = g.values?.[k] ?? 0
+        const pct = (val / max) * 100
+        return (
+         <div
+          key={k}
+          style={{
+           height: `${Math.max(pct, val > 0 ? 4 : 0)}%`,
+           background: colors[i % colors.length],
+          }}
+          className={`rounded-t-sm transition-all duration-500 ${keys.length > 1 ? 'w-[22%]' : 'w-full'}
+                ${val === 0 ? 'min-h-[2px] !bg-[#27272f]' : ''}`}
+         />
+        )
+       })}
+      </div>
+      <span className="mt-1.5 text-[10px] leading-none text-[#8b939e] tabular-nums truncate max-w-full">
+       {g.short ?? g.label}
+      </span>
+     </button>
     ))}
    </div>
   </div>
