@@ -1,29 +1,27 @@
 """
 Offline RFID line simulator — no Zebra reader, no HTTP listener required.
 
-Loads parts from the ingested work_order_components table (or .R41/),
-injects fake antenna reads into SQLite, and pings the API so the dashboard
-updates live.
+The sim's only job is to emit fake antenna reads (same Zebra JSON shape the
+listener uses) into DwellTracker.ingest_batch(). Session open/close, Insert
+hold, order completion, and analytics are all handled by tracking/ + API —
+never by this script.
 
 Usage (from repo root):
-    python sim/run.py
-    python sim/run.py --ibus IBUS462064 --auto          # 34-part WO, ~60s pipeline
     python sim/run.py --ibus IBUS462064 --auto --duration 90
+    python sim/run.py --ibus IBUS900001 --auto --duration 45
+    python sim/run.py --ibus IBUS462064 --auto --clear   # wipe prior session history
 
-On start, clears RFID session history (keeps work orders / BOM) so the
-dashboard shows a clean run. Pass --no-clear to keep prior history.
-
-The sim calls the same DwellTracker.ingest_batch() as the Zebra listener —
-only the antenna reads are fake. Dashboard/API/DB behavior matches production.
+Pass --clear only when you want a clean slate. Default keeps existing sessions
+so a second work order does not erase the first from analytics.
 
 Move syntax (pick one):
     1 4                 part #1 -> antenna 4
     S17 1               REF S17 -> antenna 1
     move 1 3            same as above
-    move end            all parts -> Insert (100% complete)
-    auto [seconds]      pipeline all parts through the line
+    move end            all parts -> Insert antenna (completion via DwellTracker)
+    auto [seconds]      pipeline all parts through the line antennas
 
-Keep the API running (`python api.py`) for live dashboard chips.
+Keep the API running (`python api.py` / start.ps1) for live dashboard chips.
 """
 
 from __future__ import annotations
@@ -55,9 +53,9 @@ from r41.parse_r41 import list_r41_files, parse_r41_file  # noqa: E402
 from storage import DwellTracker  # noqa: E402
 
 DEFAULT_RSSI = -45
-START_ANTENNA = 7  # Tennoner Entry
-END_ANTENNA = 3    # Insert Station (= 100% / complete)
-# Real RFID spine after Tennoner entrance (same ports the listener uses).
+START_ANTENNA = 7  # Tennoner Entry — first antenna on a typical walk
+END_ANTENNA = 3    # Insert Station — last antenna on AUTO_PATH
+# Antenna ports only. Completion rules live in DwellTracker, not here.
 AUTO_PATH = (4, 6, 1, 2, 3)  # table → LBD → Gannomat → exit → Insert
 NOTIFY = {"url": "http://127.0.0.1:5001/api/notify"}
 
@@ -380,20 +378,17 @@ def _start_all_at(
     burst: int,
     antenna: int = START_ANTENNA,
 ) -> None:
+    """Emit entrance reads for every part. DwellTracker owns session lifecycle."""
     where = ANT_SHORT.get(antenna) or ANTENNA_CATALOG[antenna][0]
-    print(f"  Resetting {len(parts)} parts to [{antenna}] {where} …")
-    print("  (Brings completed orders back to the start for retesting)")
-    print("  Closing open sessions so dwell timers restart …")
+    print(f"  Sighting {len(parts)} parts at [{antenna}] {where} …")
     placed = 0
     for p in parts:
-        # Drop any open dwell/presence so the next entry starts a fresh timer
-        tracker.close_open_sessions_for_epc(p["epc"])
         _move(tracker, p, antenna, locations, burst, quiet=True, notify=False)
         if locations.get(p["epc"]) == antenna:
             placed += 1
     live = _notify_dashboard("sim_start")
     dash = "dashboard updated" if live else "dashboard offline"
-    print(f"  Done — {placed}/{len(parts)} at [{antenna}] with fresh dwell. ({dash})")
+    print(f"  Done — {placed}/{len(parts)} reads at [{antenna}]. ({dash})")
     print(f"  Move with:  <part#> <antenna#>   e.g.  1 4")
     print()
 
@@ -404,17 +399,20 @@ def _finish_all(
     locations: dict[str, int],
     burst: int,
 ) -> None:
-    """Send every part to Insert Station so the order hits 100% and completes."""
+    """Emit Insert-antenna reads for every part. Completion is DwellTracker's job."""
     where = ANT_SHORT.get(END_ANTENNA) or ANTENNA_CATALOG[END_ANTENNA][0]
-    print(f"  Finishing order - moving {len(parts)} parts to [{END_ANTENNA}] {where} ...")
+    print(
+        f"  Emitting Insert reads for {len(parts)} parts "
+        f"at [{END_ANTENNA}] {where} ..."
+    )
     for p in parts:
         _move(tracker, p, END_ANTENNA, locations, burst, quiet=True, notify=False)
-    # Safety net if the last Insert open didn't already close the order
-    if parts:
-        tracker.try_complete_ibus_order(parts[0]["epc"])
     live = _notify_dashboard("sim_finish")
     dash = "dashboard live" if live else "dashboard offline"
-    print(f"  Done - all parts at Insert (100%). Order should be Completed. ({dash})")
+    print(
+        f"  Done — all parts sighted at Insert. "
+        f"Order completion follows DwellTracker rules. ({dash})"
+    )
     print()
 
 
@@ -492,20 +490,23 @@ def _auto_run(
                 flush=True,
             )
     except KeyboardInterrupt:
-        print("\n  AUTO interrupted - finishing remaining parts at Insert ...")
+        print("\n  AUTO interrupted - emitting Insert reads for remaining parts ...")
         _finish_all(tracker, parts, locations, burst)
         return
 
-    # If the last Insert arrival didn't complete the order (e.g. early holds
-    # were idle-closed), re-assert every part at Insert and try again.
-    done = bool(parts) and tracker.try_complete_ibus_order(parts[0]["epc"])
-    if not done:
-        _finish_all(tracker, parts, locations, burst)
+    # Ensure every part got a final Insert sighting (path already ends at END_ANTENNA;
+    # re-emit only if something was skipped mid-run).
+    missing = [p for p in parts if locations.get(p["epc"]) != END_ANTENNA]
+    if missing:
+        _finish_all(tracker, missing, locations, burst)
     else:
         _notify_dashboard("sim_auto_done")
     elapsed = time.monotonic() - t_wall
     print()
-    print(f"  AUTO complete in {elapsed:.1f}s - order should be Completed IBUS.")
+    print(
+        f"  AUTO complete in {elapsed:.1f}s — "
+        f"reads finished; completion/analytics come from DwellTracker + API."
+    )
     print()
 
 
@@ -516,8 +517,8 @@ def _print_help() -> None:
   --------
   <part> <ant>             Move part to antenna  (e.g. 1 4  or  S17 1)
   move all <ant>           Move every part  (e.g.  move all 7  or  all 7)
-  move end / end / finish  Move every part to Insert → 100% complete
-  auto [seconds]           Pipeline all parts through the line (~60s default)
+  move end / end / finish  Emit Insert reads for every part
+  auto [seconds]           Pipeline antenna reads through the line (~60s default)
   list / l                 Show all parts
   map / ants / a           Show antenna map 1-7
   start / reset            Same as  move all {START_ANTENNA}
@@ -594,9 +595,14 @@ def main() -> int:
         help="Do not auto-place all parts at Tennoner entrance",
     )
     parser.add_argument(
+        "--clear",
+        action="store_true",
+        help="Wipe ALL RFID session history before this run (erases other WOs from analytics)",
+    )
+    parser.add_argument(
         "--no-clear",
         action="store_true",
-        help="Keep existing session history (default: clear tracking tables on start)",
+        help=argparse.SUPPRESS,  # legacy no-op; keeping history is now the default
     )
     parser.add_argument(
         "--no-operator-move",
@@ -628,14 +634,17 @@ def main() -> int:
     print(f"  {len(parts)} parts  |  live ping -> {NOTIFY['url']}")
     print("=" * 72)
 
-    if not args.no_clear:
+    if args.clear:
         cleared = _clear_tracking_db()
         total = sum(cleared.values())
-        print(f"  Cleared tracking DB ({total} rows) - clean slate for this run")
+        print(f"  Cleared tracking DB ({total} rows) — clean slate for this run")
+        print("  Note: other work orders lose session history until re-simulated.")
         for table, n in cleared.items():
             if n:
                 print(f"    {table}: {n}")
         _notify_dashboard("sim_clear")
+    else:
+        print("  Keeping prior session history (pass --clear for a full wipe)")
 
     tracker = DwellTracker()
     operator_mover_started = False

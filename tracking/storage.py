@@ -872,7 +872,11 @@ class DwellTracker:
         )
 
     def try_complete_ibus_order(self, epc: str) -> bool:
-        """Public hook (sim/tests): complete order if every part is at Insert."""
+        """Public hook for tests: re-check order completion for this EPC's WO.
+
+        Production and the offline sim rely on ingest_batch → _maybe_complete_ibus_order
+        when Insert reads arrive; callers should not need this for normal flow.
+        """
         summary: dict = {}
         with self._lock:
             self._maybe_complete_ibus_order(epc, summary)
@@ -919,8 +923,8 @@ class DwellTracker:
     def close_open_sessions_for_epc(self, epc: str) -> int:
         """Force-close every open dwell/presence session for this EPC.
 
-        Used by the sim when reseeding (move all 7) so the next entry
-        starts a fresh dwell timer instead of touching the old session.
+        Test/admin helper. Normal RFID (and the offline sim) should only
+        close sessions via ingest_batch antenna transitions and timeouts.
         """
         closed = 0
         now = datetime.now(timezone.utc)
