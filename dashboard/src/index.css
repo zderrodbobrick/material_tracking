@@ -5,19 +5,20 @@
 
 :root {
   color-scheme: dark;
-  /* Bobrick brand — black + light blue */
+  /* Bobrick brand — industrial dark + cyan accent */
   --bb-black: #08080a;
   --bb-surface: #111114;
-  --bb-elevated: #18181d;
-  --bb-border: #27272f;
+  --bb-elevated: #16161a;
+  --bb-border: #2a2a32;
   --bb-blue: #4dc4f4;
   --bb-blue-dark: #0099cc;
-  --bb-blue-glow: rgba(77, 196, 244, 0.15);
-  --bb-text: #eef2f7;
+  --bb-blue-glow: rgba(77, 196, 244, 0.08);
+  --bb-text: #e8ecf1;
   --bb-muted: #8b939e;
   --bb-success: #34d399;
   --bb-warn: #fbbf24;
   --bb-danger: #f87171;
+  --bb-radius: 6px;
 }
 
 html {
@@ -43,51 +44,34 @@ body {
 }
 
 /* ── Smooth theme switching ──────────────────────────────────────────────── */
-/* Only color-related properties so transforms/opacity animations stay snappy */
 *,
 *::before,
 *::after {
-  transition-property: background-color, border-color, color, fill, stroke, box-shadow;
-  transition-duration: 250ms;
-  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-property: background-color, border-color, color, fill, stroke;
+  transition-duration: 150ms;
+  transition-timing-function: ease;
 }
 
 /* ── Keyframes ───────────────────────────────────────────────────────────── */
 @keyframes fade-in {
-  from { opacity: 0; transform: translateY(10px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes fade-in-scale {
-  from { opacity: 0; transform: scale(0.96) translateY(8px); }
-  to   { opacity: 1; transform: scale(1) translateY(0); }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 @keyframes slide-down {
-  from { opacity: 0; transform: translateY(-12px); }
+  from { opacity: 0; transform: translateY(-6px); }
   to   { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes row-in {
-  from { opacity: 0; transform: translateX(-8px); }
-  to   { opacity: 1; transform: translateX(0); }
-}
-
-@keyframes shimmer {
-  0%   { background-position: -480px 0; }
-  100% { background-position: 480px 0; }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 @keyframes pulse-ring {
-  0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.5); }
-  70%  { box-shadow: 0 0 0 6px rgba(34, 197, 94, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
-}
-
-@keyframes value-pop {
-  0%   { transform: scale(1); }
-  40%  { transform: scale(1.12); }
-  100% { transform: scale(1); }
+  0%   { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.45); }
+  70%  { box-shadow: 0 0 0 5px rgba(52, 211, 153, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
 }
 
 @keyframes radar-sweep {
@@ -100,42 +84,33 @@ body {
   80%, 100% { transform: scale(2.2); opacity: 0; }
 }
 
-@keyframes float-up {
-  from { opacity: 0; transform: translateY(24px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
-
 @keyframes ibus-complete-glow {
-  0%   { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55); transform: scale(1); }
-  40%  { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0.12); transform: scale(1.03); }
-  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); transform: scale(1); }
+  0%   { background-color: transparent; }
+  40%  { background-color: rgba(52, 211, 153, 0.12); }
+  100% { background-color: transparent; }
 }
 
 @keyframes ibus-depart {
-  0%   { opacity: 1; transform: scale(1) translateY(0); filter: saturate(1); }
-  100% { opacity: 0; transform: scale(0.82) translateY(-18px); filter: saturate(1.2); }
+  0%   { opacity: 1; }
+  100% { opacity: 0; }
 }
 
-@keyframes grid-drift {
-  from { background-position: 0 0; }
-  to   { background-position: 40px 40px; }
+@keyframes drawer-in {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
 }
 
 /* ── Animation utilities ─────────────────────────────────────────────────── */
-.animate-fade-in       { animation: fade-in 0.45s cubic-bezier(0.4, 0, 0.2, 1) both; }
-.animate-fade-in-scale { animation: fade-in-scale 0.5s cubic-bezier(0.34, 1.56, 0.64, 1) both; }
-.animate-slide-down    { animation: slide-down 0.5s cubic-bezier(0.4, 0, 0.2, 1) both; }
-.animate-row-in        { animation: row-in 0.35s ease-out both; }
+.animate-fade-in       { animation: fade-in 0.2s ease both; }
+.animate-slide-down    { animation: slide-down 0.25s ease both; }
+.animate-row-in        { animation: row-in 0.2s ease both; }
 .animate-pulse-ring    { animation: pulse-ring 2s ease-out infinite; }
-.animate-value-pop     { animation: value-pop 0.4s ease-out; }
 .animate-radar-sweep   { animation: radar-sweep 6s linear infinite; }
 .animate-ping-slow     { animation: ping-slow 3s cubic-bezier(0, 0, 0.2, 1) infinite; }
-.animate-float-up      { animation: float-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) both; }
-.animate-grid-drift    { animation: grid-drift 3s linear infinite; }
 .animate-ibus-complete { animation: ibus-complete-glow 0.85s ease-out both; }
-.animate-ibus-depart   { animation: ibus-depart 1.05s cubic-bezier(0.4, 0, 0.2, 1) both; }
+.animate-ibus-depart   { animation: ibus-depart 0.7s ease both; }
+.animate-drawer-in     { animation: drawer-in 0.2s ease both; }
 
-/* Respect reduced-motion preference */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;
@@ -146,24 +121,23 @@ body {
 
 /* ── Custom scrollbar ────────────────────────────────────────────────────── */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.4);
-  border-radius: 9999px;
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 4px;
   border: 2px solid transparent;
   background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(77, 196, 244, 0.45);
+  background: rgba(77, 196, 244, 0.4);
   background-clip: padding-box;
 }
 
-/* Bobrick analytics shell */
 .bobrick-shell {
   --color-surface: var(--bb-surface);
   --color-elevated: var(--bb-elevated);
@@ -173,41 +147,74 @@ body {
   --color-muted: var(--bb-muted);
 }
 
-/* Bobrick UI primitives — used app-wide */
+/* Bobrick UI primitives — industrial / operational */
 @layer components {
   .bb-panel {
-    @apply rounded-xl overflow-hidden shadow-sm;
-    animation: fade-in 0.45s cubic-bezier(0.4, 0, 0.2, 1) both;
+    @apply overflow-hidden;
+    border-radius: var(--bb-radius);
     background-color: var(--bb-elevated);
     border: 1px solid var(--bb-border);
   }
   .bb-panel-header {
-    @apply px-5 py-4 flex flex-wrap items-center justify-between gap-3 shrink-0;
+    @apply px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 shrink-0;
     border-bottom: 1px solid var(--bb-border);
   }
   .bb-title {
-    @apply flex items-center gap-2 text-base font-semibold;
+    @apply flex items-center gap-2 text-sm font-semibold;
     color: var(--bb-text);
   }
   .bb-subtitle {
     @apply text-xs mt-0.5;
     color: var(--bb-muted);
   }
+  .bb-section {
+    @apply space-y-3;
+  }
+  .bb-section-title {
+    @apply text-xs font-semibold uppercase tracking-wider;
+    color: var(--bb-muted);
+  }
   .bb-card {
-    @apply rounded-xl p-4 transition-[transform,box-shadow,border-color] duration-300;
+    @apply p-3;
+    border-radius: var(--bb-radius);
     background-color: var(--bb-elevated);
     border: 1px solid var(--bb-border);
   }
-  .bb-card:hover {
-    @apply -translate-y-0.5 shadow-lg;
-    border-color: color-mix(in srgb, var(--bb-blue) 35%, var(--bb-border));
+  .bb-kpi-strip {
+    @apply flex flex-wrap items-stretch divide-x;
+    border-radius: var(--bb-radius);
+    background-color: var(--bb-elevated);
+    border: 1px solid var(--bb-border);
+    border-color: var(--bb-border);
+  }
+  .bb-kpi-strip > * {
+    @apply px-4 py-3 min-w-[7rem] flex-1;
+    border-color: var(--bb-border);
   }
   .bb-kpi-label {
-    @apply text-xs font-semibold uppercase tracking-wider leading-none;
+    @apply text-[10px] font-semibold uppercase tracking-wider leading-none;
     color: var(--bb-muted);
   }
+  .bb-kpi-value {
+    @apply text-xl font-semibold tabular-nums mt-1;
+    color: var(--bb-text);
+  }
+  .bb-summary-bar {
+    @apply flex flex-wrap items-center gap-x-5 gap-y-1 px-3 py-2 text-sm;
+    border-radius: var(--bb-radius);
+    background-color: var(--bb-elevated);
+    border: 1px solid var(--bb-border);
+  }
+  .bb-summary-bar .bb-stat-label {
+    color: var(--bb-muted);
+  }
+  .bb-summary-bar .bb-stat-value {
+    @apply font-semibold tabular-nums;
+    color: var(--bb-text);
+  }
   .bb-input {
-    @apply px-3 py-1.5 text-sm rounded-lg transition-colors focus:outline-none focus:ring-2;
+    @apply px-2.5 py-1.5 text-sm transition-colors focus:outline-none focus:ring-1;
+    border-radius: var(--bb-radius);
     background-color: var(--bb-black);
     border: 1px solid var(--bb-border);
     color: var(--bb-text);
@@ -217,17 +224,47 @@ body {
   }
   .bb-input:focus {
     --tw-ring-color: color-mix(in srgb, var(--bb-blue) 50%, transparent);
-    border-color: transparent;
+    border-color: var(--bb-blue);
+  }
+  /* Editable table fields — higher contrast than surrounding surface */
+  .bb-field-input {
+    @apply px-2 py-1.5 text-sm font-mono tabular-nums transition-colors focus:outline-none focus:ring-1;
+    border-radius: var(--bb-radius);
+    background-color: #0c0c10;
+    border: 1px solid #3a3a44;
+    color: var(--bb-text);
+  }
+  .bb-field-input::placeholder {
+    color: var(--bb-muted);
+    font-family: inherit;
+    font-variant-numeric: normal;
+  }
+  .bb-field-input:hover {
+    border-color: #52525c;
+  }
+  .bb-field-input:focus {
+    --tw-ring-color: color-mix(in srgb, var(--bb-blue) 45%, transparent);
+    border-color: var(--bb-blue);
+    background-color: #08080a;
   }
   .bb-select {
-    @apply px-3 py-1.5 text-sm rounded-lg transition-colors focus:outline-none focus:ring-2;
+    @apply px-2.5 py-1.5 text-sm transition-colors focus:outline-none focus:ring-1;
+    border-radius: var(--bb-radius);
     background-color: var(--bb-black);
     border: 1px solid var(--bb-border);
     color: var(--bb-text);
   }
   .bb-select:focus {
     --tw-ring-color: color-mix(in srgb, var(--bb-blue) 50%, transparent);
-    border-color: transparent;
+    border-color: var(--bb-blue);
+  }
+  .bb-table-wrap {
+    @apply overflow-x-auto;
+    border-radius: var(--bb-radius);
+    border: 1px solid var(--bb-border);
+  }
+  .bb-table {
+    @apply w-full text-sm;
   }
   .bb-table-head {
     @apply text-left;
@@ -235,18 +272,27 @@ body {
     border-bottom: 1px solid var(--bb-border);
   }
   .bb-table-head th {
-    @apply px-4 py-2.5 font-semibold whitespace-nowrap text-sm;
+    @apply px-3 py-2 font-semibold whitespace-nowrap text-[11px] uppercase tracking-wider;
     color: var(--bb-muted);
   }
   .bb-table-row {
-    border-bottom: 1px solid color-mix(in srgb, var(--bb-border) 80%, transparent);
-    @apply transition-colors;
+    border-bottom: 1px solid color-mix(in srgb, var(--bb-border) 70%, transparent);
+  }
+  .bb-table-row:last-child {
+    border-bottom: none;
   }
   .bb-table-row:hover {
     background-color: var(--bb-blue-glow);
   }
+  .bb-table-row td {
+    @apply px-3 py-2;
+  }
+  .bb-table-row-active {
+    background-color: color-mix(in srgb, var(--bb-blue) 10%, transparent);
+  }
   .bb-btn-primary {
-    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors;
+    @apply inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-semibold transition-colors;
+    border-radius: var(--bb-radius);
     background-color: var(--bb-blue);
     color: var(--bb-black);
   }
@@ -254,43 +300,85 @@ body {
     filter: brightness(1.08);
   }
   .bb-btn-ghost {
-    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors;
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1.5 text-sm font-medium transition-colors;
+    border-radius: var(--bb-radius);
     color: var(--bb-muted);
   }
   .bb-btn-ghost:hover {
     color: var(--bb-text);
-    background-color: rgba(255, 255, 255, 0.05);
+    background-color: rgba(255, 255, 255, 0.04);
+  }
+  .bb-btn-outline {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium transition-colors;
+    border-radius: var(--bb-radius);
+    border: 1px solid var(--bb-border);
+    color: var(--bb-muted);
+    background: transparent;
+  }
+  .bb-btn-outline:hover {
+    color: var(--bb-text);
+    border-color: color-mix(in srgb, var(--bb-blue) 40%, var(--bb-border));
+  }
+  .bb-btn-outline-active {
+    color: var(--bb-blue);
+    border-color: color-mix(in srgb, var(--bb-blue) 50%, var(--bb-border));
+    background-color: var(--bb-blue-glow);
   }
   .bb-accent-icon {
     color: var(--bb-blue);
   }
   .bb-badge-blue {
-    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    @apply inline-flex items-center px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap;
+    border-radius: 4px;
     background-color: color-mix(in srgb, var(--bb-blue) 12%, transparent);
     color: var(--bb-blue);
-    border-color: color-mix(in srgb, var(--bb-blue) 30%, transparent);
   }
   .bb-badge-green {
-    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    @apply inline-flex items-center px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap;
+    border-radius: 4px;
     background-color: color-mix(in srgb, var(--bb-success) 12%, transparent);
     color: var(--bb-success);
-    border-color: color-mix(in srgb, var(--bb-success) 30%, transparent);
   }
   .bb-badge-warn {
-    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
+    @apply inline-flex items-center px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap;
+    border-radius: 4px;
     background-color: color-mix(in srgb, var(--bb-warn) 12%, transparent);
     color: var(--bb-warn);
-    border-color: color-mix(in srgb, var(--bb-warn) 30%, transparent);
+  }
+  .bb-badge-danger {
+    @apply inline-flex items-center px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap;
+    border-radius: 4px;
+    background-color: color-mix(in srgb, var(--bb-danger) 12%, transparent);
+    color: var(--bb-danger);
   }
   .bb-badge-muted {
-    @apply inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium whitespace-nowrap border;
-    background-color: rgba(255, 255, 255, 0.05);
+    @apply inline-flex items-center px-1.5 py-0.5 text-[11px] font-medium whitespace-nowrap;
+    border-radius: 4px;
+    background-color: rgba(255, 255, 255, 0.04);
     color: var(--bb-muted);
-    border-color: var(--bb-border);
   }
-  .bb-divide {
-    @apply divide-y;
-    --tw-divide-opacity: 1;
-    border-color: color-mix(in srgb, var(--bb-border) 80%, transparent);
+  .bb-status-dot {
+    @apply inline-block w-1.5 h-1.5 rounded-full shrink-0;
+  }
+  .bb-drawer-backdrop {
+    @apply fixed inset-0 z-40 bg-black/50;
+  }
+  .bb-drawer {
+    @apply fixed top-0 right-0 z-50 h-full w-full max-w-lg overflow-y-auto shadow-xl;
+    background-color: var(--bb-surface);
+    border-left: 1px solid var(--bb-border);
+    animation: drawer-in 0.2s ease both;
+  }
+  .bb-empty {
+    @apply py-8 text-center text-sm;
+    color: var(--bb-muted);
+  }
+  .bb-page-title {
+    @apply text-lg font-semibold;
+    color: var(--bb-text);
+  }
+  .bb-page-sub {
+    @apply text-sm mt-0.5;
+    color: var(--bb-muted);
   }
 }

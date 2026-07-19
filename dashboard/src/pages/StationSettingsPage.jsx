@@ -1,334 +1,581 @@
-import { useCallback, useEffect, useState } from 'react'
-import {
- Settings, Factory, Save, RotateCcw, Clock, Users, Gauge,
- AlertTriangle, Route, Info,
-} from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { GripVertical, HelpCircle } from 'lucide-react'
 import { apiFetch, apiPut } from '../api'
-import { Panel } from '../components/Panel'
+import { FloorPlanEditor } from '../components/FloorPlanEditor'
+
+/** Seed defaults mirrored from tracking/station_specs.py */
+const SPINE_DEFAULTS = {
+ Tenoner: { target_part_dwell_seconds: 180, target_operator_dwell_seconds: 60, max_dwell_seconds: 600, target_pieces_per_hour: 8, progress_spine_index: 0, on_progress_spine: true },
+ Tennoner: { target_part_dwell_seconds: 180, target_operator_dwell_seconds: 60, max_dwell_seconds: 600, target_pieces_per_hour: 8, progress_spine_index: 0, on_progress_spine: true },
+ LBD: { target_part_dwell_seconds: 90, target_operator_dwell_seconds: 30, max_dwell_seconds: 300, target_pieces_per_hour: 12, progress_spine_index: 1, on_progress_spine: true },
+ Gannomat: { target_part_dwell_seconds: 120, target_operator_dwell_seconds: 45, max_dwell_seconds: 480, target_pieces_per_hour: 10, progress_spine_index: 2, on_progress_spine: true },
+ 'Insert Station': { target_part_dwell_seconds: 60, target_operator_dwell_seconds: 30, max_dwell_seconds: 240, target_pieces_per_hour: 15, progress_spine_index: 3, on_progress_spine: true },
+ Anderson: { target_part_dwell_seconds: 150, target_operator_dwell_seconds: 45, max_dwell_seconds: 480, target_pieces_per_hour: null, progress_spine_index: null, on_progress_spine: false },
+}
+
+const FALLBACK_DEFAULTS = {
+ target_part_dwell_seconds: 120,
+ target_operator_dwell_seconds: 45,
+ max_dwell_seconds: 480,
+ target_pieces_per_hour: null,
+ progress_spine_index: null,
+ on_progress_spine: false,
+}
+
+const COLUMNS = [
+ { key: 'machine', label: 'Machine' },
+ {
+  key: 'part',
+  label: 'Part dwell target',
+  tip: 'Expected average time a part spends at this machine. Used for weighted IBUS progress and vs-target analytics.',
+ },
+ {
+  key: 'operator',
+  label: 'Operator dwell target',
+  tip: 'Normal RTLS presence time for an operator at this station.',
+ },
+ {
+  key: 'alert',
+  label: 'Slow-part threshold',
+  tip: 'Flag parts that dwell longer than this duration.',
+ },
+ {
+  key: 'throughput',
+  label: 'Target parts/hour',
+  tip: 'Throughput goal for this station. Leave blank if not configured.',
+ },
+ {
+  key: 'in_flow',
+  label: 'In flow',
+  tip: 'Include this station in the production sequence used for IBUS progress.',
+ },
+ { key: 'notes', label: 'Notes' },
+]
 
 function formatSeconds(sec) {
  if (sec == null || sec === '') return '—'
  const n = Number(sec)
  if (!Number.isFinite(n) || n < 0) return '—'
- if (n < 60) return `${n}s`
+ if (n === 0) return '0 sec'
+ if (n < 60) return `${n} sec`
  const m = Math.floor(n / 60)
  const s = n % 60
- return s ? `${m}m ${s}s` : `${m}m`
+ if (s === 0) return `${m} min`
+ return `${m} min ${s} sec`
+}
+
+function secondsToParts(sec) {
+ if (sec == null || sec === '') return { min: '', sec: '' }
+ const n = Number(sec)
+ if (!Number.isFinite(n) || n < 0) return { min: '', sec: '' }
+ return { min: String(Math.floor(n / 60)), sec: String(n % 60) }
+}
+
+function partsToSeconds(min, sec) {
+ if (min === '' && sec === '') return null
+ const m = min === '' ? 0 : Number(min)
+ const s = sec === '' ? 0 : Number(sec)
+ if (!Number.isFinite(m) || !Number.isFinite(s) || m < 0 || s < 0) return null
+ return Math.round(m * 60 + s)
+}
+
+function Tip({ text }) {
+ if (!text) return null
+ return (
+  <span className="inline-flex ml-1 align-middle text-[#5c6370] hover:text-[#8b939e]" title={text}>
+   <HelpCircle className="w-3 h-3" />
+  </span>
+ )
+}
+
+function DurationField({ value, onChange, ariaLabel }) {
+ const parts = secondsToParts(value)
+ const [min, setMin] = useState(parts.min)
+ const [sec, setSec] = useState(parts.sec)
+
+ useEffect(() => {
+  const p = secondsToParts(value)
+  setMin(p.min)
+  setSec(p.sec)
+ }, [value])
+
+ const commit = (nextMin, nextSec) => {
+  onChange(partsToSeconds(nextMin, nextSec))
+ }
+
+ return (
+  <div className="space-y-1">
+   <div className="flex items-center gap-1" aria-label={ariaLabel}>
+    <input
+     type="number"
+     min={0}
+     value={min}
+     onChange={e => {
+      setMin(e.target.value)
+      commit(e.target.value, sec)
+     }}
+     className="bb-field-input w-12 text-center"
+     placeholder="0"
+    />
+    <span className="text-[11px] text-[#8b939e]">min</span>
+    <input
+     type="number"
+     min={0}
+     max={59}
+     value={sec}
+     onChange={e => {
+      setSec(e.target.value)
+      commit(min, e.target.value)
+     }}
+     className="bb-field-input w-12 text-center"
+     placeholder="0"
+    />
+    <span className="text-[11px] text-[#8b939e]">sec</span>
+   </div>
+   <p className="text-xs text-[#eef2f7]/80 tabular-nums">{formatSeconds(value)}</p>
+  </div>
+ )
 }
 
 function vsTargetBadge(pct, status) {
  if (pct == null) return null
  const cls = status === 'on_target'
-  ? 'bg-[#34d399]/15 text-[#34d399]'
+  ? 'bb-badge-green'
   : status === 'slightly_over'
-   ? 'bg-[#fbbf24]/15 text-[#fbbf24]'
-   : 'bg-[#f87171]/15 text-[#f87171]'
+   ? 'bb-badge-warn'
+   : 'bb-badge-danger'
  return (
-  <span className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-semibold tabular-nums ${cls}`}>
+  <span className={`${cls} mt-1`}>
    {pct}% of target
   </span>
  )
 }
 
-function SpecRow({ row, onSave, saving }) {
- const [draft, setDraft] = useState(row)
- const dirty = JSON.stringify(draft) !== JSON.stringify(row)
-
- useEffect(() => {
-  setDraft(row)
- }, [row])
-
- const set = (key, val) => setDraft(d => ({ ...d, [key]: val }))
-
- const handleSave = () => {
-  onSave(draft.station_id, {
-   target_part_dwell_seconds: draft.target_part_dwell_seconds === '' ? null : Number(draft.target_part_dwell_seconds),
-   target_operator_dwell_seconds: draft.target_operator_dwell_seconds === '' ? null : Number(draft.target_operator_dwell_seconds),
-   max_dwell_seconds: draft.max_dwell_seconds === '' ? null : Number(draft.max_dwell_seconds),
-   target_pieces_per_hour: draft.target_pieces_per_hour === '' ? null : Number(draft.target_pieces_per_hour),
-   progress_spine_index: draft.on_progress_spine
-    ? (draft.progress_spine_index === '' ? null : Number(draft.progress_spine_index))
-    : null,
-   on_progress_spine: !!draft.on_progress_spine,
-   notes: draft.notes ?? '',
-  })
+function editablePayload(row) {
+ return {
+  target_part_dwell_seconds: row.target_part_dwell_seconds,
+  target_operator_dwell_seconds: row.target_operator_dwell_seconds,
+  max_dwell_seconds: row.max_dwell_seconds,
+  target_pieces_per_hour: row.target_pieces_per_hour,
+  progress_spine_index: row.on_progress_spine
+   ? (row.progress_spine_index == null || row.progress_spine_index === '' ? null : Number(row.progress_spine_index))
+   : null,
+  on_progress_spine: !!row.on_progress_spine,
+  notes: row.notes ?? '',
  }
+}
 
- return (
-  <tr className="border-b border-[#27272f]/80 align-top">
-   <td className="px-3 py-3">
-    <div className="font-medium text-sm text-[#eef2f7]">{draft.station_name}</div>
-    <div className="text-[11px] text-[#8b939e]">{draft.station_type ?? '—'}</div>
-    {draft.on_progress_spine && (
-     <span className="inline-flex items-center gap-1 mt-1 text-[10px] font-semibold text-[#4dc4f4]">
-      <Route className="w-3 h-3" /> Progress spine
-     </span>
-    )}
-   </td>
-   <td className="px-3 py-3">
-    <label className="block text-[10px] uppercase tracking-wider text-[#8b939e] mb-1">Part dwell (sec)</label>
-    <input
-     type="number"
-     min={0}
-     value={draft.target_part_dwell_seconds ?? ''}
-     onChange={e => set('target_part_dwell_seconds', e.target.value)}
-     className="w-24 px-2 py-1.5 rounded-lg text-sm font-mono border border-[#27272f] 
- bg-[#08080a] text-[#eef2f7]"
-    />
-    <p className="text-[10px] text-[#8b939e] mt-1">{formatSeconds(draft.target_part_dwell_seconds)} target</p>
-    {draft.actual_part_dwell_seconds != null && (
-     <div className="mt-1 space-y-0.5">
-      <p className="text-[10px] text-[#8b939e]">Actual: {formatSeconds(draft.actual_part_dwell_seconds)}</p>
-      {vsTargetBadge(draft.vs_target_pct, draft.vs_target_status)}
-     </div>
-    )}
-   </td>
-   <td className="px-3 py-3">
-    <label className="block text-[10px] uppercase tracking-wider text-[#8b939e] mb-1">Operator dwell (sec)</label>
-    <input
-     type="number"
-     min={0}
-     value={draft.target_operator_dwell_seconds ?? ''}
-     onChange={e => set('target_operator_dwell_seconds', e.target.value)}
-     className="w-24 px-2 py-1.5 rounded-lg text-sm font-mono border border-[#27272f] 
- bg-[#08080a] text-[#eef2f7]"
-    />
-    <p className="text-[10px] text-[#8b939e] mt-1">{formatSeconds(draft.target_operator_dwell_seconds)} target</p>
-    {draft.actual_operator_dwell_seconds != null && (
-     <div className="mt-1 space-y-0.5">
-      <p className="text-[10px] text-[#8b939e]">Actual: {formatSeconds(draft.actual_operator_dwell_seconds)}</p>
-      {vsTargetBadge(draft.operator_vs_target_pct, draft.operator_vs_target_status)}
-     </div>
-    )}
-   </td>
-   <td className="px-3 py-3">
-    <label className="block text-[10px] uppercase tracking-wider text-[#8b939e] mb-1">Max alert (sec)</label>
-    <input
-     type="number"
-     min={0}
-     value={draft.max_dwell_seconds ?? ''}
-     onChange={e => set('max_dwell_seconds', e.target.value)}
-     className="w-24 px-2 py-1.5 rounded-lg text-sm font-mono border border-[#27272f] 
- bg-[#08080a] text-[#eef2f7]"
-    />
-    <p className="text-[10px] text-[#8b939e] mt-1 flex items-center gap-1">
-     <AlertTriangle className="w-3 h-3" /> Slow-part flag
-    </p>
-   </td>
-   <td className="px-3 py-3">
-    <label className="block text-[10px] uppercase tracking-wider text-[#8b939e] mb-1">Pieces / hr</label>
-    <input
-     type="number"
-     min={0}
-     step={0.5}
-     value={draft.target_pieces_per_hour ?? ''}
-     onChange={e => set('target_pieces_per_hour', e.target.value)}
-     className="w-20 px-2 py-1.5 rounded-lg text-sm font-mono border border-[#27272f] 
- bg-[#08080a] text-[#eef2f7]"
-    />
-   </td>
-   <td className="px-3 py-3">
-    <label className="flex items-center gap-2 text-sm cursor-pointer">
-     <input
-      type="checkbox"
-      checked={!!draft.on_progress_spine}
-      onChange={e => set('on_progress_spine', e.target.checked)}
-      className="rounded border-[#27272f] text-[#a78bfa] focus:ring-violet-500"
-     />
-     <span className="text-xs text-[#8b939e] dark:text-[#8b939e]">On spine</span>
-    </label>
-    {draft.on_progress_spine && (
-     <div className="mt-2">
-      <label className="block text-[10px] uppercase tracking-wider text-[#8b939e] mb-1">Order (1 = first)</label>
-      <input
-       type="number"
-       min={1}
-       value={draft.progress_spine_index == null || draft.progress_spine_index === ''
-         ? ''
-         : Number(draft.progress_spine_index) + 1}
-       onChange={e => {
-         const raw = e.target.value
-         set('progress_spine_index', raw === '' ? '' : Math.max(0, Number(raw) - 1))
-       }}
-       className="w-16 px-2 py-1.5 rounded-lg text-sm font-mono bb-input"
-      />
-     </div>
-    )}
-   </td>
-   <td className="px-3 py-3 min-w-[8rem]">
-    <input
-     type="text"
-     value={draft.notes ?? ''}
-     onChange={e => set('notes', e.target.value)}
-     placeholder="Notes…"
-     className="w-full px-2 py-1.5 rounded-lg text-xs border border-[#27272f] 
- bg-[#08080a] text-[#eef2f7]"
-    />
-   </td>
-   <td className="px-3 py-3">
-    <button
-     type="button"
-     disabled={!dirty || saving}
-     onClick={handleSave}
-     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold
-                bg-[#4dc4f4] text-[#08080a] hover:bg-[#6dd0f7] disabled:opacity-40 disabled:cursor-not-allowed"
-    >
-     <Save className="w-3.5 h-3.5" />
-     Save
-    </button>
-    {dirty && (
-     <button
-      type="button"
-      onClick={() => setDraft(row)}
-      className="mt-1 inline-flex items-center gap-1 text-[10px] text-[#8b939e] hover:text-[#8b939e]"
-     >
-      <RotateCcw className="w-3 h-3" /> Reset
-     </button>
-    )}
-   </td>
-  </tr>
- )
+function normalizeRow(row) {
+ const thr = row.target_pieces_per_hour
+ return {
+  ...row,
+  on_progress_spine: !!row.on_progress_spine,
+  // Treat 0 throughput as unset unless it was intentionally configured
+  target_pieces_per_hour: thr === 0 || thr === '0' ? null : thr,
+  notes: row.notes ?? '',
+ }
+}
+
+function defaultsForStation(name) {
+ const seed = SPINE_DEFAULTS[name] ?? FALLBACK_DEFAULTS
+ return { ...seed }
 }
 
 export function StationSettingsPage() {
- const [data, setData] = useState(null)
+ const [baseline, setBaseline] = useState([])
+ const [drafts, setDrafts] = useState([])
  const [error, setError] = useState(null)
- const [savingId, setSavingId] = useState(null)
+ const [saving, setSaving] = useState(false)
+ const [editOrder, setEditOrder] = useState(false)
+ const [dragId, setDragId] = useState(null)
+ const [statusMsg, setStatusMsg] = useState(null)
 
  const load = useCallback(() => {
   apiFetch('/api/station-specifications')
-   .then(d => { setData(d); setError(null) })
+   .then(d => {
+    const rows = (d.specifications ?? []).map(normalizeRow)
+    setBaseline(rows)
+    setDrafts(rows.map(r => ({ ...r })))
+    setError(null)
+   })
    .catch(e => setError(e?.message || 'Failed to load station settings'))
  }, [])
 
  useEffect(() => { load() }, [load])
 
- const handleSave = async (stationId, payload) => {
-  setSavingId(stationId)
+ useEffect(() => {
+  if (!statusMsg) return
+  const t = setTimeout(() => setStatusMsg(null), 3000)
+  return () => clearTimeout(t)
+ }, [statusMsg])
+
+ const dirty = useMemo(() => {
+  if (baseline.length !== drafts.length) return true
+  const byId = new Map(baseline.map(r => [r.station_id, r]))
+  return drafts.some(d => {
+   const b = byId.get(d.station_id)
+   if (!b) return true
+   return JSON.stringify(editablePayload(d)) !== JSON.stringify(editablePayload(b))
+  })
+ }, [baseline, drafts])
+
+ const dirtyIds = useMemo(() => {
+  const byId = new Map(baseline.map(r => [r.station_id, r]))
+  return new Set(
+   drafts
+    .filter(d => {
+     const b = byId.get(d.station_id)
+     if (!b) return true
+     return JSON.stringify(editablePayload(d)) !== JSON.stringify(editablePayload(b))
+    })
+    .map(d => d.station_id),
+  )
+ }, [baseline, drafts])
+
+ const updateDraft = (stationId, patch) => {
+  setDrafts(prev => prev.map(r => (r.station_id === stationId ? { ...r, ...patch } : r)))
+ }
+
+ const spineRows = useMemo(() => {
+  return drafts
+   .filter(r => r.on_progress_spine)
+   .sort((a, b) => {
+    const ia = a.progress_spine_index == null ? 999 : Number(a.progress_spine_index)
+    const ib = b.progress_spine_index == null ? 999 : Number(b.progress_spine_index)
+    if (ia !== ib) return ia - ib
+    return (a.station_id ?? 0) - (b.station_id ?? 0)
+   })
+ }, [drafts])
+
+ const sortedDrafts = useMemo(() => {
+  return [...drafts].sort((a, b) => {
+   const spineIdx = (r) => {
+    if (!r.on_progress_spine) return 999
+    return r.progress_spine_index == null ? 998 : Number(r.progress_spine_index)
+   }
+   const da = spineIdx(a)
+   const db = spineIdx(b)
+   if (da !== db) return da - db
+   return (a.station_id ?? 0) - (b.station_id ?? 0)
+  })
+ }, [drafts])
+
+ const reindexSpine = (orderedIds) => {
+  setDrafts(prev => prev.map(r => {
+   const idx = orderedIds.indexOf(r.station_id)
+   if (idx >= 0) {
+    return { ...r, on_progress_spine: true, progress_spine_index: idx }
+   }
+   if (r.on_progress_spine) {
+    return { ...r, on_progress_spine: false, progress_spine_index: null }
+   }
+   return r
+  }))
+ }
+
+ const toggleInFlow = (stationId, on) => {
+  setDrafts(prev => {
+   const current = prev
+    .filter(r => r.on_progress_spine && r.station_id !== stationId)
+    .sort((a, b) => (a.progress_spine_index ?? 999) - (b.progress_spine_index ?? 999))
+   const ids = current.map(r => r.station_id)
+   if (on) ids.push(stationId)
+   return prev.map(r => {
+    const idx = ids.indexOf(r.station_id)
+    if (idx >= 0) return { ...r, on_progress_spine: true, progress_spine_index: idx }
+    return { ...r, on_progress_spine: false, progress_spine_index: null }
+   })
+  })
+ }
+
+ const handleDragStart = (stationId) => setDragId(stationId)
+
+ const handleDropOn = (targetId) => {
+  if (dragId == null || dragId === targetId) {
+   setDragId(null)
+   return
+  }
+  const ids = spineRows.map(r => r.station_id)
+  const from = ids.indexOf(dragId)
+  const to = ids.indexOf(targetId)
+  if (from < 0 || to < 0) {
+   setDragId(null)
+   return
+  }
+  const next = [...ids]
+  next.splice(from, 1)
+  next.splice(to, 0, dragId)
+  reindexSpine(next)
+  setDragId(null)
+ }
+
+ const discardChanges = () => {
+  setDrafts(baseline.map(r => ({ ...r })))
+  setEditOrder(false)
+  setStatusMsg('Changes discarded')
+ }
+
+ const resetDefaults = () => {
+  setDrafts(prev => prev.map(r => {
+   const d = defaultsForStation(r.station_name)
+   return {
+    ...r,
+    target_part_dwell_seconds: d.target_part_dwell_seconds,
+    target_operator_dwell_seconds: d.target_operator_dwell_seconds,
+    max_dwell_seconds: d.max_dwell_seconds,
+    target_pieces_per_hour: d.target_pieces_per_hour,
+    progress_spine_index: d.progress_spine_index,
+    on_progress_spine: !!d.on_progress_spine,
+   }
+  }))
+  setStatusMsg('Defaults applied — save to persist')
+ }
+
+ const saveChanges = async () => {
+  if (!dirtyIds.size) return
+  setSaving(true)
+  setError(null)
   try {
-   const updated = await apiPut(`/api/station-specifications/${stationId}`, payload)
-   setData(prev => ({
-    ...prev,
-    specifications: (prev?.specifications ?? []).map(s =>
-     s.station_id === stationId ? updated : s,
-    ),
-   }))
+   const results = await Promise.all(
+    drafts
+     .filter(d => dirtyIds.has(d.station_id))
+     .map(async (d) => {
+      const updated = await apiPut(
+       `/api/station-specifications/${d.station_id}`,
+       editablePayload(d),
+      )
+      return normalizeRow(updated)
+     }),
+   )
+   const byId = new Map(results.map(r => [r.station_id, r]))
+   setBaseline(prev => prev.map(r => byId.get(r.station_id) ?? r))
+   setDrafts(prev => prev.map(r => byId.get(r.station_id) ?? r))
+   setEditOrder(false)
+   setStatusMsg(`Saved ${results.length} machine${results.length === 1 ? '' : 's'}`)
   } catch (e) {
    setError(e?.message || 'Save failed')
   } finally {
-   setSavingId(null)
+   setSaving(false)
   }
  }
 
- const specs = data?.specifications ?? []
- const spine = data?.progress_spine ?? []
-
- const sortedSpecs = [...specs].sort((a, b) => {
-  const spineIdx = (r) => {
-    if (!r.on_progress_spine) return 999
-    return r.progress_spine_index == null ? 998 : Number(r.progress_spine_index)
-  }
-  const da = spineIdx(a)
-  const db = spineIdx(b)
-  if (da !== db) return da - db
-  return (a.station_id ?? 0) - (b.station_id ?? 0)
- })
-
  return (
-  <div className="space-y-6 max-w-[1400px] mx-auto">
-   <div className="flex flex-wrap items-start gap-4">
-    <div>
-     <h1 className="text-xl font-bold text-[#eef2f7] flex items-center gap-2">
-      <Settings className="w-6 h-6 text-[#4dc4f4]" />
-      Machine Analytics Settings
-     </h1>
-     <p className="text-sm text-[#8b939e] mt-1 max-w-2xl">
-      Set normal dwell targets per machine. IBUS progress bars use a{' '}
-      <strong className="font-medium text-[#eef2f7]">weighted average</strong>{' '}
-      based on part dwell targets along the progress spine — longer stations count more toward completion.
+  <div className="space-y-5 w-full max-w-[1800px]">
+   <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="min-w-0">
+     <h1 className="bb-page-title">Machine Analytics Settings</h1>
+     <p className="bb-page-sub max-w-2xl">
+      Configure expected part and operator dwell times, alert thresholds, throughput goals, and production order.
      </p>
+    </div>
+    <div className="flex flex-wrap items-center gap-2 shrink-0">
+     {dirty && (
+      <span className="text-xs text-[#fbbf24] mr-1">Unsaved changes</span>
+     )}
+     <button
+      type="button"
+      onClick={discardChanges}
+      disabled={!dirty || saving}
+      className="bb-btn-outline disabled:opacity-40"
+     >
+      Discard changes
+     </button>
+     <button
+      type="button"
+      onClick={resetDefaults}
+      disabled={saving}
+      className="bb-btn-outline disabled:opacity-40"
+     >
+      Reset defaults
+     </button>
+     <button
+      type="button"
+      onClick={saveChanges}
+      disabled={!dirty || saving}
+      className="bb-btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
+     >
+      {saving ? 'Saving…' : 'Save changes'}
+     </button>
     </div>
    </div>
 
-   <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-    <div className="rounded-xl border border-[#4dc4f4]/30 bg-[#4dc4f4]/10 p-4">
-     <div className="flex items-center gap-2 text-[#4dc4f4] font-semibold text-sm">
-      <Clock className="w-4 h-4" /> Part dwell target
-     </div>
-     <p className="text-xs text-[#8b939e] mt-2">
-      Expected average time a part spends at this machine. Drives weighted IBUS progress and “vs target” analytics.
-     </p>
-    </div>
-    <div className="rounded-xl border border-[#4dc4f4]/30 bg-[#4dc4f4]/5 p-4">
-     <div className="flex items-center gap-2 text-[#4dc4f4] font-semibold text-sm">
-      <Users className="w-4 h-4" /> Operator dwell target
-     </div>
-     <p className="text-xs text-[#8b939e] mt-2">
-      Normal RTLS presence time for an operator at this station. Compare against zone visit history on the Operators page.
-     </p>
-    </div>
-    <div className="rounded-xl border border-[#fbbf24]/30 bg-[#fbbf24]/10 p-4">
-     <div className="flex items-center gap-2 text-[#fbbf24] font-semibold text-sm">
-      <Gauge className="w-4 h-4" /> Other useful fields
-     </div>
-     <p className="text-xs text-[#8b939e] mt-2">
-      <strong className="text-[#eef2f7]">Max alert</strong> flags slow parts. <strong className="text-[#eef2f7]">Pieces/hr</strong> is a throughput goal.
-      <strong className="text-[#eef2f7]"> Progress spine</strong> defines which machines count toward IBUS % and in what order.
-     </p>
-    </div>
-   </div>
+   {statusMsg && (
+    <p className="text-xs text-[#8b939e]">{statusMsg}</p>
+   )}
 
-   {spine.length > 0 && (
-    <Panel title="Progress Spine" icon={Route} iconColor="bb-accent-icon"
-        subtitle="Production order for weighted IBUS completion (left → right)">
-     <div className="px-5 py-4 flex flex-wrap items-center gap-2">
-      {spine.map((name, i) => (
-       <span key={name} className="inline-flex items-center gap-1.5">
-        {i > 0 && <span className="text-[#4dc4f4]">→</span>}
-        <span className="px-3 py-1.5 rounded-lg text-xs font-semibold
-                         bg-[#4dc4f4]/15 text-[#4dc4f4] border border-[#4dc4f4]/35">
-         {i + 1}. {name}
+   {error && (
+    <div className="border border-[#f87171]/30 bg-[#f87171]/10 text-[#f87171] px-3 py-2 text-sm rounded-[6px]">
+     {error}
+    </div>
+   )}
+
+   <section className="bb-section">
+    <div className="flex flex-wrap items-center justify-between gap-2">
+     <h2 className="bb-section-title">Production flow</h2>
+     <button
+      type="button"
+      onClick={() => setEditOrder(v => !v)}
+      className={`bb-btn-outline ${editOrder ? 'bb-btn-outline-active' : ''}`}
+     >
+      {editOrder ? 'Done' : 'Edit order'}
+     </button>
+    </div>
+    {spineRows.length === 0 ? (
+     <p className="text-sm text-[#8b939e] py-2">
+      No stations in the production flow. Enable <span className="text-[#eef2f7]">In flow</span> on a machine below.
+     </p>
+    ) : (
+     <div className="bb-panel px-3 py-3 flex flex-wrap items-center gap-1.5">
+      {spineRows.map((row, i) => (
+       <span key={row.station_id} className="inline-flex items-center gap-1.5">
+        {i > 0 && <span className="text-[#5c6370] select-none">→</span>}
+        <span
+         draggable={editOrder}
+         onDragStart={() => handleDragStart(row.station_id)}
+         onDragOver={e => { if (editOrder) e.preventDefault() }}
+         onDrop={() => handleDropOn(row.station_id)}
+         className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-[6px]
+                     border border-[#2a2a32] bg-[#111114] text-[#eef2f7]
+                     ${editOrder ? 'cursor-grab active:cursor-grabbing' : ''}
+                     ${dragId === row.station_id ? 'border-[#4dc4f4] bg-[#4dc4f4]/10' : ''}`}
+        >
+         {editOrder && <GripVertical className="w-3 h-3 text-[#5c6370]" />}
+         {row.station_name}
         </span>
        </span>
       ))}
      </div>
-    </Panel>
-   )}
+    )}
+    {editOrder && (
+     <p className="text-[11px] text-[#8b939e]">
+      Drag stations to reorder. Use In flow in the table to add or remove machines.
+     </p>
+    )}
+   </section>
 
-   {error && (
-    <div className="rounded-lg border border-[#f87171]/30 bg-[#f87171]/10 text-[#f87171] px-4 py-3 text-sm flex items-center gap-2">
-     <Info className="w-4 h-4 shrink-0" /> {error}
-    </div>
-   )}
-
-   <Panel title="All Machines" icon={Factory} iconColor="text-[#4dc4f4]"
-       subtitle="Edit targets and save each row — changes apply immediately to progress and analytics">
-    {!data ? (
-     <p className="text-sm text-[#8b939e] py-10 text-center">Loading…</p>
+   <section className="bb-section">
+    <h2 className="bb-section-title">Machine settings</h2>
+    {!baseline.length && !error ? (
+     <p className="bb-empty">Loading…</p>
     ) : (
-     <div className="overflow-x-auto">
-      <table className="w-full text-sm min-w-[960px]">
-       <thead>
-        <tr className="text-left bg-[#08080a] border-b border-[#27272f]">
-         {['Machine', 'Part target', 'Operator target', 'Max alert', 'Throughput', 'Progress', 'Notes', ''].map(h => (
-          <th key={h} className="px-3 py-3 font-semibold text-[11px] uppercase tracking-wider text-[#8b939e]">{h}</th>
+     <div className="bb-table-wrap">
+      <table className="bb-table min-w-[980px]">
+       <thead className="bb-table-head">
+        <tr>
+         {COLUMNS.map(col => (
+          <th key={col.key}>
+           {col.label}
+           <Tip text={col.tip} />
+          </th>
          ))}
         </tr>
        </thead>
        <tbody>
-        {sortedSpecs.map(row => (
-         <SpecRow
-          key={row.station_id}
-          row={row}
-          onSave={handleSave}
-          saving={savingId === row.station_id}
-         />
-        ))}
+        {sortedDrafts.map(row => {
+         const isDirty = dirtyIds.has(row.station_id)
+         const thr = row.target_pieces_per_hour
+         return (
+          <tr
+           key={row.station_id}
+           className={`bb-table-row align-top ${isDirty ? 'bb-table-row-active' : ''}`}
+          >
+           <td>
+            <div className="font-medium text-sm text-[#eef2f7]">{row.station_name}</div>
+            <div className="text-[11px] text-[#8b939e]">{row.station_type ?? '—'}</div>
+           </td>
+           <td>
+            <DurationField
+             value={row.target_part_dwell_seconds}
+             onChange={v => updateDraft(row.station_id, { target_part_dwell_seconds: v })}
+             ariaLabel="Part dwell target"
+            />
+            {row.actual_part_dwell_seconds != null && (
+             <div className="mt-1 space-y-0.5">
+              <p className="text-[10px] text-[#8b939e]">
+               Actual: {formatSeconds(row.actual_part_dwell_seconds)}
+              </p>
+              {vsTargetBadge(row.vs_target_pct, row.vs_target_status)}
+             </div>
+            )}
+           </td>
+           <td>
+            <DurationField
+             value={row.target_operator_dwell_seconds}
+             onChange={v => updateDraft(row.station_id, { target_operator_dwell_seconds: v })}
+             ariaLabel="Operator dwell target"
+            />
+            {row.actual_operator_dwell_seconds != null && (
+             <div className="mt-1 space-y-0.5">
+              <p className="text-[10px] text-[#8b939e]">
+               Actual: {formatSeconds(row.actual_operator_dwell_seconds)}
+              </p>
+              {vsTargetBadge(row.operator_vs_target_pct, row.operator_vs_target_status)}
+             </div>
+            )}
+           </td>
+           <td>
+            <DurationField
+             value={row.max_dwell_seconds}
+             onChange={v => updateDraft(row.station_id, { max_dwell_seconds: v })}
+             ariaLabel="Slow-part threshold"
+            />
+           </td>
+           <td>
+            <input
+             type="number"
+             min={0}
+             step={0.5}
+             value={thr == null || thr === '' ? '' : thr}
+             onChange={e => {
+              const raw = e.target.value
+              updateDraft(row.station_id, {
+               target_pieces_per_hour: raw === '' ? null : Number(raw),
+              })
+             }}
+             placeholder="Not set"
+             className="bb-field-input w-20"
+            />
+            {(thr == null || thr === '') && (
+             <p className="text-[11px] text-[#8b939e] mt-1">Not set</p>
+            )}
+           </td>
+           <td>
+            <label className="inline-flex items-center gap-2 text-sm cursor-pointer">
+             <input
+              type="checkbox"
+              checked={!!row.on_progress_spine}
+              onChange={e => toggleInFlow(row.station_id, e.target.checked)}
+              className="rounded border-[#3a3a44] bg-[#08080a] text-[#4dc4f4] focus:ring-[#4dc4f4]"
+             />
+             <span className="text-xs text-[#eef2f7]">
+              {row.on_progress_spine ? 'Yes' : 'No'}
+             </span>
+            </label>
+            {row.on_progress_spine && (
+             <p className="text-[11px] text-[#8b939e] mt-1 tabular-nums">
+              Order {(Number(row.progress_spine_index) || 0) + 1}
+             </p>
+            )}
+           </td>
+           <td className="min-w-[8rem]">
+            <input
+             type="text"
+             value={row.notes ?? ''}
+             onChange={e => updateDraft(row.station_id, { notes: e.target.value })}
+             placeholder="—"
+             className="bb-field-input w-full text-xs"
+            />
+           </td>
+          </tr>
+         )
+        })}
        </tbody>
       </table>
      </div>
     )}
-   </Panel>
+   </section>
+
+   <FloorPlanEditor />
   </div>
  )
 }

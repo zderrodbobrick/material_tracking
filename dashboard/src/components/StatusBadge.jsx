@@ -18,7 +18,7 @@ const STATUS_LABELS = {
  open:   'In Process',
  closed:  'Completed',
  abandoned: 'Abandoned',
- exit_only: 'Exit Only',
+ exit_only: 'Missing Entry Read',
  Entry:   'Entry',
  Exit:   'Exit',
 }

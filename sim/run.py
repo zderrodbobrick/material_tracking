@@ -406,7 +406,7 @@ def _finish_all(
 ) -> None:
     """Send every part to Insert Station so the order hits 100% and completes."""
     where = ANT_SHORT.get(END_ANTENNA) or ANTENNA_CATALOG[END_ANTENNA][0]
-    print(f"  Finishing order — moving {len(parts)} parts to [{END_ANTENNA}] {where} …")
+    print(f"  Finishing order - moving {len(parts)} parts to [{END_ANTENNA}] {where} ...")
     for p in parts:
         _move(tracker, p, END_ANTENNA, locations, burst, quiet=True, notify=False)
     # Safety net if the last Insert open didn't already close the order
@@ -414,7 +414,7 @@ def _finish_all(
         tracker.try_complete_ibus_order(parts[0]["epc"])
     live = _notify_dashboard("sim_finish")
     dash = "dashboard live" if live else "dashboard offline"
-    print(f"  Done — all parts at Insert (100%). Order should be Completed. ({dash})")
+    print(f"  Done - all parts at Insert (100%). Order should be Completed. ({dash})")
     print()
 
 
@@ -443,11 +443,11 @@ def _auto_run(
     step_dwell = max(0.35, (duration_sec * 0.65) / max(hops, 1))
     eta = (n - 1) * release_gap + hops * step_dwell
 
-    path_labels = " → ".join(
+    path_labels = " -> ".join(
         f"{a}:{ANT_SHORT.get(a, ANTENNA_CATALOG.get(a, ('?',))[0])}" for a in path
     )
     print(f"  AUTO RUN  {n} parts  |  target ~{duration_sec:.0f}s (eta {eta:.0f}s)")
-    print(f"  Path: [{START_ANTENNA}] entrance → {path_labels}")
+    print(f"  Path: [{START_ANTENNA}] entrance -> {path_labels}")
     print(f"  Release gap {release_gap:.2f}s  |  dwell/station {step_dwell:.2f}s")
     print("  (Same ingest_batch logic as the live listener)")
     print()
@@ -488,20 +488,24 @@ def _auto_run(
             elapsed = time.monotonic() - t_wall
             print(
                 f"  [{elapsed:5.1f}s] {done_moves}/{total_moves}  "
-                f"{label} → [{ant}] {where}",
+                f"{label} -> [{ant}] {where}",
                 flush=True,
             )
     except KeyboardInterrupt:
-        print("\n  AUTO interrupted — finishing remaining parts at Insert …")
+        print("\n  AUTO interrupted - finishing remaining parts at Insert ...")
         _finish_all(tracker, parts, locations, burst)
         return
 
-    if parts:
-        tracker.try_complete_ibus_order(parts[0]["epc"])
-    _notify_dashboard("sim_auto_done")
+    # If the last Insert arrival didn't complete the order (e.g. early holds
+    # were idle-closed), re-assert every part at Insert and try again.
+    done = bool(parts) and tracker.try_complete_ibus_order(parts[0]["epc"])
+    if not done:
+        _finish_all(tracker, parts, locations, burst)
+    else:
+        _notify_dashboard("sim_auto_done")
     elapsed = time.monotonic() - t_wall
     print()
-    print(f"  AUTO complete in {elapsed:.1f}s — order should be Completed IBUS.")
+    print(f"  AUTO complete in {elapsed:.1f}s - order should be Completed IBUS.")
     print()
 
 
@@ -627,7 +631,7 @@ def main() -> int:
     if not args.no_clear:
         cleared = _clear_tracking_db()
         total = sum(cleared.values())
-        print(f"  Cleared tracking DB ({total} rows) — clean slate for this run")
+        print(f"  Cleared tracking DB ({total} rows) - clean slate for this run")
         for table, n in cleared.items():
             if n:
                 print(f"    {table}: {n}")
@@ -640,7 +644,7 @@ def main() -> int:
         if n_ops > 0:
             print(f"  Demo operators: {n_ops} loaded (one per station)")
         elif n_ops < 0:
-            print("  Demo operators: skipped (API offline — start api.py first)")
+            print("  Demo operators: skipped (API offline - start api.py first)")
         else:
             print("  Demo operators: none seeded")
 
@@ -653,7 +657,7 @@ def main() -> int:
             if operator_mover_started:
                 print(
                     f"  Operator movement: {n_moving} badges roaming "
-                    f"({SIM_OPERATOR_MIN_DWELL_SEC:.0f}–{SIM_OPERATOR_MAX_DWELL_SEC:.0f}s dwell)"
+                    f"({SIM_OPERATOR_MIN_DWELL_SEC:.0f}-{SIM_OPERATOR_MAX_DWELL_SEC:.0f}s dwell)"
                 )
 
         _print_antenna_map()
@@ -672,7 +676,7 @@ def main() -> int:
             _print_parts(parts, locations)
             if operator_mover_started:
                 print()
-                print("  Auto pipeline done — operators still roaming (Ctrl+C to stop)")
+                print("  Auto pipeline done - operators still roaming (Ctrl+C to stop)")
                 try:
                     while True:
                         time.sleep(1)

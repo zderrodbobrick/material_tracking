@@ -6,7 +6,7 @@ export function Panel({ title, subtitle, icon: Icon, iconColor = 'bb-accent-icon
      <div className="min-w-0">
       {title && (
        <h2 className="bb-title">
-        {Icon && <Icon className={`w-4 h-4 ${iconColor}`} />}
+        {Icon && <Icon className={`w-3.5 h-3.5 ${iconColor}`} />}
         {title}
        </h2>
       )}

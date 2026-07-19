@@ -316,12 +316,16 @@ def _start_presence(
     if active:
         return False
     timer_start = _now_iso()
-    conn.execute(
-        """INSERT INTO session_operator_presence
-           (session_id, operator_id, station_id, entered_at)
-           VALUES (?, ?, ?, ?)""",
-        (session_id, operator_id, station_id, timer_start),
-    )
+    try:
+        # UNIQUE(session_id, operator_id) WHERE left_at IS NULL — race-safe vs sweeper
+        conn.execute(
+            """INSERT INTO session_operator_presence
+               (session_id, operator_id, station_id, entered_at)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, operator_id, station_id, timer_start),
+        )
+    except sqlite3.IntegrityError:
+        return False
     return True
 
 

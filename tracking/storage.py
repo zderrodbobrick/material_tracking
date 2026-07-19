@@ -18,8 +18,8 @@ Session modes
     stays open for map); LBD ant 6 closes the Tennoner visit (one session per part).
 
   Presence (LBD, Insert Station):
-    A valid read means the part is there. Idle timeout without reads means
-    it is not there (session closed). No enter/exit dwell pair.
+    A valid read means the part is there. LBD closes on short idle (left zone).
+    Insert holds until the IBUS order completes (or INSERT_HOLD_TIMEOUT).
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ from config import (
     EXIT_IDLE_TIMEOUT_SEC,
     SWEEP_INTERVAL_SEC,
     ABANDON_TIMEOUT_SEC,
+    INSERT_HOLD_TIMEOUT_SEC,
     DB_PATH,
     STATION_NAME,
     STATION_TYPE,
@@ -236,6 +237,7 @@ class DwellTracker:
         self._open: dict[str, _Session] = {}           # Gannomat dwell
         self._tenoner_open: dict[str, _Session] = {}   # Tennoner dwell
         self._presence_open: dict[str, _Session] = {}  # LBD / Insert presence
+        self._completed_wos: set[str] = set()          # WO digits already completed
         self._last_raw: dict[tuple[str, int], float] = {}
         self._read_counts: dict[tuple[str, int], int] = {}
 
@@ -792,12 +794,35 @@ class DwellTracker:
                     found.append(e)
         return found
 
+    def _epc_reached_insert(self, epc: str) -> bool:
+        """True if this EPC reached Insert on the current pass (fresh session)."""
+        if self._insert_station_id is None:
+            return False
+        row = self._conn.execute(
+            "SELECT s.entry_time FROM part_station_sessions s "
+            "JOIN rfid_tags t ON t.tag_id = s.tag_id "
+            "WHERE t.epc = ? AND s.station_id = ? "
+            "ORDER BY s.session_id DESC LIMIT 1",
+            (epc, self._insert_station_id),
+        ).fetchone()
+        if not row:
+            return False
+        entry = _parse_ts(row[0])
+        if entry is None:
+            return True
+        age = (datetime.now(timezone.utc) - entry).total_seconds()
+        # Ignore leftover Insert rows from an earlier day/shift.
+        return age <= max(INSERT_HOLD_TIMEOUT_SEC, 3600.0)
+
     def _maybe_complete_ibus_order(self, epc: str, summary: dict) -> None:
-        """When every BOM part is at Insert, close Insert holds → journey completed."""
+        """When every BOM part has reached Insert, close Insert holds → completed."""
         if self._insert_station_id is None:
             return
         wo = _wo_digits_from_epc(epc)
         if not wo:
+            return
+        if wo in self._completed_wos:
+            summary["order_completed"] = summary.get("order_completed", 0) + 1
             return
         expected = self._expected_epcs_for_wo(wo)
         if not expected:
@@ -805,11 +830,14 @@ class DwellTracker:
 
         for e in expected:
             sess = self._presence_open.get(e)
-            if (
-                sess is None
-                or sess.station_id != self._insert_station_id
-                or not self._session_still_open(sess.session_id)
-            ):
+            at_insert_open = (
+                sess is not None
+                and sess.station_id == self._insert_station_id
+                and self._session_still_open(sess.session_id)
+            )
+            # Count idle-closed Insert arrivals too — a short hold timeout used to
+            # drop early parts before the last sibling arrived.
+            if not at_insert_open and not self._epc_reached_insert(e):
                 return
             for bucket in (self._open, self._tenoner_open):
                 other = bucket.get(e)
@@ -822,6 +850,11 @@ class DwellTracker:
             sess = self._presence_open.get(e)
             if sess is None:
                 continue
+            if sess.station_id != self._insert_station_id:
+                continue
+            if not self._session_still_open(sess.session_id):
+                self._drop_stale_open(e, self._presence_open)
+                continue
             if sess.entry_ts is not None and not sess.has_exit:
                 sess.exit_ts = now
                 sess.has_exit = True
@@ -829,12 +862,14 @@ class DwellTracker:
             closed += 1
             summary["session_closed"] = summary.get("session_closed", 0) + 1
 
-        if closed:
-            summary["order_completed"] = summary.get("order_completed", 0) + 1
-            print(
-                f"[ibus] IBUS{wo} COMPLETE — {closed} parts finished at Insert",
-                flush=True,
-            )
+        # Success even when holds were already idle-closed (closed == 0).
+        self._completed_wos.add(wo)
+        summary["order_completed"] = summary.get("order_completed", 0) + 1
+        print(
+            f"[ibus] IBUS{wo} COMPLETE - {closed} Insert holds closed "
+            f"({len(expected)} parts reached Insert)",
+            flush=True,
+        )
 
     def try_complete_ibus_order(self, epc: str) -> bool:
         """Public hook (sim/tests): complete order if every part is at Insert."""
@@ -948,7 +983,7 @@ class DwellTracker:
                         self._finalize(sess, STATUS_ABANDONED, bucket)
 
             # Presence:
-            #   Insert — stay until abandon or order complete
+            #   Insert — long hold until order complete (INSERT_HOLD_TIMEOUT_SEC)
             #   LBD — idle timeout (no reads => not there)
             #   (Tennoner table hold uses _tenoner_open dwell bucket, not presence)
             for epc in list(self._presence_open.keys()):
@@ -959,7 +994,7 @@ class DwellTracker:
                 idle = (now - sess.last_seen_wall).total_seconds()
                 hold_ids = {self._insert_station_id}
                 timeout = (
-                    ABANDON_TIMEOUT_SEC
+                    INSERT_HOLD_TIMEOUT_SEC
                     if sess.station_id in hold_ids
                     else IDLE_TIMEOUT_SEC
                 )

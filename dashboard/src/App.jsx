@@ -62,7 +62,7 @@ export default function App() {
  }
 
  return (
-  <div className="min-h-screen bg-[#0c0c0e] text-[#eef2f7]">
+  <div className="min-h-screen bg-[#08080a] text-[#eef2f7]">
    <Header
     wsStatus={wsStatus}
     lastUpdated={lastUpdated}
@@ -70,7 +70,7 @@ export default function App() {
     onTabChange={setTab}
     onHome={goHome}
    />
-   <main className="w-full px-3 sm:px-4 py-3">
+   <main className="w-full px-3 sm:px-4 py-3 max-w-[1800px]">
     {tab === 'live' && (
      <LiveDashboard liveSessions={liveSessions} tick={tick} />
     )}

@@ -366,21 +366,37 @@ export function StationPlaceLayer({
 }
 
 /** Non-edit station pins (when showMarkers is on). */
-export function StationMarkers({ placements, stations, showMarkers }) {
+export function StationMarkers({ placements, stations, showMarkers, onStationClick }) {
  if (!showMarkers) return null
  const stationByKey = Object.fromEntries(stations.map(s => [s.station, s]))
+ const interactive = typeof onStationClick === 'function'
  return (
-  <g className="station-markers pointer-events-none">
+  <g className={`station-markers ${interactive ? 'pointer-events-auto' : 'pointer-events-none'}`}>
    {Object.entries(placements).map(([id, p]) => {
     if (p.visible === false) return null
     const st = stationByKey[id]
     return (
-     <g key={id} transform={`translate(${p.x}, ${p.y})`} opacity={0.85}>
+     <g
+      key={id}
+      transform={`translate(${p.x}, ${p.y})`}
+      opacity={0.9}
+      style={interactive ? { cursor: 'pointer' } : undefined}
+      onClick={interactive ? (e) => {
+       e.stopPropagation()
+       onStationClick(id, st)
+      } : undefined}
+     >
+      <circle
+       r={interactive ? 10 : 5}
+       fill={interactive ? 'rgba(77,196,244,0.15)' : '#0ea5e9'}
+       stroke="transparent"
+       strokeWidth="1"
+      />
       <circle r={5} fill="#0ea5e9" stroke="#fff" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
       <text
        y={-8}
        textAnchor="middle"
-       style={{ fontSize: 8, fontWeight: 600, fill: '#0369a1' }}
+       style={{ fontSize: 8, fontWeight: 600, fill: '#8b939e' }}
       >
        {st?.name ?? id}
       </text>

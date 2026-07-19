@@ -1,24 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
-import { Map as MapIcon, AlertCircle, MapPin, Eye, EyeOff, UserRound } from 'lucide-react'
-import { Panel } from '../components/Panel'
+import { AlertCircle, ChevronDown, Map as MapIcon, X } from 'lucide-react'
 import { MachineOverlaySvg } from '../components/MachineOverlay'
-import { AntennaPlaceToolbar, AntennaPlaceLayer, AntennaMarkers } from '../components/AntennaEditor'
-import { StationPlaceToolbar, StationPlaceLayer, StationMarkers } from '../components/StationEditor'
+import { AntennaMarkers } from '../components/AntennaEditor'
+import { StationMarkers } from '../components/StationEditor'
 import { PartChipLayer } from '../components/PartChipLayer'
 import { MachineStatusTable } from '../components/MachineStatusPanel'
 import { IbusOrdersSidebar } from '../components/IbusOrdersSidebar'
+import { DwellTimer } from '../components/DwellTimer'
 import { useRtlsLive } from '../hooks/useRtlsLive'
-import { apiFetch, apiPut, apiPost, apiDelete } from '../api'
+import { apiFetch, apiPost, apiDelete } from '../api'
 import { FLOOR_PLAN } from '../utils/floorPlanCoords'
 import { normalizeShapesMap, polygonCentroid } from '../utils/machinePolygons'
-import {
- normalizeAntennaPlacements,
- placementsToPayload,
-} from '../utils/antennaPlacements'
-import {
- normalizeStationPlacements,
- stationPlacementsToPayload,
-} from '../utils/stationPlacements'
+import { normalizeAntennaPlacements } from '../utils/antennaPlacements'
+import { normalizeStationPlacements } from '../utils/stationPlacements'
 import {
  ALL_STATIONS,
  PRODUCTION_LINE_ORDER,
@@ -27,24 +21,26 @@ import {
  machinesWithPolygons,
  operatorsByStation,
 } from '../utils/machineRegions'
-import { getAllStationStatuses } from '../utils/stationStatus'
+import { getAllStationStatuses, sessionsForStation } from '../utils/stationStatus'
+import { ibusOrderKey } from '../utils/ibusOrder'
 import floorPlanImg from '../assets/floor_plan.png'
 
-const SHOW_ANTENNAS_KEY = 'liveDashboard.showAntennaMarkers'
-const SHOW_STATIONS_KEY = 'liveDashboard.showStationMarkers'
+const MAP_OPEN_KEY = 'liveDashboard.mapOpen'
 
-function OperatorMarker({ op, zoneName, pos, mapBusy = false, stackIndex = 0 }) {
- const title = [
-  op.operator_name || `Tag ${op.tag_id}`,
-  zoneName,
- ].filter(Boolean).join(' · ')
+function sessionDwellSeconds(session) {
+ const ms = session.entry_epoch_ms
+  ?? (session.entry_time ? new Date(session.entry_time).getTime() : NaN)
+ if (!Number.isFinite(ms)) return null
+ return Math.max(0, (Date.now() - ms) / 1000)
+}
 
+function OperatorMarker({ op, zoneName, pos, stackIndex = 0 }) {
+ const title = [op.operator_name || `Tag ${op.tag_id}`, zoneName].filter(Boolean).join(' · ')
  const offsetPx = stackIndex * 10
-
  return (
   <div
    data-floor-marker
-   className={`absolute z-20 ${mapBusy ? 'pointer-events-none opacity-80' : 'pointer-events-auto'}`}
+   className="absolute z-20 pointer-events-auto"
    style={{
     left: pos.left,
     top: pos.top,
@@ -52,15 +48,12 @@ function OperatorMarker({ op, zoneName, pos, mapBusy = false, stackIndex = 0 }) 
    }}
    title={title}
   >
-   <span className="relative flex items-center justify-center w-2.5 h-2.5 rounded-full
-                      ring-2 ring-white/90 shadow-[0_0_10px_rgba(255,255,255,0.5)] bg-white">
-    <span className="absolute inset-0 rounded-full animate-ping opacity-25 bg-white [animation-duration:1.8s]" />
+   <span className="relative flex items-center justify-center w-2 h-2 rounded-full
+                    ring-2 ring-white/90 bg-white">
    </span>
-   <span
-    className="absolute left-1/2 top-full mt-0.5 -translate-x-1/2 whitespace-nowrap
- px-1 py-px rounded text-[7px] font-medium tracking-tight leading-none
-          bg-black/75 text-white/90 border border-white/10"
-   >
+   <span className="absolute left-1/2 top-full mt-0.5 -translate-x-1/2 whitespace-nowrap
+ px-1 py-px rounded text-[7px] font-medium leading-none
+          bg-black/75 text-white/90">
     {op.operator_name || `#${op.tag_id}`}
    </span>
   </div>
@@ -71,82 +64,49 @@ function FloorPlanMap({
  liveSessions,
  operators,
  machines,
- antennaMode,
- stationMode,
- antennas,
  antennaPlacements,
- selectedAntennaId,
- onPlaceAntenna,
- onSelectAntenna,
- onRemoveAntenna,
  showAntennaMarkers,
  stations,
  stationPlacements,
- selectedStationId,
- onPlaceStation,
- onSelectStation,
- onRemoveStation,
  showStationMarkers,
  mapRef,
+ getDelayLevel,
+ onPartClick,
+ onStationClick,
 }) {
- const mapBusy = antennaMode || stationMode
-
  return (
   <div
    ref={mapRef}
-   className="relative w-full min-w-0 rounded-lg bg-black shadow-inner ring-1 ring-[#27272f]"
+   className="relative w-full min-w-0 rounded-[6px] bg-black ring-1 ring-[#2a2a32]"
    style={{ aspectRatio: `${FLOOR_PLAN.imageWidth} / ${FLOOR_PLAN.imageHeight}` }}
   >
    <img
     src={floorPlanImg}
     alt="Machine floor plan"
-    className="absolute inset-0 w-full h-full object-fill select-none rounded-lg"
+    className="absolute inset-0 w-full h-full object-fill select-none rounded-[6px]"
     draggable={false}
    />
-   <div className="absolute inset-0 z-10 overflow-visible rounded-lg">
-    {!mapBusy && (
-     <MachineOverlaySvg className="z-10 pointer-events-none">
-      <AntennaMarkers
-       placements={antennaPlacements}
-       antennas={antennas}
-       showMarkers={showAntennaMarkers}
-      />
-      <StationMarkers
-       placements={stationPlacements}
-       stations={stations}
-       showMarkers={showStationMarkers}
-      />
-     </MachineOverlaySvg>
-    )}
-    {!mapBusy && (
-     <PartChipLayer
-      sessions={liveSessions}
+   <div className="absolute inset-0 z-10 overflow-visible rounded-[6px]">
+    <MachineOverlaySvg className="z-10 pointer-events-none">
+     <AntennaMarkers
       placements={antennaPlacements}
-      machines={machines}
+      antennas={[]}
+      showMarkers={showAntennaMarkers}
      />
-    )}
-    {antennaMode && (
-     <AntennaPlaceLayer
-      mapRef={mapRef}
-      selectedId={selectedAntennaId}
-      placements={antennaPlacements}
-      antennas={antennas}
-      onPlace={onPlaceAntenna}
-      onSelect={onSelectAntenna}
-      onRemove={onRemoveAntenna}
-     />
-    )}
-    {stationMode && (
-     <StationPlaceLayer
-      mapRef={mapRef}
-      selectedId={selectedStationId}
+     <StationMarkers
       placements={stationPlacements}
       stations={stations}
-      onPlace={onPlaceStation}
-      onSelect={onSelectStation}
-      onRemove={onRemoveStation}
+      showMarkers={showStationMarkers}
+      onStationClick={onStationClick}
      />
-    )}
+    </MachineOverlaySvg>
+    <PartChipLayer
+     sessions={liveSessions}
+     placements={antennaPlacements}
+     machines={machines}
+     getDelayLevel={getDelayLevel}
+     onPartClick={onPartClick}
+    />
     {operators.map((entry) => (
      <OperatorMarker
       key={entry.op.tag_id}
@@ -154,7 +114,6 @@ function FloorPlanMap({
       pos={entry.pos}
       zoneName={entry.zoneName}
       stackIndex={entry.stackIndex}
-      mapBusy={mapBusy}
      />
     ))}
    </div>
@@ -164,94 +123,158 @@ function FloorPlanMap({
 
 const MemoFloorPlanMap = memo(FloorPlanMap)
 
+function StationDetailPanel({ stationKey, stationName, status, sessions, onClose }) {
+ if (!stationKey) return null
+ return (
+  <div className="bb-panel">
+   <div className="bb-panel-header">
+    <div>
+     <h3 className="bb-title">{stationName || stationKey}</h3>
+     <p className="bb-subtitle">
+      {status?.hasPart && !status?.hasOperator
+       ? 'Part present — no operator'
+       : status?.inUse
+        ? 'In use'
+        : 'Idle'}
+     </p>
+    </div>
+    <button type="button" onClick={onClose} className="bb-btn-ghost p-1" aria-label="Close">
+     <X className="w-4 h-4" />
+    </button>
+   </div>
+   <div className="px-3 py-2 grid grid-cols-2 sm:grid-cols-4 gap-3 text-sm border-b border-[#2a2a32]">
+    <div>
+     <p className="bb-kpi-label">Operator</p>
+     <p className="text-sm font-medium mt-0.5">{status?.operatorName ?? '—'}</p>
+    </div>
+    <div>
+     <p className="bb-kpi-label">Parts in queue</p>
+     <p className="text-sm font-medium tabular-nums mt-0.5">{sessions.length}</p>
+    </div>
+    <div>
+     <p className="bb-kpi-label">Part dwell</p>
+     <p className="text-sm font-mono mt-0.5">
+      {status?.partEntryTime || status?.partEntryEpochMs != null ? (
+       <DwellTimer
+        entranceTime={status.partEntryTime}
+        entranceEpochMs={status.partEntryEpochMs}
+        exitTime={null}
+        dwellSeconds={null}
+       />
+      ) : '—'}
+     </p>
+    </div>
+    <div>
+     <p className="bb-kpi-label">Operator dwell</p>
+     <p className="text-sm font-mono mt-0.5">
+      {status?.operatorEnteredAt ? (
+       <DwellTimer entranceTime={status.operatorEnteredAt} exitTime={null} dwellSeconds={null} />
+      ) : '—'}
+     </p>
+    </div>
+   </div>
+   {sessions.length === 0 ? (
+    <p className="bb-empty py-4">No parts currently at this station</p>
+   ) : (
+    <div className="overflow-x-auto">
+     <table className="bb-table">
+      <thead className="bb-table-head">
+       <tr>
+        <th>Part</th>
+        <th>Work order</th>
+        <th className="text-right">Dwell</th>
+       </tr>
+      </thead>
+      <tbody>
+       {sessions.map(s => (
+        <tr key={s.id ?? s.session_id} className="bb-table-row">
+         <td className="font-mono text-xs">
+          {s.part_number || s.part_name || s.epc || '—'}
+         </td>
+         <td className="font-mono text-xs text-[#8b939e]">
+          {s.work_order || s.ibus_number || ibusOrderKey(s) || '—'}
+         </td>
+         <td className="text-right font-mono text-xs">
+          <DwellTimer
+           entranceTime={s.entry_time}
+           entranceEpochMs={s.entry_epoch_ms}
+           exitTime={null}
+           dwellSeconds={null}
+          />
+         </td>
+        </tr>
+       ))}
+      </tbody>
+     </table>
+    </div>
+   )}
+  </div>
+ )
+}
+
 export function LiveDashboard({ liveSessions = [], tick = 0 }) {
  const { rtls, health, error, refresh } = useRtlsLive()
 
- // Shapes still load as a fallback for part chips — map regions are hidden.
  const [shapesMap, setShapesMap] = useState({})
- const [statusMessage, setStatusMessage] = useState(null)
- const [demoBusy, setDemoBusy] = useState(false)
- const [antennas, setAntennas] = useState([])
  const [antennaPlacements, setAntennaPlacements] = useState({})
- const [antennaMode, setAntennaMode] = useState(false)
- const [selectedAntennaId, setSelectedAntennaId] = useState(null)
- const [antennaDirty, setAntennaDirty] = useState(false)
- const [antennaSaving, setAntennaSaving] = useState(false)
- const [showAntennaMarkers, setShowAntennaMarkers] = useState(() => {
-  try {
-   const raw = localStorage.getItem(SHOW_ANTENNAS_KEY)
-   return raw == null ? true : raw === 'true'
-  } catch {
-   return true
-  }
- })
  const [stationPlacements, setStationPlacements] = useState({})
- const [stationMode, setStationMode] = useState(false)
- const [selectedStationId, setSelectedStationId] = useState(
-  PRODUCTION_LINE_STATIONS[0]?.station ?? null,
- )
- const [stationDirty, setStationDirty] = useState(false)
- const [stationSaving, setStationSaving] = useState(false)
- const [showStationMarkers, setShowStationMarkers] = useState(() => {
+ const [openIbusJourneys, setOpenIbusJourneys] = useState([])
+ const [specsByStation, setSpecsByStation] = useState({})
+ const [showSystemStatus, setShowSystemStatus] = useState(false)
+ const [demoBusy, setDemoBusy] = useState(false)
+ const [statusMessage, setStatusMessage] = useState(null)
+ const [selectedOrderKey, setSelectedOrderKey] = useState(null)
+ const [selectedStationKey, setSelectedStationKey] = useState(null)
+ const [mapOpen, setMapOpen] = useState(() => {
   try {
-   const raw = localStorage.getItem(SHOW_STATIONS_KEY)
-   return raw == null ? true : raw === 'true'
+   return localStorage.getItem(MAP_OPEN_KEY) === 'true'
   } catch {
-   return true
+   return false
   }
  })
  const mapRef = useRef(null)
- const antennaBaseline = useRef({})
- const stationBaseline = useRef({})
- const [openIbusJourneys, setOpenIbusJourneys] = useState([])
 
  const loadOpenIbus = useCallback(() => {
   apiFetch('/api/ibus?status=open&limit=80')
-   .then(rows => {
-    if (Array.isArray(rows)) setOpenIbusJourneys(rows)
-   })
+   .then(rows => { if (Array.isArray(rows)) setOpenIbusJourneys(rows) })
    .catch(() => {})
  }, [])
 
- // Refresh progress bars on every rfid_update (and socket fallback tick).
- useEffect(() => {
-  loadOpenIbus()
- }, [tick, loadOpenIbus])
+ useEffect(() => { loadOpenIbus() }, [tick, loadOpenIbus])
 
  useEffect(() => {
   let cancelled = false
   Promise.all([
    apiFetch('/api/machine-shapes').catch(() => ({})),
    apiFetch('/api/antenna-placements').catch(() => ({})),
-   apiFetch('/api/antennas').catch(() => []),
    apiFetch('/api/station-placements').catch(() => ({})),
-  ]).then(([shapes, placements, ants, stationPins]) => {
+   apiFetch('/api/station-specifications').catch(() => null),
+  ]).then(([shapes, placements, stationPins, specs]) => {
    if (cancelled) return
    setShapesMap(normalizeShapesMap(shapes))
-   const normalizedPlacements = normalizeAntennaPlacements(placements)
-   setAntennaPlacements(normalizedPlacements)
-   antennaBaseline.current = normalizedPlacements
-   const list = Array.isArray(ants) ? ants : []
-   setAntennas(list)
-   if (list.length > 0) {
-    setSelectedAntennaId(String(list[0].antenna_id))
+   setAntennaPlacements(normalizeAntennaPlacements(placements))
+   setStationPlacements(normalizeStationPlacements(stationPins))
+   const byName = {}
+   for (const row of specs?.specifications ?? []) {
+    if (row.station_name) byName[row.station_name] = row
+    // Tennoner / Tenoner alias
+    if (row.station_name === 'Tennoner') byName.Tenoner = row
+    if (row.station_name === 'Tenoner') byName.Tennoner = row
    }
-   const normalizedStations = normalizeStationPlacements(stationPins)
-   setStationPlacements(normalizedStations)
-   stationBaseline.current = normalizedStations
-   const firstUnplaced = PRODUCTION_LINE_STATIONS.find(s => !normalizedStations[s.station])
-   if (firstUnplaced) setSelectedStationId(firstUnplaced.station)
+   setSpecsByStation(byName)
   })
   return () => { cancelled = true }
  }, [])
 
  useEffect(() => {
-  localStorage.setItem(SHOW_ANTENNAS_KEY, String(showAntennaMarkers))
- }, [showAntennaMarkers])
+  try { localStorage.setItem(MAP_OPEN_KEY, String(mapOpen)) } catch { /* ignore */ }
+ }, [mapOpen])
 
  useEffect(() => {
-  localStorage.setItem(SHOW_STATIONS_KEY, String(showStationMarkers))
- }, [showStationMarkers])
+  if (!statusMessage) return
+  const t = setTimeout(() => setStatusMessage(null), 4000)
+  return () => clearTimeout(t)
+ }, [statusMessage])
 
  const stationsWithShapes = useMemo(
   () => applyMachineShapes(ALL_STATIONS, shapesMap),
@@ -261,12 +284,6 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   () => machinesWithPolygons(stationsWithShapes),
   [stationsWithShapes],
  )
-
- useEffect(() => {
-  if (!statusMessage) return
-  const t = setTimeout(() => setStatusMessage(null), 4000)
-  return () => clearTimeout(t)
- }, [statusMessage])
 
  const sessionsByStation = useMemo(() => {
   const grouped = {}
@@ -278,200 +295,6 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   return grouped
  }, [liveSessions])
 
- const enterAntennaMode = useCallback(() => {
-  setStationMode(false)
-  setAntennaMode(true)
-  setShowAntennaMarkers(true)
-  // Re-fetch so newly seeded antennas (4–7) show up without a full page reload
-  apiFetch('/api/antennas')
-   .then((list) => {
-    const ants = Array.isArray(list) ? list : []
-    setAntennas(ants)
-    const placed = antennaBaseline.current || {}
-    const firstUnplaced = ants.find(a => !placed[String(a.antenna_id)])
-     || ants.find(a => !antennaPlacements[String(a.antenna_id)])
-    const pick = firstUnplaced || ants[0]
-    if (pick) setSelectedAntennaId(String(pick.antenna_id))
-   })
-   .catch(() => {})
- }, [antennaPlacements])
-
- const exitAntennaMode = useCallback(() => {
-  setAntennaMode(false)
-  if (antennaDirty) {
-   setAntennaPlacements(antennaBaseline.current)
-   setAntennaDirty(false)
-  }
- }, [antennaDirty])
-
- const enterStationMode = useCallback(() => {
-  setAntennaMode(false)
-  setStationMode(true)
-  setShowStationMarkers(true)
- }, [])
-
- const exitStationMode = useCallback(() => {
-  setStationMode(false)
-  if (stationDirty) {
-   setStationPlacements(stationBaseline.current)
-   setStationDirty(false)
-  }
- }, [stationDirty])
-
- const handlePlaceAntenna = useCallback((antennaId, x, y, opts = {}) => {
-  const id = String(antennaId)
-  setAntennaPlacements(prev => {
-   const existing = prev[id]
-   const wasNew = !existing
-   const next = {
-    ...prev,
-    [id]: {
-     x,
-     y,
-     visible: opts.keepVisible && existing ? existing.visible !== false : true,
-    },
-   }
-   // After placing a new antenna, select the next one that still needs a pin
-   if (wasNew && !opts.keepVisible) {
-    const nextUnplaced = antennas.find(a => {
-     const aid = String(a.antenna_id)
-     return aid !== id && !next[aid]
-    })
-    if (nextUnplaced) {
-     queueMicrotask(() => setSelectedAntennaId(String(nextUnplaced.antenna_id)))
-    } else {
-     queueMicrotask(() => setSelectedAntennaId(id))
-    }
-   }
-   return next
-  })
-  setAntennaDirty(true)
-  if (opts.keepVisible) setSelectedAntennaId(id)
- }, [antennas])
-
- const handleRemoveAntennaPlacement = useCallback((antennaId) => {
-  if (antennaId == null || antennaId === '') return
-  const id = String(antennaId)
-  setAntennaPlacements(prev => {
-   if (!prev[id]) return prev
-   const next = { ...prev }
-   delete next[id]
-   return next
-  })
-  setAntennaDirty(true)
- }, [])
-
- const handleRemoveAllAntennas = useCallback(() => {
-  if (Object.keys(antennaPlacements).length === 0) return
-  if (!window.confirm('Remove all antenna pins from the map?')) return
-  setAntennaPlacements({})
-  setAntennaDirty(true)
- }, [antennaPlacements])
-
- const handleSaveAntennaPlacements = useCallback(async () => {
-  setAntennaSaving(true)
-  try {
-   const saved = await apiPut('/api/antenna-placements', placementsToPayload(antennaPlacements))
-   const normalized = normalizeAntennaPlacements(saved)
-   setAntennaPlacements(normalized)
-   antennaBaseline.current = normalized
-   setAntennaDirty(false)
-   setStatusMessage('Antenna placements saved.')
-  } catch {
-   setStatusMessage('Could not save antenna placements — is the API running?')
-  } finally {
-   setAntennaSaving(false)
-  }
- }, [antennaPlacements])
-
- const handlePlaceStation = useCallback((stationKey, x, y, opts = {}) => {
-  const id = String(stationKey)
-  setStationPlacements(prev => {
-   const existing = prev[id]
-   const wasNew = !existing
-   const next = {
-    ...prev,
-    [id]: {
-     x,
-     y,
-     visible: opts.keepVisible && existing ? existing.visible !== false : true,
-    },
-   }
-   if (wasNew && !opts.keepVisible) {
-    const nextUnplaced = PRODUCTION_LINE_STATIONS.find(s => !next[s.station])
-    if (nextUnplaced) {
-     queueMicrotask(() => setSelectedStationId(nextUnplaced.station))
-    } else {
-     queueMicrotask(() => setSelectedStationId(id))
-    }
-   }
-   return next
-  })
-  setStationDirty(true)
-  if (opts.keepVisible) setSelectedStationId(id)
- }, [])
-
- const handleRemoveStationPlacement = useCallback((stationKey) => {
-  if (stationKey == null || stationKey === '') return
-  const id = String(stationKey)
-  setStationPlacements(prev => {
-   if (!prev[id]) return prev
-   const next = { ...prev }
-   delete next[id]
-   return next
-  })
-  setStationDirty(true)
- }, [])
-
- const handleRemoveAllStations = useCallback(() => {
-  if (Object.keys(stationPlacements).length === 0) return
-  if (!window.confirm('Remove all station pins from the map?')) return
-  setStationPlacements({})
-  setStationDirty(true)
- }, [stationPlacements])
-
- const handleSaveStationPlacements = useCallback(async () => {
-  setStationSaving(true)
-  try {
-   const saved = await apiPut('/api/station-placements', stationPlacementsToPayload(stationPlacements))
-   const normalized = normalizeStationPlacements(saved)
-   setStationPlacements(normalized)
-   stationBaseline.current = normalized
-   setStationDirty(false)
-   setStatusMessage('Station pins saved.')
-  } catch {
-   setStatusMessage('Could not save station pins — is the API running?')
-  } finally {
-   setStationSaving(false)
-  }
- }, [stationPlacements])
-
- const loadDemoOperators = useCallback(async () => {
-  setDemoBusy(true)
-  try {
-   await apiPost('/api/rtls/demo')
-   await refresh()
-   setStatusMessage('Demo operators loaded — place station pins to show them on the map')
-  } catch {
-   setStatusMessage('Could not load demo operators — restart the API (start.ps1) first')
-  } finally {
-   setDemoBusy(false)
-  }
- }, [refresh])
-
- const clearDemoOperators = useCallback(async () => {
-  setDemoBusy(true)
-  try {
-   await apiDelete('/api/rtls/demo')
-   await refresh()
-   setStatusMessage('Demo operators cleared')
-  } catch {
-   setStatusMessage('Could not clear demo operators')
-  } finally {
-   setDemoBusy(false)
-  }
- }, [refresh])
-
  const operatorsByStationMap = useMemo(
   () => operatorsByStation(rtls, stationsWithShapes),
   [rtls, stationsWithShapes],
@@ -482,7 +305,13 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   const stationMeta = new Map(PRODUCTION_LINE_STATIONS.map(s => [s.station, s]))
   const markers = []
   for (const [station, ops] of operatorsByStationMap) {
-   if (ops.length === 0) continue
+   // Operator dots only at stations that currently have a part
+   const stSessions = sessionsByStation[station]
+    ?? sessionsByStation[station === 'Tennoner' ? 'Tenoner' : station === 'Tenoner' ? 'Tennoner' : '']
+    ?? []
+   const hasPart = stSessions.some(s => s.status === 'open' || s.status === 'exit_only')
+   if (!hasPart) continue
+
    const pin = stationPlacements[station]
    const machine = machinesByStation.get(station)
    let x = null
@@ -491,7 +320,6 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
     x = pin.x
     y = pin.y
    } else if (machine?.polygon?.length >= 3) {
-    // Temporary fallback while pins are being placed
     const c = polygonCentroid(machine.polygon)
     x = c.x
     y = c.y
@@ -514,7 +342,7 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   return markers.sort((a, b) =>
    (a.op.operator_name || '').localeCompare(b.op.operator_name || ''),
   )
- }, [operatorsByStationMap, stationsWithShapes, stationPlacements])
+ }, [operatorsByStationMap, stationsWithShapes, stationPlacements, sessionsByStation])
 
  const hasZoneOperators = useMemo(() => {
   for (const ops of operatorsByStationMap.values()) {
@@ -530,247 +358,292 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
  const showConfigWarning = health != null && !health.enabled
  const showDisconnected = rtlsEnabled && !connected && !hasZoneOperators
  const showNoPositions = rtlsEnabled && connected && !hasZoneOperators
+
  const allMachineStatuses = useMemo(
-  () => getAllStationStatuses(PRODUCTION_LINE_STATIONS, PRODUCTION_LINE_ORDER, sessionsByStation, rtls, operatorsByStationMap),
+  () => getAllStationStatuses(
+   PRODUCTION_LINE_STATIONS,
+   PRODUCTION_LINE_ORDER,
+   sessionsByStation,
+   rtls,
+   operatorsByStationMap,
+  ),
   [sessionsByStation, rtls, operatorsByStationMap],
  )
- const machinesInUseCount = useMemo(
-  () => allMachineStatuses.filter(s => s.inUse).length,
+
+ const getDelayLevel = useCallback((session) => {
+  const dwell = sessionDwellSeconds(session)
+  if (dwell == null) return 'ok'
+  const spec = specsByStation[session.station_name]
+   ?? specsByStation[session.station_name === 'Tennoner' ? 'Tenoner' : '']
+  const maxSec = spec?.max_dwell_seconds
+  const targetSec = spec?.target_part_dwell_seconds
+  if (maxSec != null && dwell >= maxSec) return 'critical'
+  if (targetSec != null && dwell >= targetSec) return 'warn'
+  return 'ok'
+ }, [specsByStation])
+
+ const delayedSessionCount = useMemo(
+  () => liveSessions.filter(s => {
+   const level = getDelayLevel(s)
+   return level === 'warn' || level === 'critical'
+  }).length,
+  [liveSessions, getDelayLevel],
+ )
+
+ const stationsDelayed = useMemo(() => {
+  return allMachineStatuses.filter(st => {
+   const station = PRODUCTION_LINE_STATIONS.find(s => s.station === st.stationKey)
+   if (!station) return st.light === 'amber'
+   const sessions = sessionsForStation(sessionsByStation, station)
+    .filter(s => s.status === 'open' || s.status === 'exit_only')
+   return sessions.some(s => {
+    const level = getDelayLevel(s)
+    return level === 'warn' || level === 'critical'
+   }) || st.light === 'amber'
+  }).length
+ }, [allMachineStatuses, sessionsByStation, getDelayLevel])
+
+ const unstaffedStations = useMemo(
+  () => allMachineStatuses.filter(s => s.hasPart && !s.hasOperator).length,
   [allMachineStatuses],
  )
 
+ const ordersBehind = useMemo(() => {
+  return openIbusJourneys.filter(j => {
+   if (j.actual_vs_estimated_seconds != null && j.actual_vs_estimated_seconds > 0) return true
+   // Any open part over dwell target
+   for (const p of j.parts ?? []) {
+    const openM = [...(p.machines ?? [])].reverse().find(m => m.status === 'open' || m.status === 'Open')
+    if (!openM) continue
+    const level = getDelayLevel({
+     ...openM,
+     station_name: openM.station_name,
+     entry_time: openM.entry_time,
+     entry_epoch_ms: openM.entry_epoch_ms,
+    })
+    if (level === 'warn' || level === 'critical') return true
+   }
+   return false
+  }).length
+ }, [openIbusJourneys, getDelayLevel])
+
+ const partsInProcess = liveSessions.length
+ const activePartsOnMap = useMemo(
+  () => liveSessions.filter(s => s.status === 'open' || s.status === 'exit_only').length,
+  [liveSessions],
+ )
+
+ const loadDemoOperators = useCallback(async () => {
+  setDemoBusy(true)
+  try {
+   await apiPost('/api/rtls/demo')
+   await refresh()
+   setStatusMessage('Demo operators loaded')
+  } catch {
+   setStatusMessage('Could not load demo operators — restart the API first')
+  } finally {
+   setDemoBusy(false)
+  }
+ }, [refresh])
+
+ const clearDemoOperators = useCallback(async () => {
+  setDemoBusy(true)
+  try {
+   await apiDelete('/api/rtls/demo')
+   await refresh()
+   setStatusMessage('Demo operators cleared')
+  } catch {
+   setStatusMessage('Could not clear demo operators')
+  } finally {
+   setDemoBusy(false)
+  }
+ }, [refresh])
+
+ const handlePartClick = useCallback((session) => {
+  const key = ibusOrderKey(session) || session.ibus_number || session.work_order
+  if (key) setSelectedOrderKey(key)
+ }, [])
+
+ const handleStationSelect = useCallback((stationKey) => {
+  setSelectedStationKey(prev => (prev === stationKey ? null : stationKey))
+ }, [])
+
+ const selectedStationMeta = useMemo(() => {
+  if (!selectedStationKey) return null
+  const status = allMachineStatuses.find(s => s.stationKey === selectedStationKey)
+  const station = PRODUCTION_LINE_STATIONS.find(s => s.station === selectedStationKey)
+  const sessions = station
+   ? sessionsForStation(sessionsByStation, station).filter(s => s.status === 'open' || s.status === 'exit_only')
+   : (sessionsByStation[selectedStationKey] ?? [])
+  return {
+   stationKey: selectedStationKey,
+   stationName: status?.stationName || station?.name || selectedStationKey,
+   status,
+   sessions,
+  }
+ }, [selectedStationKey, allMachineStatuses, sessionsByStation])
+
+ const alerts = useMemo(() => {
+  const list = []
+  if (ordersBehind > 0) list.push(`${ordersBehind} order${ordersBehind === 1 ? '' : 's'} behind target`)
+  if (stationsDelayed > 0) list.push(`${stationsDelayed} station${stationsDelayed === 1 ? '' : 's'} delayed`)
+  if (unstaffedStations > 0) list.push(`${unstaffedStations} unstaffed station${unstaffedStations === 1 ? '' : 's'}`)
+  if (delayedSessionCount > 0) list.push(`${delayedSessionCount} part${delayedSessionCount === 1 ? '' : 's'} over dwell target`)
+  return list
+ }, [ordersBehind, stationsDelayed, unstaffedStations, delayedSessionCount])
+
  return (
   <div className="space-y-3">
-   <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-stretch">
-   <Panel
-    className="min-w-0 flex flex-col"
-    title="Floor Plan"
-    subtitle="Operators by zone · parts at last RFID antenna"
-    icon={MapIcon}
-    iconColor="text-[#4dc4f4]"
-   >
-    {error && (
-     <div className="mx-5 mt-4 flex items-center gap-2 text-sm text-[#f87171] shrink-0">
-      <AlertCircle className="w-4 h-4 shrink-0" />
-      {error}
-     </div>
-    )}
+   {/* Shift status */}
+   <div className="bb-kpi-strip">
+    <div>
+     <p className="bb-kpi-label">Orders behind</p>
+     <p className={`bb-kpi-value ${ordersBehind > 0 ? 'text-[#fbbf24]' : ''}`}>{ordersBehind}</p>
+    </div>
+    <div>
+     <p className="bb-kpi-label">Parts in process</p>
+     <p className="bb-kpi-value">{partsInProcess}</p>
+    </div>
+    <div>
+     <p className="bb-kpi-label">Stations delayed</p>
+     <p className={`bb-kpi-value ${stationsDelayed > 0 ? 'text-[#fbbf24]' : ''}`}>{stationsDelayed}</p>
+    </div>
+    <div>
+     <p className="bb-kpi-label">Unstaffed stations</p>
+     <p className={`bb-kpi-value ${unstaffedStations > 0 ? 'text-[#fbbf24]' : ''}`}>{unstaffedStations}</p>
+    </div>
+   </div>
 
-    {showConfigWarning && (
-     <div className="mx-5 mt-4 flex items-center gap-2 text-sm text-[#fbbf24]
- bg-[#fbbf24]/10 dark:bg-[#fbbf24]/100/10 border border-[#fbbf24]/30 border-[#fbbf24]/20
-             rounded-lg px-3 py-2 shrink-0">
-      <AlertCircle className="w-4 h-4 shrink-0" />
-      RTLS ingestion is disabled. Set ENABLE_LIVE_INGESTION=true in .env and restart the API.
-     </div>
-    )}
-
-    {showDisconnected && (
-     <div className="mx-5 mt-4 flex flex-wrap items-center gap-2 text-sm text-[#fbbf24]
- bg-[#fbbf24]/10 dark:bg-[#fbbf24]/100/10 border border-[#fbbf24]/30 border-[#fbbf24]/20
-             rounded-lg px-3 py-2 shrink-0">
-      <AlertCircle className="w-4 h-4 shrink-0" />
-      <span className="flex-1 min-w-0">
-       Sewio WebSocket is disconnected — waiting for zone events. Check factory network access to 10.25.80.13.
-      </span>
+   {(alerts.length > 0 || showConfigWarning || showDisconnected || error) && (
+    <div className="flex flex-wrap items-center gap-2 text-xs">
+     {alerts.map(a => (
+      <span key={a} className="bb-badge-warn">{a}</span>
+     ))}
+     {(showConfigWarning || showDisconnected || error) && (
       <button
        type="button"
-       disabled={demoBusy}
-       onClick={loadDemoOperators}
-       className="shrink-0 px-2.5 py-1 rounded-md text-xs font-medium
- bg-amber-600/90 hover:bg-amber-600 text-white disabled:opacity-50"
+       onClick={() => setShowSystemStatus(v => !v)}
+       className="bb-btn-outline text-[#8b939e]"
       >
-       {demoBusy ? 'Loading…' : 'Load demo operators'}
+       <AlertCircle className="w-3 h-3" />
+       System
       </button>
-     </div>
-    )}
+     )}
+    </div>
+   )}
 
-    {showNoPositions && (
-     <div className="mx-5 mt-4 flex flex-wrap items-center gap-2 text-sm text-[#8b939e] dark:text-[#8b939e]
- bg-[#4dc4f4]/5 border border-[#27272f]
-             rounded-lg px-3 py-2 shrink-0">
-      <AlertCircle className="w-4 h-4 shrink-0" />
-      <span className="flex-1 min-w-0">
-       Connected to Sewio but no operators in a mapped zone yet.
-      </span>
-      <button
-       type="button"
-       disabled={demoBusy}
-       onClick={loadDemoOperators}
-       className="shrink-0 px-2.5 py-1 rounded-md text-xs font-medium
- bg-[#4dc4f4] hover:bg-[#6dd0f7] text-[#08080a] text-white disabled:opacity-50"
-      >
-       {demoBusy ? 'Loading…' : 'Load demo operators'}
-      </button>
-     </div>
-    )}
-
-    {operators.length > 0 && (
-     <div className="mx-5 mt-4 flex justify-end shrink-0">
-      <button
-       type="button"
-       disabled={demoBusy}
-       onClick={clearDemoOperators}
-       className="px-2.5 py-1 rounded-md text-xs font-medium text-[#8b939e]
- hover:bg-[#4dc4f4]/10 disabled:opacity-50"
-      >
+   {showSystemStatus && (showConfigWarning || showDisconnected || showNoPositions || error) && (
+    <div className="bb-panel px-3 py-2 space-y-1.5 text-xs">
+     <p className="text-[10px] font-semibold uppercase tracking-wider text-[#8b939e]">System status</p>
+     {error && <p className="text-[#f87171]">{error}</p>}
+     {showConfigWarning && (
+      <p className="text-[#fbbf24]">
+       RTLS ingestion is disabled. Set ENABLE_LIVE_INGESTION=true in .env and restart the API.
+      </p>
+     )}
+     {showDisconnected && (
+      <div className="flex flex-wrap items-center gap-2 text-[#fbbf24]">
+       <span className="flex-1">Sewio WebSocket disconnected.</span>
+       <button type="button" disabled={demoBusy} onClick={loadDemoOperators} className="bb-btn-outline">
+        {demoBusy ? 'Loading…' : 'Load demo operators'}
+       </button>
+      </div>
+     )}
+     {showNoPositions && (
+      <div className="flex flex-wrap items-center gap-2 text-[#8b939e]">
+       <span className="flex-1">Connected — no operators in a mapped zone yet.</span>
+       <button type="button" disabled={demoBusy} onClick={loadDemoOperators} className="bb-btn-outline">
+        {demoBusy ? 'Loading…' : 'Load demo operators'}
+       </button>
+      </div>
+     )}
+     {operators.length > 0 && (
+      <button type="button" disabled={demoBusy} onClick={clearDemoOperators} className="bb-btn-ghost text-xs">
        Clear demo operators
       </button>
-     </div>
-    )}
-
-    {statusMessage && (
-     <div className="mx-5 mt-4 flex items-center gap-2 text-sm text-[#4dc4f4]
- bg-[#4dc4f4]/10 dark:bg-[#4dc4f4]/100/10 border border-[#4dc4f4]/30 border-[#4dc4f4]/20
-             rounded-lg px-3 py-2 shrink-0">
-      <AlertCircle className="w-4 h-4 shrink-0" />
-      {statusMessage}
-     </div>
-    )}
-
-    <div className="px-4 sm:px-5 pt-4 shrink-0">
-     <div className="flex flex-wrap items-center gap-2">
-      <span className="text-xs font-medium text-[#8b939e] shrink-0">
-       Map
-      </span>
-      <button
-       type="button"
-       onClick={antennaMode ? exitAntennaMode : enterAntennaMode}
-       disabled={stationMode}
-       className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium
-             border transition-colors disabled:opacity-40
-        ${antennaMode
-         ? 'bg-[#fbbf24]/10 text-[#fbbf24] border-amber-300 dark:bg-[#fbbf24]/100/15 dark:border-amber-500/40'
-         : 'bg-transparent text-[#8b939e] border-[#27272f] hover:border-[#fbbf24] hover:text-[#fbbf24]'
-        }`}
-       title="Place RFID antennas used for part chip locations"
-      >
-       <MapPin className="w-3 h-3" />
-       {antennaMode ? 'Exit antennas' : 'Place antennas'}
-      </button>
-      <button
-       type="button"
-       onClick={stationMode ? exitStationMode : enterStationMode}
-       disabled={antennaMode}
-       className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium
-             border transition-colors disabled:opacity-40
-        ${stationMode
-         ? 'bg-[#4dc4f4]/10 text-sky-800 border-sky-300 dark:bg-[#4dc4f4]/100/15 dark:border-sky-500/40'
-         : 'bg-transparent text-[#8b939e] border-[#27272f] hover:border-[#4dc4f4] hover:text-[#4dc4f4]'
-        }`}
-       title="Place station pins used for operator locations"
-      >
-       <UserRound className="w-3 h-3" />
-       {stationMode ? 'Exit stations' : 'Place stations'}
-      </button>
-      {!antennaMode && !stationMode && (
-       <>
-        <button
-         type="button"
-         onClick={() => setShowAntennaMarkers(v => !v)}
-         className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs
- text-[#8b939e] border border-[#27272f] 
-               hover:bg-[#4dc4f4]/5 hover:bg-[#4dc4f4]/10"
-         title={showAntennaMarkers ? 'Hide antenna pins' : 'Show antenna pins'}
-        >
-         {showAntennaMarkers ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-         Antennas
-        </button>
-        <button
-         type="button"
-         onClick={() => setShowStationMarkers(v => !v)}
-         className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs
- text-[#8b939e] border border-[#27272f] 
-               hover:bg-[#4dc4f4]/5 hover:bg-[#4dc4f4]/10"
-         title={showStationMarkers ? 'Hide station pins' : 'Show station pins'}
-        >
-         {showStationMarkers ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-         Stations
-        </button>
-       </>
-      )}
-     </div>
+     )}
     </div>
+   )}
 
-    <div className="p-4 sm:p-5 pt-3">
-     <div className="relative">
-      {antennaMode && (
-       <AntennaPlaceToolbar
-        antennas={antennas}
-        selectedId={selectedAntennaId}
-        onSelect={setSelectedAntennaId}
-        placements={antennaPlacements}
-        onRemove={handleRemoveAntennaPlacement}
-        onRemoveAll={handleRemoveAllAntennas}
-        onSave={handleSaveAntennaPlacements}
-        onCancel={exitAntennaMode}
-        saving={antennaSaving}
-        dirty={antennaDirty}
-        showMarkers={showAntennaMarkers}
-        onToggleShowMarkers={() => setShowAntennaMarkers(v => !v)}
-       />
-      )}
-      {stationMode && (
-       <StationPlaceToolbar
+   {statusMessage && (
+    <p className="text-xs text-[#8b939e]">{statusMessage}</p>
+   )}
+
+   {/* Production focus */}
+   <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-stretch min-h-[22rem]">
+    <div className="min-w-0 min-h-[18rem] lg:min-h-0 h-full overflow-hidden">
+     <IbusOrdersSidebar
+      journeys={openIbusJourneys}
+      selectedKey={selectedOrderKey}
+      onSelectedKeyChange={setSelectedOrderKey}
+     />
+    </div>
+    <div className="min-w-0 min-h-[18rem] lg:min-h-0 h-full overflow-hidden">
+     <MachineStatusTable
+      statuses={allMachineStatuses}
+      selectedStationKey={selectedStationKey}
+      onStationClick={(row) => handleStationSelect(row.stationKey)}
+     />
+    </div>
+   </div>
+
+   {selectedStationMeta && (
+    <StationDetailPanel
+     stationKey={selectedStationMeta.stationKey}
+     stationName={selectedStationMeta.stationName}
+     status={selectedStationMeta.status}
+     sessions={selectedStationMeta.sessions}
+     onClose={() => setSelectedStationKey(null)}
+    />
+   )}
+
+   {/* Collapsible live map — secondary */}
+   <div className="bb-panel">
+    <button
+     type="button"
+     onClick={() => setMapOpen(v => !v)}
+     className="w-full bb-panel-header hover:bg-white/[0.02] transition-colors text-left"
+    >
+     <div className="min-w-0 flex items-center gap-2">
+      <MapIcon className="w-10 h-10 text-[#8b939e]" />
+      <div>
+       <h2 className="bb-title">Live floor map</h2>
+       <p className="bb-subtitle">
+        {activePartsOnMap} active part{activePartsOnMap === 1 ? '' : 's'}
+        {delayedSessionCount > 0 ? ` · ${delayedSessionCount} delayed` : ''}
+        {operators.length > 0 ? ` · ${operators.length} operator${operators.length === 1 ? '' : 's'} at stations` : ''}
+       </p>
+      </div>
+     </div>
+     <ChevronDown
+      className={`w-4 h-4 text-[#8b939e] transition-transform ${mapOpen ? '' : '-rotate-90'}`}
+     />
+    </button>
+
+    {mapOpen && (
+     <div className="p-2 pt-0 space-y-1.5">
+      <div className="w-full">
+       <MemoFloorPlanMap
+        liveSessions={liveSessions.filter(s => s.status === 'open' || s.status === 'exit_only')}
+        operators={operators}
+        machines={mapMachines}
+        antennaPlacements={antennaPlacements}
+        showAntennaMarkers={false}
         stations={PRODUCTION_LINE_STATIONS}
-        selectedId={selectedStationId}
-        onSelect={setSelectedStationId}
-        placements={stationPlacements}
-        onRemove={handleRemoveStationPlacement}
-        onRemoveAll={handleRemoveAllStations}
-        onSave={handleSaveStationPlacements}
-        onCancel={exitStationMode}
-        saving={stationSaving}
-        dirty={stationDirty}
-        showMarkers={showStationMarkers}
-        onToggleShowMarkers={() => setShowStationMarkers(v => !v)}
+        stationPlacements={stationPlacements}
+        showStationMarkers
+        mapRef={mapRef}
+        getDelayLevel={getDelayLevel}
+        onPartClick={handlePartClick}
+        onStationClick={(id) => handleStationSelect(id)}
        />
-      )}
-      <MemoFloorPlanMap
-       liveSessions={liveSessions}
-       operators={operators}
-       machines={mapMachines}
-       antennaMode={antennaMode}
-       stationMode={stationMode}
-       antennas={antennas}
-       antennaPlacements={antennaPlacements}
-       selectedAntennaId={selectedAntennaId}
-       onPlaceAntenna={handlePlaceAntenna}
-       onSelectAntenna={setSelectedAntennaId}
-       onRemoveAntenna={handleRemoveAntennaPlacement}
-       showAntennaMarkers={showAntennaMarkers}
-       stations={PRODUCTION_LINE_STATIONS}
-       stationPlacements={stationPlacements}
-       selectedStationId={selectedStationId}
-       onPlaceStation={handlePlaceStation}
-       onSelectStation={setSelectedStationId}
-       onRemoveStation={handleRemoveStationPlacement}
-       showStationMarkers={showStationMarkers}
-       mapRef={mapRef}
-      />
+      </div>
+      <p className="text-[11px] text-[#8b939e] px-1">
+       Amber/red = over dwell target · Click a part for its work order · Click a station pin for queue detail
+       {' · '}Floor plan pins are configured in Settings
+      </p>
      </div>
-
-     <p className="mt-3 text-xs text-[#8b939e] text-center">
-      {antennaMode
-       ? 'Antenna mode — select an antenna, click the map to place it · Save to persist'
-       : stationMode
-        ? 'Station mode — select a machine, click the map to place its operator pin · Save to persist'
-        : 'Colored chips = parts by IBUS order · White dots = operators at station pins'}
-      {!antennaMode && !stationMode
-       ? ` · ${allMachineStatuses.length} machines (${machinesInUseCount} in use)`
-       : ''}
-      {' · '}Origin at white rectangle top-left · {FLOOR_PLAN.scalePxPerM} px/m
-     </p>
-    </div>
-   </Panel>
-
-   <div className="min-w-0 min-h-[24rem] lg:min-h-0 h-full self-stretch overflow-hidden">
-    <IbusOrdersSidebar journeys={openIbusJourneys} />
-   </div>
-   </div>
-
-   <div className="min-h-[16rem]">
-    <MachineStatusTable statuses={allMachineStatuses} />
+    )}
    </div>
   </div>
  )

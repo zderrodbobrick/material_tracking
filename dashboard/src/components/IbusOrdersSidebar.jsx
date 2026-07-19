@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, CheckCircle2, Package } from 'lucide-react'
+import { ArrowLeft } from 'lucide-react'
 import { ibusOrderKey, partTagLabel } from '../utils/ibusOrder'
 import { ibusAccent } from '../utils/ibusColors'
 import { DwellTimer, formatDwell } from './DwellTimer'
@@ -7,14 +7,6 @@ import { PRODUCTION_LINE_ORDER } from '../utils/machineRegions'
 
 const COMPLETE_HOLD_MS = 900
 const DEPART_MS = 1100
-
-const GREEN = {
- card: 'border-[#34d399]/90 from-[#34d399]/10 to-[#18181d]',
- barTrack: 'bg-[#27272f]',
- barFill: 'bg-[#34d399]',
- accentText: 'text-[#34d399]',
- softText: 'text-[#34d399]/80',
-}
 
 function ibusLabel(j) {
  return j.ibus_order ?? j.ibus_number ?? ibusOrderKey(j) ?? j.key ?? '—'
@@ -40,7 +32,6 @@ function progressPct(j) {
  if (typeof j.progress === 'number') {
   return Math.round(Math.min(1, Math.max(0, j.progress)) * 100)
  }
- // Fallback spine (RFID path) — API is source of truth
  const spine = ['Tenoner', 'LBD', 'Gannomat', 'Insert Station']
  const raw = j.current_station === 'Tennoner' ? 'Tenoner' : j.current_station
  const idx = spine.indexOf(raw)
@@ -48,14 +39,21 @@ function progressPct(j) {
  return Math.round((idx / Math.max(spine.length - 1, 1)) * 100)
 }
 
+function orderPartCount(j) {
+ return j?.expected_parts ?? j?.estimated_parts ?? j?.part_count ?? j?.parts?.length ?? 0
+}
+
 function looksComplete(j) {
- if (progressPct(j) >= 100) return true
  const parts = j?.parts ?? []
  if (!parts.length) return false
- return parts.every(p => {
+ const expected = j?.expected_parts ?? j?.estimated_parts
+ // Wait until the full BOM is on the journey before celebrating.
+ if (expected && parts.length < expected) return false
+ const allAtInsert = parts.every(p => {
   const st = p?.current_station || ''
   return st === 'Insert Station' || st === 'Insert'
  })
+ return allAtInsert && progressPct(j) >= 100
 }
 
 function partCurrentStation(p) {
@@ -72,15 +70,26 @@ function partOpenMachine(p) {
 }
 
 /**
- * Open IBUS cards with a top progress bar (side panel next to the map).
- * At 100% the card turns green, then animates out into Completed IBUS.
+ * Open IBUS orders as a compact production list.
+ * Supports controlled selection via selectedKey / onSelectedKeyChange.
  */
-export function IbusOrdersSidebar({ journeys = [] }) {
- const [selectedKey, setSelectedKey] = useState(null)
+export function IbusOrdersSidebar({
+ journeys = [],
+ selectedKey: selectedKeyProp,
+ onSelectedKeyChange,
+}) {
+ const [internalKey, setInternalKey] = useState(null)
+ const selectedKey = selectedKeyProp !== undefined ? selectedKeyProp : internalKey
+ const setSelectedKey = (key) => {
+  if (selectedKeyProp === undefined) setInternalKey(key)
+  onSelectedKeyChange?.(key)
+ }
  /** @type {Record<string, { journey: object, phase: 'celebrate' | 'depart' }>} */
  const [staging, setStaging] = useState({})
  const prevRef = useRef([])
  const timersRef = useRef(new Map())
+ /** Keys already animated out — stay hidden until they leave the open API for real. */
+ const hiddenRef = useRef(new Set())
 
  useEffect(() => {
   return () => {
@@ -93,11 +102,21 @@ export function IbusOrdersSidebar({ journeys = [] }) {
   const prev = prevRef.current
   const nowKeys = new Set(journeys.map(j => j.key ?? ibusLabel(j)))
 
+  // Drop hide-mask once the API no longer lists the order as open.
+  for (const key of [...hiddenRef.current]) {
+   if (!nowKeys.has(key)) hiddenRef.current.delete(key)
+  }
+
   setStaging(prevStaging => {
    let next = { ...prevStaging }
 
    for (const j of journeys) {
     const key = j.key ?? ibusLabel(j)
+    if (hiddenRef.current.has(key)) {
+     // Still complete → keep hidden. Regressed → show again.
+     if (!looksComplete(j)) hiddenRef.current.delete(key)
+     else continue
+    }
     if (looksComplete(j) && !next[key]) {
      next[key] = { journey: j, phase: 'celebrate' }
      const existing = timersRef.current.get(key)
@@ -108,6 +127,7 @@ export function IbusOrdersSidebar({ journeys = [] }) {
        return { ...s, [key]: { ...s[key], phase: 'depart' } }
       })
       const t2 = setTimeout(() => {
+       hiddenRef.current.add(key)
        setStaging(s => {
         const copy = { ...s }
         delete copy[key]
@@ -132,6 +152,7 @@ export function IbusOrdersSidebar({ journeys = [] }) {
     const existing = timersRef.current.get(key)
     if (existing) clearTimeout(existing)
     const t = setTimeout(() => {
+     hiddenRef.current.add(key)
      setStaging(s => {
       const copy = { ...s }
       delete copy[key]
@@ -153,16 +174,22 @@ export function IbusOrdersSidebar({ journeys = [] }) {
   [journeys],
  )
 
- const selected = useMemo(
-  () => journeys.find(j => (j.key ?? ibusLabel(j)) === selectedKey) ?? null,
-  [journeys, selectedKey],
- )
+ const selected = useMemo(() => {
+  if (selectedKey == null) return null
+  return journeys.find(j => {
+   const key = j.key ?? ibusLabel(j)
+   if (key === selectedKey) return true
+   const label = ibusLabel(j)
+   return label === selectedKey || j.ibus_number === selectedKey || j.work_order === selectedKey
+  }) ?? null
+ }, [journeys, selectedKey])
 
- const displayCards = useMemo(() => {
+ const displayRows = useMemo(() => {
   const items = []
   const seen = new Set()
   for (const j of journeys) {
    const key = j.key ?? ibusLabel(j)
+   if (hiddenRef.current.has(key) && !staging[key]) continue
    seen.add(key)
    const st = staging[key]
    items.push({
@@ -187,135 +214,100 @@ export function IbusOrdersSidebar({ journeys = [] }) {
 
  return (
   <aside className="flex flex-col min-h-0 min-w-0 w-full h-full">
-   <div
-    className="rounded-xl border border-[#27272f] bg-[#18181d] shadow-sm overflow-hidden
- border-[#27272f]/60 bg-[#18181d] flex flex-col flex-1 min-h-0 h-full"
-   >
-    <div className="px-4 py-3 border-b border-[#27272f] shrink-0">
-     <h2 className="flex items-center gap-2 text-sm font-semibold text-[#eef2f7]">
-      {selected ? (
-       <button
-        type="button"
-        onClick={() => setSelectedKey(null)}
-        className="inline-flex items-center gap-1 text-[#8b939e] hover:text-[#eef2f7]
- dark:text-[#8b939e] dark:hover:text-[#8b939e]100"
-        title="Back to orders"
-       >
-        <ArrowLeft className="w-4 h-4" />
-       </button>
-      ) : (
-       <Package className="w-4 h-4 text-[#fbbf24]" />
-      )}
-      {selected ? ibusLabel(selected) : 'In Progress IBUS'}
-      <span className="ml-auto tabular-nums text-xs font-medium text-[#8b939e]">
+   <div className="bb-panel flex flex-col flex-1 min-h-0 h-full">
+    <div className="bb-panel-header">
+     <div className="min-w-0">
+      <h2 className="bb-title">
+       {selected ? (
+        <button
+         type="button"
+         onClick={() => setSelectedKey(null)}
+         className="inline-flex items-center gap-1 text-[#8b939e] hover:text-[#eef2f7]"
+         title="Back to orders"
+        >
+         <ArrowLeft className="w-3.5 h-3.5" />
+        </button>
+       ) : null}
+       {selected ? ibusLabel(selected) : 'Current Production'}
+      </h2>
+      <p className="bb-subtitle">
        {selected
-        ? `${selected.parts?.length ?? selected.part_count ?? 0} parts`
-        : journeys.length}
-      </span>
-     </h2>
-     <p className="text-[11px] text-[#8b939e] mt-0.5">
+        ? `${shortStation(selected.current_station)} · part locations`
+        : 'Open IBUS orders'}
+      </p>
+     </div>
+     <span className="tabular-nums text-xs font-medium text-[#8b939e]">
       {selected
-       ? `${shortStation(selected.current_station)} · live dwell while at a station`
-       : 'Open orders — click a card to see parts & locations'}
-     </p>
+       ? `${orderPartCount(selected)} parts`
+       : journeys.length}
+     </span>
     </div>
 
     {selected ? (
      <OrderPartsDetail order={selected} accent={ibusAccent(selected.key ?? ibusLabel(selected), knownKeys)} />
-    ) : displayCards.length === 0 ? (
-     <p className="px-4 py-8 text-center text-xs text-[#8b939e]">
-      No open IBUS orders
-     </p>
+    ) : displayRows.length === 0 ? (
+     <p className="bb-empty">No open IBUS orders</p>
     ) : (
-     <div className="p-3.5 overflow-y-auto flex-1 min-h-0">
-      <div className="grid grid-cols-2 sm:grid-cols-2 gap-3">
-       {displayCards.map(({ key, journey: j, phase }) => {
-        const label = ibusLabel(j)
-        const pct = phase === 'normal' ? progressPct(j) : 100
-        const done = phase === 'celebrate' || phase === 'depart'
-        const accent = done ? GREEN : ibusAccent(key, knownKeys)
-        const anim =
-         phase === 'depart'
-          ? 'animate-ibus-depart pointer-events-none'
-          : phase === 'celebrate'
-           ? 'animate-ibus-complete'
-           : ''
-        return (
-         <button
-          key={key}
-          type="button"
-          onClick={() => { if (!done) setSelectedKey(key) }}
-          disabled={done}
-          className={`relative aspect-square min-h-[8.5rem] rounded-xl border bg-gradient-to-b overflow-hidden
-                flex flex-col shadow-sm text-left
-                hover:brightness-[1.03] focus:outline-none focus-visible:ring-2
-                focus-visible:ring-offset-1 focus-visible:ring-amber-400
-                ${done ? 'cursor-default' : 'cursor-pointer'}
-                ${accent.card} ${anim}`}
-          title={
-           done
-            ? `${label} · Complete — moving to Completed IBUS`
-            : `${label} · ${pct}% · ${j.current_station ?? ''} — click for parts`
-          }
-         >
-          <div className={`h-2.5 w-full shrink-0 ${accent.barTrack}`}>
-           <div
-            className={`h-full transition-[width] duration-500 ${accent.barFill}`}
-            style={{ width: `${pct}%` }}
-           />
-          </div>
-
-          <div className="flex-1 flex flex-col justify-between p-3 min-h-0">
-           <p className="font-mono text-xs sm:text-sm font-bold text-[#eef2f7]
- leading-snug break-all">
-            {label}
-           </p>
-           {(j.part_count > 1 || (j.parts?.length ?? 0) > 1) && (
-            <p className={`text-[10px] ${accent.softText}`}>
-             {j.part_count ?? j.parts?.length} parts
-            </p>
-           )}
-           <div className="space-y-1">
-            <p className={`text-xs truncate ${done ? accent.accentText : 'text-[#8b939e]'}`}>
-             {done ? (
-              <span className="inline-flex items-center gap-1 font-medium">
-               <CheckCircle2 className="w-3.5 h-3.5" />
-               Complete
-              </span>
-             ) : (
-              shortStation(j.current_station)
-             )}
-            </p>
-            <div className="flex items-center justify-between gap-1">
-             <span className={`text-xs font-semibold tabular-nums ${accent.accentText}`}>
+     <div className="overflow-y-auto flex-1 min-h-0">
+      <table className="bb-table">
+       <thead className="bb-table-head sticky top-0 z-10">
+        <tr>
+         <th>IBUS</th>
+         <th>Station</th>
+         <th className="text-right">Progress</th>
+         <th className="text-right">Elapsed</th>
+        </tr>
+       </thead>
+       <tbody>
+        {displayRows.map(({ key, journey: j, phase }) => {
+         const label = ibusLabel(j)
+         const pct = phase === 'normal' ? progressPct(j) : 100
+         const done = phase === 'celebrate' || phase === 'depart'
+         const anim =
+          phase === 'depart'
+           ? 'animate-ibus-depart pointer-events-none'
+           : phase === 'celebrate'
+            ? 'animate-ibus-complete'
+            : ''
+         return (
+          <tr
+           key={key}
+           className={`bb-table-row cursor-pointer ${anim} ${done ? 'opacity-80' : ''}`}
+           onClick={() => { if (!done) setSelectedKey(key) }}
+           title={done ? `${label} · Complete` : `${label} · ${pct}%`}
+          >
+           <td>
+            <p className="font-mono text-xs font-semibold text-[#eef2f7]">{label}</p>
+            {orderPartCount(j) > 1 && (
+             <p className="text-[10px] text-[#8b939e]">{orderPartCount(j)} parts</p>
+            )}
+           </td>
+           <td className="text-xs text-[#8b939e]">
+            {done ? <span className="text-[#34d399]">Complete</span> : shortStation(j.current_station)}
+           </td>
+           <td className="text-right">
+            <div className="inline-flex flex-col items-end gap-0.5 min-w-[3.5rem]">
+             <span className={`text-xs font-semibold tabular-nums ${done ? 'text-[#34d399]' : 'text-[#4dc4f4]'}`}>
               {pct}%
              </span>
-             {!done && j.estimated_total_display && (
-              <span className="text-[10px] font-mono text-[#4dc4f4]/90 truncate" title={
-               `${j.estimated_parts ?? j.part_count ?? '?'} parts × per-part estimate`
-              }>
-               Est {j.estimated_total_display}
-              </span>
-             )}
+             <span className="h-1 w-12 rounded-sm bg-[#2a2a32] overflow-hidden">
+              <span
+               className={`block h-full ${done ? 'bg-[#34d399]' : 'bg-[#4dc4f4]'}`}
+               style={{ width: `${pct}%` }}
+              />
+             </span>
             </div>
-            {!done && (
-             <p className="text-[10px] font-mono text-[#8b939e] truncate" title="Elapsed since first part entered">
-              {j.total_production_display
-               ?? formatDwell(j.total_production_seconds)
-               ?? '—'}
-              {' '}
-              elapsed
-             </p>
-            )}
-            {done && (
-             <p className="text-[10px] font-mono text-[#8b939e]">→ Completed</p>
-            )}
-           </div>
-          </div>
-         </button>
-        )
-       })}
-      </div>
+           </td>
+           <td className="text-right font-mono text-[11px] text-[#8b939e] whitespace-nowrap">
+            {j.total_production_display
+             ?? formatDwell(j.total_production_seconds)
+             ?? '—'}
+           </td>
+          </tr>
+         )
+        })}
+       </tbody>
+      </table>
      </div>
     )}
    </div>
@@ -329,73 +321,67 @@ function OrderPartsDetail({ order, accent }) {
  return (
   <div className="overflow-y-auto flex-1 min-h-0">
    {order.estimated_total_display && (
-    <div className="px-3.5 py-2 border-b border-[#27272f]/50 bg-[#08080a]/40">
+    <div className="px-3 py-2 border-b border-[#2a2a32] bg-[#08080a]/50">
      <p className="text-[10px] uppercase tracking-wider text-[#8b939e]">Order estimate</p>
      <p className="text-sm font-mono tabular-nums text-[#4dc4f4] mt-0.5">
       {order.estimated_total_display}
       <span className="text-[#8b939e] text-xs font-normal ml-1.5">
-       ({order.estimated_parts ?? order.part_count} parts)
+       ({orderPartCount(order)} parts)
       </span>
      </p>
-     {order.total_production_display && (
-      <p className="text-[10px] font-mono text-[#8b939e] mt-0.5">
-       {order.total_production_display} elapsed
-      </p>
-     )}
     </div>
    )}
    {parts.length === 0 ? (
-    <p className="px-4 py-8 text-center text-xs text-[#8b939e]">
-     No parts tracked for this order yet
-    </p>
+    <p className="bb-empty">No parts tracked for this order yet</p>
    ) : (
-    <ul className="divide-y divide-[#27272f]/50">
-     {parts.map(p => {
-      const tag = p.part_tag || partTagLabel(p) || p.epc || '—'
-      const station = partCurrentStation(p)
-      const openM = partOpenMachine(p)
-      return (
-       <li
-        key={p.epc || tag}
-        className={`px-3.5 py-2.5 ${accent.rowHover}`}
-       >
-        <div className="flex items-start gap-2.5">
-         <span
-          className="mt-1.5 w-2 h-2 rounded-full shrink-0 ring-1 ring-white/80"
-          style={{ backgroundColor: accent.hex }}
-          title={ibusLabel(order)}
-         />
-         <div className="min-w-0 flex-1">
-          <p className="font-mono text-[11px] font-semibold text-[#eef2f7] break-all">
-           {tag}
-          </p>
-          <p className="text-[10px] text-[#8b939e] mt-0.5 truncate">
-           {[p.part_number, p.part_name].filter(Boolean).join(' · ') || '—'}
-          </p>
-         </div>
-         <div className="text-right shrink-0">
-          <p className={`text-[11px] font-medium ${accent.accentText}`}>
-           {shortStation(station)}
-          </p>
-          <p className="text-[10px] font-mono text-[#8b939e] mt-0.5">
-           {openM ? (
-            <DwellTimer
-             entranceTime={openM.entry_time}
-             exitTime={null}
-             dwellSeconds={null}
-            />
-           ) : (
-            p.total_production_display
-             ?? formatDwell(p.total_production_seconds)
-             ?? '—'
-           )}
-          </p>
-         </div>
-        </div>
-       </li>
-      )
-     })}
-    </ul>
+    <table className="bb-table">
+     <thead className="bb-table-head">
+      <tr>
+       <th>Part</th>
+       <th>Station</th>
+       <th className="text-right">Dwell</th>
+      </tr>
+     </thead>
+     <tbody>
+      {parts.map(p => {
+       const tag = p.part_tag || partTagLabel(p) || p.epc || '—'
+       const station = partCurrentStation(p)
+       const openM = partOpenMachine(p)
+       return (
+        <tr key={p.epc || tag} className="bb-table-row">
+         <td>
+          <div className="flex items-start gap-2">
+           <span
+            className="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0"
+            style={{ backgroundColor: accent.hex }}
+           />
+           <div className="min-w-0">
+            <p className="font-mono text-[11px] font-semibold text-[#eef2f7] break-all">{tag}</p>
+            <p className="text-[10px] text-[#8b939e] truncate">
+             {[p.part_number, p.part_name].filter(Boolean).join(' · ') || '—'}
+            </p>
+           </div>
+          </div>
+         </td>
+         <td className="text-xs text-[#8b939e]">{shortStation(station)}</td>
+         <td className="text-right font-mono text-[11px] text-[#8b939e]">
+          {openM ? (
+           <DwellTimer
+            entranceTime={openM.entry_time}
+            exitTime={null}
+            dwellSeconds={null}
+           />
+          ) : (
+           p.total_production_display
+            ?? formatDwell(p.total_production_seconds)
+            ?? '—'
+          )}
+         </td>
+        </tr>
+       )
+      })}
+     </tbody>
+    </table>
    )}
   </div>
  )

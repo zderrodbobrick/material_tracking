@@ -60,11 +60,22 @@ function offsetForSibling(index, total) {
  * Colored dots for open parts at last antenna / machine center.
  * Stacks by location + IBUS order so different work orders keep distinct colors.
  */
+function delayColor(level, fallbackHex) {
+ if (level === 'critical') return { hex: '#f87171', ping: 'bg-[#f87171]', badge: 'bg-[#f87171]' }
+ if (level === 'warn') return { hex: '#fbbf24', ping: 'bg-[#fbbf24]', badge: 'bg-[#fbbf24]' }
+ return { hex: fallbackHex, ping: 'bg-white', badge: 'bg-[#27272f]' }
+}
+
+/**
+ * Active parts on the floor plan.
+ * @param {(session) => 'ok'|'warn'|'critical'|null} [getDelayLevel]
+ */
 export function PartChipLayer({
  sessions = [],
  placements = {},
  machines = [],
  onPartClick,
+ getDelayLevel,
 }) {
  const [openKey, setOpenKey] = useState(null)
  const popoverRef = useRef(null)
@@ -157,6 +168,13 @@ export function PartChipLayer({
     const open = openKey === group.key
     const left = `${(x / FLOOR_PLAN.imageWidth) * 100}%`
     const top = `${(y / FLOOR_PLAN.imageHeight) * 100}%`
+    const worstDelay = group.items.reduce((worst, item) => {
+     const level = getDelayLevel?.(item.session) ?? 'ok'
+     if (level === 'critical') return 'critical'
+     if (level === 'warn' && worst !== 'critical') return 'warn'
+     return worst
+    }, 'ok')
+    const delay = delayColor(worstDelay, group.accent.hex)
     const accent = group.accent
 
     return (
@@ -172,7 +190,13 @@ export function PartChipLayer({
      >
       <button
        type="button"
-       title={stackTitle(group)}
+       title={
+        worstDelay === 'critical'
+         ? `${stackTitle(group)} · over threshold`
+         : worstDelay === 'warn'
+          ? `${stackTitle(group)} · over target`
+          : stackTitle(group)
+       }
        aria-expanded={open}
        aria-label={stackTitle(group)}
        onClick={e => {
@@ -182,20 +206,22 @@ export function PartChipLayer({
        className="relative flex items-center justify-center w-2.5 h-2.5 rounded-full
  ring-2 ring-white/80 focus:outline-none focus-visible:ring-2"
        style={{
-        backgroundColor: accent.hex,
-        boxShadow: `0 0 10px ${accent.hex}88`,
+        backgroundColor: delay.hex,
+        boxShadow: worstDelay !== 'ok' ? `0 0 8px ${delay.hex}aa` : `0 0 6px ${delay.hex}66`,
        }}
       >
-       <span
-        className={`absolute inset-0 rounded-full animate-ping opacity-25 ${accent.ping} [animation-duration:1.8s]`}
-       />
+       {worstDelay === 'ok' && (
+        <span
+         className={`absolute inset-0 rounded-full animate-ping opacity-20 ${delay.ping} [animation-duration:2s]`}
+        />
+       )}
        <span className="relative w-1.5 h-1.5 rounded-full bg-[#18181d]" />
        {count > 1 && (
         <span
          className={`absolute -top-1.5 -right-1.5 min-w-[14px] h-[14px] px-0.5
                flex items-center justify-center rounded-full
                text-[8px] font-bold leading-none text-white border border-white/80
-               ${accent.badge}`}
+               ${worstDelay !== 'ok' ? delay.badge : accent.badge}`}
         >
          {count}
         </span>

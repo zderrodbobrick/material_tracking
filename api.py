@@ -471,6 +471,8 @@ def index():
             "GET  /api/summary",
             "GET  /api/analytics",
             "GET  /api/analytics/operators",
+            "GET  /api/analytics/operators/trends",
+            "GET  /api/analytics/operators/trends/sessions",
             "GET  /api/report/stations",
             "GET  /api/report/sessions",
             "GET  /api/stations",
@@ -878,6 +880,12 @@ def _build_ibus_journeys(
             _attach_order_time_estimates(
                 journey, specs_by_name, part_actuals, wo_parts_by_ibus
             )
+        else:
+            # Still expose BOM size so the UI can show "34 parts" without specs.
+            key_u = (journey.get("key") or "").upper()
+            bom = (wo_parts_by_ibus or {}).get(key_u)
+            journey["expected_parts"] = bom
+            journey["estimated_parts"] = bom or journey.get("part_count") or 1
         journeys.append(journey)
 
     journeys.sort(key=lambda j: j.get("entry_time") or "", reverse=True)
@@ -1791,21 +1799,51 @@ _STATUS_ALIASES = {
 
 @app.route("/api/report/sessions")
 def report_sessions():
-    limit  = min(request.args.get("limit", 100, type=int), 500)
+    export = (request.args.get("export") or "").strip().lower() in ("1", "true", "csv")
+    max_limit = 5000 if export else 500
+    limit  = min(request.args.get("limit", 100, type=int), max_limit)
     offset = max(request.args.get("offset", 0, type=int), 0)
     search = (request.args.get("search") or "").strip()
     status = (request.args.get("status") or "ALL").strip().upper()
+    date_from = (request.args.get("date_from") or "").strip()
+    date_to = (request.args.get("date_to") or "").strip()
+    station = (request.args.get("station") or "").strip()
+    work_order = (request.args.get("work_order") or "").strip()
+    operator_id = request.args.get("operator_id", type=int)
 
     where = []
     params: list = []
     if search:
-        where.append("(epc LIKE ? OR ibus_number LIKE ? OR part_name LIKE ?)")
+        where.append(
+            "(epc LIKE ? OR ibus_number LIKE ? OR part_name LIKE ? OR job_number LIKE ?)"
+        )
         like = f"%{search}%"
-        params.extend([like, like, like])
+        params.extend([like, like, like, like])
     if status and status != "ALL":
         db_status = _STATUS_ALIASES.get(status, status.lower())
         where.append("session_status = ?")
         params.append(db_status)
+    if date_from:
+        where.append("date(COALESCE(exit_time, entry_time)) >= date(?)")
+        params.append(date_from)
+    if date_to:
+        where.append("date(COALESCE(exit_time, entry_time)) <= date(?)")
+        params.append(date_to)
+    if station:
+        where.append("station_name = ?")
+        params.append(station)
+    if work_order:
+        where.append("(job_number LIKE ? OR ibus_number LIKE ?)")
+        like_wo = f"%{work_order}%"
+        params.extend([like_wo, like_wo])
+    if operator_id is not None:
+        where.append(
+            """session_id IN (
+                SELECT session_id FROM part_operator_assignments WHERE operator_id = ?
+            )"""
+        )
+        params.append(operator_id)
+
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     db = get_db()
@@ -1820,23 +1858,34 @@ def report_sessions():
             LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
+    sessions = [_session_dict(r) for r in rows]
+    _attach_operators(db, sessions)
     db.close()
 
     return jsonify({
         "total":    total,
         "limit":    limit,
         "offset":   offset,
-        "sessions": [_session_dict(r) for r in rows],
+        "sessions": sessions,
     })
 
 
 # ── GET /api/analytics ────────────────────────────────────────────────────────
 
-def _build_operator_analytics(db: sqlite3.Connection) -> dict:
-    """Aggregate per-operator counts (distinct parts), dwell, and per-station breakdown."""
+def _build_operator_analytics(
+    db: sqlite3.Connection,
+    *,
+    today_only: bool = False,
+) -> dict:
+    """Aggregate per-operator counts (distinct parts), dwell, and per-station breakdown.
+
+    When today_only=True, only sessions with exit/entry/assigned timestamps on the
+    local calendar day are counted (Live “Parts today”).
+    """
     rows = db.execute(
         """SELECT o.operator_id, o.operator_name, st.station_name,
-                  s.session_id, s.dwell_seconds, s.session_status, t.epc
+                  s.session_id, s.dwell_seconds, s.session_status, t.epc,
+                  s.exit_time, s.entry_time, poa.assigned_at
            FROM part_operator_assignments poa
            JOIN operators o ON poa.operator_id = o.operator_id
            JOIN part_station_sessions s ON poa.session_id = s.session_id
@@ -1844,8 +1893,17 @@ def _build_operator_analytics(db: sqlite3.Connection) -> dict:
            LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id"""
     ).fetchall()
 
+    today = datetime.now().astimezone().date()
     op_acc: dict[int, dict] = {}
     for r in rows:
+        if today_only:
+            day = (
+                _local_date(r["exit_time"])
+                or _local_date(r["assigned_at"])
+                or _local_date(r["entry_time"])
+            )
+            if day != today:
+                continue
         oid = r["operator_id"]
         if oid not in op_acc:
             op_acc[oid] = {
@@ -1946,8 +2004,9 @@ def _build_operator_analytics(db: sqlite3.Connection) -> dict:
 
 
 def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
-    """Full operator analytics for the dedicated dashboard page."""
-    base = _build_operator_analytics(db)
+    """Full operator analytics for the dedicated Live Operators page (today-scoped)."""
+    base = _build_operator_analytics(db, today_only=True)
+    all_time = _build_operator_analytics(db, today_only=False)
 
     # Who is in which zone right now (RTLS / demo seeds).
     in_zone = db.execute(
@@ -1973,13 +2032,14 @@ def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
         (STATION_NAME, STATION_NAME),
     ).fetchall()
 
-    # Hourly assignment volume (local wall-clock — not UTC strftime).
-    assign_ts = [
-        r["assigned_at"]
-        for r in db.execute(
-            "SELECT assigned_at FROM part_operator_assignments WHERE assigned_at IS NOT NULL"
-        )
-    ]
+    # Hourly assignment volume today (local wall-clock — not UTC strftime).
+    today = datetime.now().astimezone().date()
+    assign_ts = []
+    for r in db.execute(
+        "SELECT assigned_at FROM part_operator_assignments WHERE assigned_at IS NOT NULL"
+    ):
+        if _local_date(r["assigned_at"]) == today:
+            assign_ts.append(r["assigned_at"])
     by_hour = _hourly_buckets_from_timestamps(assign_ts)
 
     # RTLS presence confirmation stats.
@@ -2029,9 +2089,9 @@ def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
            LIMIT 30"""
     ).fetchall()
 
-    # Multi-station operators (versatility).
+    # Multi-station operators (versatility) — all-time for context.
     multi = [
-        o for o in base["leaderboard"]
+        o for o in all_time["leaderboard"]
         if o.get("stations_worked", 0) >= 2
     ]
 
@@ -2039,8 +2099,17 @@ def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
     confirmed_pres = int(pres["confirmed"] or 0)
     confirm_rate = round(100.0 * confirmed_pres / total_pres, 1) if total_pres else None
 
+    today_by_id = {o["operator_id"]: o for o in base["leaderboard"]}
+
     return {
         **base,
+        "summary": {
+            **base["summary"],
+            "scope": "today",
+            "active_operators": len([
+                z for z in in_zone
+            ]) or base["summary"].get("active_operators", 0),
+        },
         "presence": {
             "total_records":      total_pres,
             "confirmed":            confirmed_pres,
@@ -2071,6 +2140,15 @@ def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
                 "sessions":         int(r["sessions"] or 0),
                 "stations":         int(r["stations"] or 0),
                 "last_assigned_at": r["last_assigned_at"],
+                "parts_today":      (today_by_id.get(r["operator_id"]) or {}).get(
+                    "completed_pieces", 0
+                ),
+                "stations_today":   (today_by_id.get(r["operator_id"]) or {}).get(
+                    "stations_worked", 0
+                ),
+                "in_progress":      (today_by_id.get(r["operator_id"]) or {}).get(
+                    "in_progress", 0
+                ),
             }
             for r in roster_rows
         ],
@@ -2090,6 +2168,767 @@ def _build_operator_analytics_extended(db: sqlite3.Connection) -> dict:
         ],
         "multi_station_operators": multi,
     }
+
+
+_ACTIVE_HOUR_MIN_SEC = 60  # need ≥1 min active time for parts/hour
+
+
+def _parse_trends_range(args) -> tuple[datetime, datetime, str, str, bool]:
+    """Return (start_utc, end_utc, date_from_iso, date_to_iso, all_time) local-date based.
+
+    ``days=all`` (or ``0``) means all-time: start far in the past so filters include
+    every row; callers should clamp ``date_from`` to the first day with data.
+    """
+    now_local = datetime.now().astimezone()
+    date_to_s = (args.get("date_to") or "").strip()
+    date_from_s = (args.get("date_from") or "").strip()
+    days_raw = args.get("days")
+    days_s = str(days_raw).strip().lower() if days_raw is not None else ""
+    all_time = days_s in ("all", "0")
+    days = None if all_time else args.get("days", type=int)
+
+    if date_to_s:
+        try:
+            end_d = datetime.fromisoformat(date_to_s).date()
+        except ValueError:
+            end_d = now_local.date()
+    else:
+        end_d = now_local.date()
+
+    if date_from_s:
+        try:
+            start_d = datetime.fromisoformat(date_from_s).date()
+            all_time = False
+        except ValueError:
+            start_d = end_d - timedelta(days=max((days or 14) - 1, 0))
+    elif all_time:
+        start_d = end_d.replace(year=max(2000, end_d.year - 20))
+    else:
+        span = max((days or 14) - 1, 0)
+        start_d = end_d - timedelta(days=span)
+
+    if start_d > end_d:
+        start_d, end_d = end_d, start_d
+
+    start_local = datetime.combine(start_d, datetime.min.time(), tzinfo=now_local.tzinfo)
+    end_local = datetime.combine(end_d, datetime.max.time(), tzinfo=now_local.tzinfo)
+    return (
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+        start_d.isoformat(),
+        end_d.isoformat(),
+        all_time,
+    )
+
+
+def _ts_in_range(ts: str | None, start_utc: datetime, end_utc: datetime) -> bool:
+    dt = _parse_ts(ts)
+    if not dt:
+        return False
+    return start_utc <= dt <= end_utc
+
+
+def _parts_per_active_hour(parts: int, active_seconds: float | None) -> float | None:
+    if not active_seconds or active_seconds < _ACTIVE_HOUR_MIN_SEC:
+        return None
+    return round(parts / (active_seconds / 3600.0), 2)
+
+
+def _metric_bundle(value, peer, *, kind: str) -> dict:
+    delta = None
+    delta_pct = None
+    if value is not None and peer is not None:
+        delta = round(value - peer, 2 if kind in ("rate", "pct") else 1)
+        if peer != 0 and kind in ("rate", "count", "seconds"):
+            delta_pct = round(100.0 * (value - peer) / abs(peer), 1)
+        elif kind == "pct":
+            delta_pct = round(value - peer, 1)
+
+    def _fmt(v):
+        if v is None:
+            return None
+        if kind == "seconds":
+            return _dwell_display(v)
+        if kind == "pct":
+            return f"{v:.1f}%"
+        if kind == "rate":
+            return f"{v:.1f}"
+        return str(int(v) if kind == "count" else v)
+
+    delta_display = None
+    if delta is not None:
+        if kind == "seconds":
+            if delta == 0:
+                delta_display = "0"
+            elif delta > 0:
+                delta_display = f"+{_dwell_display(abs(int(delta)))}"
+            else:
+                delta_display = f"-{_dwell_display(abs(int(delta)))}"
+        elif kind == "pct":
+            sign = "+" if delta > 0 else ""
+            delta_display = f"{sign}{delta:.1f} pts"
+        elif kind == "rate":
+            sign = "+" if delta > 0 else ""
+            pct = f" ({sign}{delta_pct}%)" if delta_pct is not None else ""
+            delta_display = f"{sign}{delta:.1f}{pct}"
+        else:
+            sign = "+" if delta > 0 else ""
+            pct = f" ({sign}{delta_pct}%)" if delta_pct is not None else ""
+            delta_display = f"{sign}{int(delta) if float(delta).is_integer() else delta}{pct}"
+
+    return {
+        "value": value,
+        "peer": peer,
+        "delta": delta,
+        "delta_pct": delta_pct,
+        "display": _fmt(value),
+        "peer_display": _fmt(peer),
+        "delta_display": delta_display,
+    }
+
+
+_WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
+    """Date-scoped operator trends vs station peers."""
+    operator_id = args.get("operator_id", type=int)
+    station_filter = (args.get("station") or "").strip() or None
+    work_order = (args.get("work_order") or "").strip() or None
+    part_type = (args.get("part_type") or "").strip() or None
+    metric = (args.get("metric") or "parts_per_active_hour").strip()
+    start_utc, end_utc, date_from, date_to, all_time = _parse_trends_range(args)
+
+    specs = fetch_specs_by_name(db)
+
+    op_row = None
+    if operator_id:
+        op_row = db.execute(
+            "SELECT operator_id, operator_name, employee_number, rtls_badge_id, is_active "
+            "FROM operators WHERE operator_id = ?",
+            (operator_id,),
+        ).fetchone()
+
+    assign_rows = db.execute(
+        """SELECT poa.operator_id, o.operator_name, o.rtls_badge_id,
+                  poa.session_id, poa.assigned_at,
+                  COALESCE(poa.station_name, st.station_name) AS station_name,
+                  s.dwell_seconds, s.session_status, s.entry_time, s.exit_time,
+                  t.epc, p.part_type, p.ibus_number, p.job_number
+           FROM part_operator_assignments poa
+           JOIN operators o ON o.operator_id = poa.operator_id
+           JOIN part_station_sessions s ON s.session_id = poa.session_id
+           JOIN stations st ON st.station_id = s.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id
+           LEFT JOIN parts p ON p.part_id = s.part_id"""
+    ).fetchall()
+
+    zone_rows = db.execute(
+        """SELECT operator_id, station_name, entered_at, exited_at, dwell_seconds
+           FROM operator_zone_visits
+           WHERE station_name IS NOT NULL AND dwell_seconds IS NOT NULL"""
+    ).fetchall()
+
+    # Filter assignments into range (+ optional WO / part type).
+    filtered = []
+    for r in assign_rows:
+        ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
+        if not _ts_in_range(ts, start_utc, end_utc):
+            continue
+        if work_order:
+            wo = (r["ibus_number"] or r["job_number"] or "").upper()
+            if work_order.upper() not in wo and work_order.upper() not in (
+                f"IBUS{(r['job_number'] or '')}"
+            ).upper():
+                continue
+        if part_type and (r["part_type"] or "").lower() != part_type.lower():
+            continue
+        filtered.append(r)
+
+    # Active seconds from zone visits (fallback: closed session dwells).
+    def _active_seconds(oid: int, station: str | None, day=None) -> float:
+        total = 0.0
+        used_zone = False
+        for z in zone_rows:
+            if z["operator_id"] != oid:
+                continue
+            if station and (z["station_name"] or "") != station:
+                continue
+            ts = z["exited_at"] or z["entered_at"]
+            if not _ts_in_range(ts, start_utc, end_utc):
+                continue
+            if day is not None and _local_date(ts) != day:
+                continue
+            total += float(z["dwell_seconds"] or 0)
+            used_zone = True
+        if used_zone:
+            return total
+        # Fallback: sum attributed closed part dwells
+        for r in filtered:
+            if r["operator_id"] != oid:
+                continue
+            if station and (r["station_name"] or "") != station:
+                continue
+            if r["session_status"] != STATUS_CLOSED:
+                continue
+            ts = r["exit_time"] or r["assigned_at"]
+            if day is not None and _local_date(ts) != day:
+                continue
+            total += float(r["dwell_seconds"] or 0)
+        return total
+
+    def _op_station_stats(oid: int, station: str | None) -> dict:
+        epcs: set[str] = set()
+        sessions = 0
+        dwells: list[int] = []
+        over = 0
+        days_active: set = set()
+        by_day: dict = {}
+        for r in filtered:
+            if r["operator_id"] != oid:
+                continue
+            st = r["station_name"] or STATION_NAME
+            if station and st != station:
+                continue
+            ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
+            day = _local_date(ts)
+            if day:
+                days_active.add(day)
+            if r["session_status"] != STATUS_CLOSED:
+                continue
+            sessions += 1
+            epc = r["epc"] or f"session-{r['session_id']}"
+            epcs.add(epc)
+            dwell = int(r["dwell_seconds"]) if r["dwell_seconds"] is not None else None
+            if dwell is not None:
+                dwells.append(dwell)
+                spec = _spec_for_station(specs, st)
+                target = spec.get("target_part_dwell_seconds") if spec else None
+                if target and dwell > int(target):
+                    over += 1
+            if day:
+                bucket = by_day.setdefault(
+                    day,
+                    {"epcs": set(), "dwells": [], "over": 0, "sessions": 0, "station": st},
+                )
+                bucket["epcs"].add(epc)
+                bucket["sessions"] += 1
+                if dwell is not None:
+                    bucket["dwells"].append(dwell)
+                    spec = _spec_for_station(specs, st)
+                    target = spec.get("target_part_dwell_seconds") if spec else None
+                    if target and dwell > int(target):
+                        bucket["over"] += 1
+
+        parts = len(epcs)
+        active = _active_seconds(oid, station)
+        op_dwells = []
+        for z in zone_rows:
+            if z["operator_id"] != oid:
+                continue
+            if station and (z["station_name"] or "") != station:
+                continue
+            ts = z["exited_at"] or z["entered_at"]
+            if not _ts_in_range(ts, start_utc, end_utc):
+                continue
+            if z["dwell_seconds"] is not None:
+                op_dwells.append(int(z["dwell_seconds"]))
+        if not op_dwells:
+            op_dwells = list(dwells)
+
+        over_pct = round(100.0 * over / sessions, 1) if sessions else None
+        within_pct = round(100.0 * (sessions - over) / sessions, 1) if sessions else None
+        return {
+            "parts": parts,
+            "sessions": sessions,
+            "active_seconds": active,
+            "parts_per_active_hour": _parts_per_active_hour(parts, active),
+            "median_operator_dwell_seconds": _median(op_dwells),
+            "median_part_dwell_seconds": _median(dwells),
+            "parts_over_target_pct": over_pct,
+            "within_target_pct": within_pct,
+            "over_target": over,
+            "active_days": len(days_active),
+            "by_day": by_day,
+            "days_active": days_active,
+        }
+
+    # Primary station = most attributed closed parts in range (any station).
+    primary_station = station_filter
+    if operator_id and not primary_station:
+        counts: dict[str, int] = {}
+        for r in filtered:
+            if r["operator_id"] != operator_id or r["session_status"] != STATUS_CLOSED:
+                continue
+            st = r["station_name"] or STATION_NAME
+            counts[st] = counts.get(st, 0) + 1
+        if counts:
+            primary_station = max(counts.items(), key=lambda x: x[1])[0]
+
+    station = primary_station
+
+    # Operators with activity at this station in range.
+    peer_ids: set[int] = set()
+    names: dict[int, str] = {}
+    for r in filtered:
+        st = r["station_name"] or STATION_NAME
+        if station and st != station:
+            continue
+        peer_ids.add(r["operator_id"])
+        names[r["operator_id"]] = r["operator_name"]
+
+    peer_stats = {oid: _op_station_stats(oid, station) for oid in peer_ids}
+    selected = peer_stats.get(operator_id) if operator_id else None
+    if selected is None and operator_id:
+        selected = _op_station_stats(operator_id, station)
+
+    def _metric_value(st: dict) -> float | None:
+        if metric == "parts":
+            return float(st["parts"])
+        if metric == "median_operator_dwell":
+            return st["median_operator_dwell_seconds"]
+        if metric == "median_part_dwell":
+            return st["median_part_dwell_seconds"]
+        if metric == "pct_within_target":
+            return st["within_target_pct"]
+        if metric == "active_time":
+            return st["active_seconds"]
+        if metric == "exception_rate":
+            return st["parts_over_target_pct"]
+        return st["parts_per_active_hour"]  # default
+
+    peer_metric_vals = []
+    for oid, st in peer_stats.items():
+        if operator_id is not None and oid == operator_id:
+            continue
+        v = _metric_value(st)
+        if v is not None:
+            peer_metric_vals.append(v)
+    peer_avg = (
+        round(sum(peer_metric_vals) / len(peer_metric_vals), 2)
+        if peer_metric_vals else None
+    )
+    peer_operator_count = sum(
+        1 for oid in peer_ids if operator_id is None or oid != operator_id
+    )
+
+    # Summary uses fixed five metrics vs station peer averages of those metrics.
+    def _peer_avg_of(key: str):
+        vals = [
+            st[key]
+            for oid, st in peer_stats.items()
+            if (operator_id is None or oid != operator_id) and st.get(key) is not None
+        ]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    sel = selected or {
+        "parts": 0,
+        "sessions": 0,
+        "active_seconds": 0,
+        "parts_per_active_hour": None,
+        "median_operator_dwell_seconds": None,
+        "parts_over_target_pct": None,
+        "by_day": {},
+        "active_days": 0,
+    }
+
+    summary = {
+        "parts_per_active_hour": _metric_bundle(
+            sel.get("parts_per_active_hour"),
+            _peer_avg_of("parts_per_active_hour"),
+            kind="rate",
+        ),
+        "median_operator_dwell_seconds": _metric_bundle(
+            sel.get("median_operator_dwell_seconds"),
+            _peer_avg_of("median_operator_dwell_seconds"),
+            kind="seconds",
+        ),
+        "parts_over_target_pct": _metric_bundle(
+            sel.get("parts_over_target_pct"),
+            _peer_avg_of("parts_over_target_pct"),
+            kind="pct",
+        ),
+        "active_station_seconds": _metric_bundle(
+            sel.get("active_seconds"),
+            _peer_avg_of("active_seconds"),
+            kind="seconds",
+        ),
+        "rfid_associated_parts": _metric_bundle(
+            sel.get("parts"),
+            _peer_avg_of("parts"),
+            kind="count",
+        ),
+    }
+
+    def _day_metric(oid: int | None, day, day_b: dict | None) -> float | None:
+        """Metric value for one operator on one calendar day at the selected station."""
+        if oid is None:
+            return None
+        op_parts = len(day_b["epcs"]) if day_b else 0
+        op_active = _active_seconds(oid, station, day)
+        op_med = _median(day_b["dwells"]) if day_b and day_b["dwells"] else None
+        op_over = day_b["over"] if day_b else 0
+        if metric == "parts":
+            return float(op_parts) if op_parts else None
+        if metric == "median_operator_dwell":
+            day_op_dwells = [
+                int(z["dwell_seconds"])
+                for z in zone_rows
+                if z["operator_id"] == oid
+                and (not station or z["station_name"] == station)
+                and _local_date(z["exited_at"] or z["entered_at"]) == day
+                and z["dwell_seconds"] is not None
+            ]
+            return _median(day_op_dwells) if day_op_dwells else op_med
+        if metric == "median_part_dwell":
+            return op_med
+        if metric == "pct_within_target":
+            sess = day_b["sessions"] if day_b else 0
+            return round(100.0 * (sess - op_over) / sess, 1) if sess else None
+        if metric == "active_time":
+            return op_active if op_active else None
+        if metric == "exception_rate":
+            sess = day_b["sessions"] if day_b else 0
+            return round(100.0 * op_over / sess, 1) if sess else None
+        return _parts_per_active_hour(op_parts, op_active)
+
+    # Clamp all-time date_from to first day with activity (keeps UI honest).
+    activity_days = sorted({
+        day
+        for st in peer_stats.values()
+        for day in (st.get("days_active") or set())
+    })
+    if all_time and activity_days:
+        date_from = activity_days[0].isoformat()
+
+    d0 = datetime.fromisoformat(date_from).date()
+    d1 = datetime.fromisoformat(date_to).date()
+    span_days = (d1 - d0).days + 1
+    # Long ranges: calendar series is activity-only; short ranges fill every day.
+    if all_time or span_days > 90:
+        series_days = list(activity_days)
+    else:
+        series_days = []
+        cur = d0
+        while cur <= d1:
+            series_days.append(cur)
+            cur += timedelta(days=1)
+
+    # Weekday averages sample every day that had station activity (any peer).
+    scan_days = activity_days if activity_days else series_days
+
+    op_weekday_vals: dict[int, list[float]] = {i: [] for i in range(7)}
+    peer_weekday_vals: dict[int, list[float]] = {i: [] for i in range(7)}
+    day_cache: dict = {}
+
+    for day in scan_days:
+        op_day = (sel.get("by_day") or {}).get(day)
+        op_val = _day_metric(operator_id, day, op_day)
+        peer_day_vals = []
+        for oid, st in peer_stats.items():
+            if operator_id and oid == operator_id:
+                continue
+            v = _day_metric(oid, day, (st.get("by_day") or {}).get(day))
+            if v is not None:
+                peer_day_vals.append(v)
+        peer_val = (
+            round(sum(peer_day_vals) / len(peer_day_vals), 2)
+            if peer_day_vals else None
+        )
+        if op_val is not None:
+            op_weekday_vals[day.weekday()].append(float(op_val))
+        if peer_val is not None:
+            peer_weekday_vals[day.weekday()].append(float(peer_val))
+        day_cache[day] = {
+            "op_day": op_day,
+            "op_val": op_val,
+            "peer_val": peer_val,
+        }
+
+    daily = []
+    for day in series_days:
+        cached = day_cache.get(day)
+        if cached:
+            op_day = cached["op_day"]
+            op_val = cached["op_val"]
+            peer_val = cached["peer_val"]
+        else:
+            op_day = (sel.get("by_day") or {}).get(day)
+            op_val = _day_metric(operator_id, day, op_day)
+            peer_day_vals = []
+            for oid, st in peer_stats.items():
+                if operator_id and oid == operator_id:
+                    continue
+                v = _day_metric(oid, day, (st.get("by_day") or {}).get(day))
+                if v is not None:
+                    peer_day_vals.append(v)
+            peer_val = (
+                round(sum(peer_day_vals) / len(peer_day_vals), 2)
+                if peer_day_vals else None
+            )
+        op_parts = len(op_day["epcs"]) if op_day else 0
+        op_active = _active_seconds(operator_id, station, day) if operator_id else 0
+        op_med = _median(op_day["dwells"]) if op_day and op_day["dwells"] else None
+        op_over = op_day["over"] if op_day else 0
+        daily.append({
+            "date": day.isoformat(),
+            "label": day.strftime("%b %d"),
+            "weekday": _WEEKDAY_LABELS[day.weekday()],
+            "operator_value": op_val,
+            "peer_value": peer_val,
+            "parts": op_parts,
+            "active_seconds": op_active,
+            "over_target": op_over,
+            "median_dwell_seconds": op_med,
+        })
+
+    by_weekday = []
+    for wd in range(7):
+        op_samples = op_weekday_vals[wd]
+        peer_samples = peer_weekday_vals[wd]
+        by_weekday.append({
+            "weekday": wd,
+            "label": _WEEKDAY_LABELS[wd],
+            "operator_value": (
+                round(sum(op_samples) / len(op_samples), 2) if op_samples else None
+            ),
+            "peer_value": (
+                round(sum(peer_samples) / len(peer_samples), 2) if peer_samples else None
+            ),
+            "samples": len(op_samples),
+            "peer_samples": len(peer_samples),
+        })
+
+    # Peer comparison bars for selected metric (include selected even if null → 0).
+    peer_bars = []
+    for oid, st in peer_stats.items():
+        v = _metric_value(st)
+        if v is None and metric == "parts_per_active_hour":
+            # Still rank by parts when active time is too short for a rate.
+            v = float(st.get("parts") or 0)
+        if v is None:
+            continue
+        peer_bars.append({
+            "operator_id": oid,
+            "operator_name": names.get(oid, f"#{oid}"),
+            "value": v,
+            "is_selected": bool(operator_id and oid == operator_id),
+            "is_median": False,
+        })
+    peer_bars.sort(key=lambda x: x["value"], reverse=True)
+    med_vals = [p["value"] for p in peer_bars]
+    if med_vals:
+        station_median = _median_float(med_vals)
+        insert_at = sum(1 for p in peer_bars if p["value"] > station_median)
+        peer_bars.insert(insert_at, {
+            "operator_id": None,
+            "operator_name": "Station median",
+            "value": round(station_median, 2),
+            "is_selected": False,
+            "is_median": True,
+        })
+
+    # Station breakdown for selected operator (all stations in range).
+    stations_out = []
+    if operator_id:
+        st_names = sorted({
+            (r["station_name"] or STATION_NAME)
+            for r in filtered
+            if r["operator_id"] == operator_id
+        })
+        for st_name in st_names:
+            st = _op_station_stats(operator_id, st_name)
+            stations_out.append({
+                "station": st_name,
+                "sessions": st["sessions"],
+                "parts": st["parts"],
+                "parts_per_active_hour": st["parts_per_active_hour"],
+                "median_dwell_seconds": st["median_operator_dwell_seconds"],
+                "median_dwell_display": _dwell_display(st["median_operator_dwell_seconds"]),
+                "within_target_pct": st["within_target_pct"],
+            })
+        stations_out.sort(key=lambda s: s["parts"], reverse=True)
+
+    # Daily history rows (operator × day × station). Prefer activity days so
+    # all-time / long ranges do not emit empty calendar shells.
+    history_days = list(reversed(activity_days if activity_days else series_days))
+    days_out = []
+    if operator_id:
+        for day in history_days:
+            by_st: dict[str, dict] = {}
+            for r in filtered:
+                if r["operator_id"] != operator_id or r["session_status"] != STATUS_CLOSED:
+                    continue
+                ts = r["exit_time"] or r["assigned_at"]
+                if _local_date(ts) != day:
+                    continue
+                st = r["station_name"] or STATION_NAME
+                if station and st != station:
+                    continue
+                b = by_st.setdefault(st, {"epcs": set(), "dwells": [], "over": 0})
+                epc = r["epc"] or f"session-{r['session_id']}"
+                b["epcs"].add(epc)
+                if r["dwell_seconds"] is not None:
+                    dwell = int(r["dwell_seconds"])
+                    b["dwells"].append(dwell)
+                    spec = _spec_for_station(specs, st)
+                    target = spec.get("target_part_dwell_seconds") if spec else None
+                    if target and dwell > int(target):
+                        b["over"] += 1
+            for st, b in by_st.items():
+                parts = len(b["epcs"])
+                active = _active_seconds(operator_id, st, day)
+                days_out.append({
+                    "date": day.isoformat(),
+                    "label": day.strftime("%b %d"),
+                    "weekday": _WEEKDAY_LABELS[day.weekday()],
+                    "station": st,
+                    "active_seconds": active,
+                    "active_display": _dwell_display(active),
+                    "parts": parts,
+                    "parts_per_active_hour": _parts_per_active_hour(parts, active),
+                    "median_dwell_seconds": _median(b["dwells"]),
+                    "median_dwell_display": _dwell_display(_median(b["dwells"])),
+                    "over_target": b["over"],
+                })
+
+    # Filter option lists
+    wo_opts = sorted({
+        (r["ibus_number"] or (f"IBUS{r['job_number']}" if r["job_number"] else None))
+        for r in filtered
+        if r["ibus_number"] or r["job_number"]
+    } - {None})
+    pt_opts = sorted({r["part_type"] for r in filtered if r["part_type"]})
+    station_opts = sorted({
+        (r["station_name"] or STATION_NAME) for r in filtered
+    })
+
+    return {
+        "operator": {
+            "operator_id": op_row["operator_id"] if op_row else operator_id,
+            "operator_name": op_row["operator_name"] if op_row else None,
+            "employee_number": op_row["employee_number"] if op_row else None,
+            "rtls_badge_id": op_row["rtls_badge_id"] if op_row else None,
+            "primary_station": primary_station,
+            "active_days": sel.get("active_days", 0),
+        } if operator_id else None,
+        "filters": {
+            "station": station,
+            "date_from": date_from,
+            "date_to": date_to,
+            "all_time": all_time,
+            "work_order": work_order,
+            "part_type": part_type,
+            "metric": metric,
+            "compare": "station_average",
+            "peer_count": peer_operator_count,
+        },
+        "filter_options": {
+            "stations": station_opts,
+            "work_orders": wo_opts,
+            "part_types": pt_opts,
+            "ranges": [
+                {"id": "all", "label": "All time"},
+                {"id": "7", "label": "1 week"},
+                {"id": "14", "label": "2 weeks"},
+                {"id": "30", "label": "30 days"},
+                {"id": "90", "label": "90 days"},
+            ],
+            "operators": [
+                {
+                    "operator_id": r["operator_id"],
+                    "operator_name": r["operator_name"],
+                    "rtls_badge_id": r["rtls_badge_id"],
+                }
+                for r in db.execute(
+                    "SELECT operator_id, operator_name, rtls_badge_id FROM operators "
+                    "WHERE is_active = 1 ORDER BY operator_name"
+                )
+            ],
+            "metrics": [
+                {"id": "parts_per_active_hour", "label": "Parts per active hour"},
+                {"id": "parts", "label": "Parts completed"},
+                {"id": "median_operator_dwell", "label": "Median operator dwell"},
+                {"id": "median_part_dwell", "label": "Median part dwell"},
+                {"id": "pct_within_target", "label": "Percentage within target"},
+                {"id": "active_time", "label": "Active time"},
+                {"id": "exception_rate", "label": "Exception rate"},
+            ],
+        },
+        "summary": summary,
+        "by_weekday": by_weekday,
+        "daily": daily,
+        "peers": peer_bars,
+        "stations": stations_out,
+        "days": days_out,
+        "peer_average": peer_avg,
+    }
+
+
+def _operator_trend_day_sessions(db: sqlite3.Connection, args) -> list[dict]:
+    operator_id = args.get("operator_id", type=int)
+    day_s = (args.get("date") or "").strip()
+    station = (args.get("station") or "").strip() or None
+    if not operator_id or not day_s:
+        return []
+    try:
+        day = datetime.fromisoformat(day_s).date()
+    except ValueError:
+        return []
+
+    rows = db.execute(
+        """SELECT poa.session_id, poa.assigned_at,
+                  COALESCE(poa.station_name, st.station_name) AS station_name,
+                  poa.zone_name, t.epc, s.dwell_seconds, s.session_status,
+                  s.entry_time, s.exit_time, p.part_type, p.ibus_number
+           FROM part_operator_assignments poa
+           JOIN part_station_sessions s ON s.session_id = poa.session_id
+           JOIN stations st ON st.station_id = s.station_id
+           LEFT JOIN rfid_tags t ON t.tag_id = s.tag_id
+           LEFT JOIN parts p ON p.part_id = s.part_id
+           WHERE poa.operator_id = ?
+           ORDER BY COALESCE(s.exit_time, poa.assigned_at, s.entry_time) DESC""",
+        (operator_id,),
+    ).fetchall()
+
+    out = []
+    for r in rows:
+        ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
+        if _local_date(ts) != day:
+            continue
+        if station and (r["station_name"] or "") != station:
+            continue
+        out.append({
+            "session_id": r["session_id"],
+            "assigned_at": r["assigned_at"],
+            "station_name": r["station_name"],
+            "zone_name": r["zone_name"],
+            "epc": r["epc"],
+            "dwell_seconds": r["dwell_seconds"],
+            "dwell_display": _dwell_display(r["dwell_seconds"]),
+            "session_status": r["session_status"],
+            "entry_time": r["entry_time"],
+            "exit_time": r["exit_time"],
+            "part_type": r["part_type"],
+            "ibus_number": r["ibus_number"],
+        })
+    return out
+
+
+@app.route("/api/analytics/operators/trends")
+def analytics_operators_trends():
+    db = get_db()
+    data = _build_operator_trends(db, request.args)
+    db.close()
+    return jsonify(data)
+
+
+@app.route("/api/analytics/operators/trends/sessions")
+def analytics_operators_trends_sessions():
+    db = get_db()
+    sessions = _operator_trend_day_sessions(db, request.args)
+    db.close()
+    return jsonify({"sessions": sessions})
 
 
 @app.route("/api/analytics/operators")
@@ -2331,6 +3170,17 @@ def _median(values: list[int]):
     mid = n // 2
     if n % 2:
         return float(s[mid])
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _median_float(values: list[float]):
+    if not values:
+        return None
+    s = sorted(float(v) for v in values)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return s[mid]
     return (s[mid - 1] + s[mid]) / 2.0
 
 
@@ -2581,7 +3431,17 @@ def _build_machine_analytics(
 def _build_ibus_order_analytics(db: sqlite3.Connection, specs_by_name: dict) -> list[dict]:
     """Work-order progress: BOM expected vs RFID-completed parts."""
     spine = progress_spine_names(specs_by_name)
-    final_station = spine[-1] if spine else INSERT_STATION_NAME
+    # Prefer Insert Station when it is on the spine — later off-line machines
+    # (e.g. Anderson) must not redefine "RFID complete".
+    final_station = INSERT_STATION_NAME
+    if spine:
+        insert_canon = canonical_station(INSERT_STATION_NAME) or INSERT_STATION_NAME
+        for name in spine:
+            if (canonical_station(name) or name) == insert_canon or name == INSERT_STATION_NAME:
+                final_station = name
+                break
+        else:
+            final_station = spine[-1]
 
     orders = db.execute(
         "SELECT * FROM work_orders ORDER BY ingested_at DESC"

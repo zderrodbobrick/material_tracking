@@ -105,11 +105,16 @@ EPC_FILTER_PATTERN = os.getenv("EPC_FILTER_PATTERN", r".*IBUS.*" if CHECK_FOR_IB
 # ── Session Management ────────────────────────────────────────────────────────
 # Fast-moving tags: lower throttle for higher resolution, shorter timeouts
 RAW_THROTTLE_SEC = float(os.getenv("RAW_THROTTLE_SEC", "0.05"))     # 50ms between stored reads
-IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "60.0"))      # Idle (non-exit) before sweeper acts
+IDLE_TIMEOUT_SEC = float(os.getenv("IDLE_TIMEOUT_SEC", "60.0"))      # LBD presence: no reads ⇒ not there
 # Deprecated: Gannomat sessions no longer close on antenna 2.
 # They stay open until a strong antenna 3 (Insert Station) read ends dwell.
 EXIT_IDLE_TIMEOUT_SEC = float(os.getenv("EXIT_IDLE_TIMEOUT_SEC", "0"))
-ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h — keep alive until antenna 3
+# Stuck Gannomat/Tennoner dwells with no progress (must stay long enough for
+# multi-part orders to finish the line — do NOT use a few seconds).
+ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h
+# Insert presence holds until the IBUS order completes. Kept separate so a short
+# ABANDON_TIMEOUT cannot drop parts off Insert before siblings arrive.
+INSERT_HOLD_TIMEOUT_SEC = float(os.getenv("INSERT_HOLD_TIMEOUT_SEC", "14400"))  # 4 h
 SWEEP_INTERVAL_SEC = float(os.getenv("SWEEP_INTERVAL_SEC", "1.0"))  # Check every second
 
 # ── Database Pruning ──────────────────────────────────────────────────────────

@@ -1,8 +1,4 @@
 import { useState, useEffect, useCallback, useMemo } from 'react'
-import {
- Factory, CalendarDays, Package, AlertTriangle,
- Target, Gauge, ChevronRight,
-} from 'lucide-react'
 import { apiFetch } from '../api'
 import { HorizontalBars, AreaChart } from '../components/charts'
 
@@ -13,159 +9,213 @@ const TABS = [
 ]
 
 function targetLabel(status) {
- if (status === 'on_target') return { text: 'On target', cls: 'text-[#34d399] bg-[#34d399]/10 border-[#34d399]/25' }
- if (status === 'slightly_over') return { text: 'Slightly over', cls: 'text-[#fbbf24] bg-[#fbbf24]/10 border-[#fbbf24]/25' }
- if (status === 'over_target') return { text: 'Over target', cls: 'text-[#f87171] bg-[#f87171]/10 border-[#f87171]/25' }
- return { text: '—', cls: 'text-[#8b939e] bg-[#18181d]/5 border-[#27272f]' }
+ if (status === 'on_target') return { text: 'On target', cls: 'bb-badge-green' }
+ if (status === 'slightly_over') return { text: 'Slightly over', cls: 'bb-badge-warn' }
+ if (status === 'over_target') return { text: 'Over target', cls: 'bb-badge-danger' }
+ return { text: '—', cls: 'bb-badge-muted' }
 }
 
-function PulseKpi({ label, value, sub }) {
- return (
-  <div className="rounded-xl border border-[#27272f] bg-[#18181d] p-4">
-   <p className="text-[10px] font-semibold uppercase tracking-widest text-[#8b939e]">{label}</p>
-   <p className="text-2xl font-bold text-[#eef2f7] mt-1 tabular-nums">{value ?? '—'}</p>
-   {sub && <p className="text-xs text-[#8b939e] mt-1">{sub}</p>}
-  </div>
- )
+function formatVariance(avgSec, targetSec) {
+ if (avgSec == null || targetSec == null) return '—'
+ const diff = Math.round(avgSec - targetSec)
+ const abs = Math.abs(diff)
+ const m = Math.floor(abs / 60)
+ const s = abs % 60
+ const body = m > 0 ? `${m}m ${s}s` : `${s}s`
+ if (diff === 0) return '0s'
+ return diff < 0 ? `−${body}` : `+${body}`
 }
 
-function MachineTile({ m }) {
- const badge = targetLabel(m.vs_target_status)
- return (
-  <div className="rounded-xl border border-[#27272f] bg-[#18181d] p-4 space-y-3">
-   <div className="flex items-start justify-between gap-2">
-    <div>
-     <h3 className="font-bold text-[#eef2f7]">{m.station}</h3>
-     <p className="text-xs text-[#8b939e]">{m.completed_today ?? 0} done today</p>
-    </div>
-    <span className={`text-[10px] font-semibold uppercase px-2 py-0.5 rounded border ${badge.cls}`}>
-     {badge.text}
-    </span>
-   </div>
-   <div className="flex items-baseline justify-between text-sm">
-    <span className="text-[#8b939e]">Avg dwell</span>
-    <span className="font-mono font-semibold text-[#4dc4f4]">
-     {m.avg_dwell_display ?? '—'}
-     {m.target_part_dwell_display && (
-      <span className="text-[#8b939e] font-normal text-xs ml-1">/ {m.target_part_dwell_display}</span>
-     )}
-    </span>
-   </div>
-   {(m.in_process ?? 0) > 0 && (
-    <p className="text-xs text-[#4dc4f4]">{m.in_process} in process now</p>
-   )}
-   {(m.exceeding_target ?? 0) > 0 && (
-    <p className="text-xs text-[#fbbf24]">{m.exceeding_target} over target</p>
-   )}
-  </div>
- )
+function parseTargetSeconds(display) {
+ if (!display || typeof display !== 'string') return null
+ const m = display.match(/(\d+)\s*m/)
+ const s = display.match(/(\d+)\s*s/)
+ const mins = m ? parseInt(m[1], 10) : 0
+ const secs = s ? parseInt(s[1], 10) : 0
+ if (!m && !s) return null
+ return mins * 60 + secs
 }
 
-function OrderRow({ o }) {
- const pct = o.completion_pct ?? 0
- const done = pct >= 100
+function Kpi({ label, value, sub }) {
  return (
-  <div className="rounded-xl border border-[#27272f] bg-[#18181d] p-4">
-   <div className="flex items-center justify-between gap-3 mb-2">
-    <div>
-     <p className="font-mono font-bold text-[#eef2f7]">{o.ibus_number}</p>
-     {o.customer && <p className="text-xs text-[#8b939e] truncate">{o.customer}</p>}
-    </div>
-    <p className={`text-lg font-bold tabular-nums ${done ? 'text-[#34d399]' : 'text-[#4dc4f4]'}`}>
-     {pct}%
-    </p>
-   </div>
-   <div className="h-1.5 rounded-full bg-[#27272f] overflow-hidden">
-    <div
-     className={`h-full rounded-full transition-all ${done ? 'bg-[#34d399]' : 'bg-[#4dc4f4]'}`}
-     style={{ width: `${Math.min(pct, 100)}%` }}
-    />
-   </div>
-   <p className="text-xs text-[#8b939e] mt-2 tabular-nums">
-    {o.rfid_completed ?? 0} / {o.expected_parts ?? '—'} parts RFID complete
-    {(o.rfid_in_progress ?? 0) > 0 && ` · ${o.rfid_in_progress} in progress`}
-   </p>
+  <div>
+   <p className="bb-kpi-label">{label}</p>
+   <p className="bb-kpi-value">{value ?? '—'}</p>
+   {sub && <p className="text-[11px] text-[#8b939e] mt-0.5">{sub}</p>}
   </div>
  )
 }
 
 function TodayTab({ a }) {
- const machines = (a.machines ?? []).filter(m => m.on_progress_spine !== false)
+ const machines = (a.machines ?? []).filter(m => m.on_progress_spine)
  const orders = a.ibus_orders ?? []
  const ex = a.exceptions ?? {}
  const bottleneck = a.bottleneck
 
- const completedToday = machines.reduce((s, m) => s + (m.completed_today ?? 0), 0)
- const ordersOnTrack = orders.filter(o => (o.completion_pct ?? 0) >= 100 || (o.rfid_in_progress ?? 0) === 0).length
- const needsAttention = (ex.exceeding_target ?? 0) + (ex.exit_only ?? 0) + (ex.abandoned ?? 0)
-
- const headline = orders.length === 1
-  ? `${orders[0].ibus_number} — ${orders[0].rfid_completed ?? 0}/${orders[0].expected_parts ?? '?'} complete`
-  : orders.length > 1
-   ? `${orders.filter(o => (o.completion_pct ?? 0) >= 100).length} of ${orders.length} orders complete`
-   : 'No active orders'
+ const stationCompletions = machines.reduce((s, m) => s + (m.completed_today ?? 0), 0)
+ const ordersBehind = orders.filter(o => (o.completion_pct ?? 0) < 100 && (o.rfid_in_progress ?? 0) > 0).length
+ const ordersComplete = orders.filter(o => (o.completion_pct ?? 0) >= 100).length
+ const exceptionCount = (ex.exceeding_target ?? 0) + (ex.exit_only ?? 0) + (ex.abandoned ?? 0)
 
  return (
-  <div className="space-y-6">
-   <div className="rounded-xl border border-[#4dc4f4]/20 bg-[#4dc4f4]/5 px-5 py-4">
-    <p className="text-xs font-semibold uppercase tracking-widest text-[#4dc4f4]">Today&apos;s pulse</p>
-    <p className="text-lg font-medium text-[#eef2f7] mt-1">{headline}</p>
-   </div>
-
-   <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-    <PulseKpi label="Completed today" value={completedToday} sub="Across all stations" />
-    <PulseKpi
-     label="Orders on track"
-     value={orders.length ? `${ordersOnTrack}/${orders.length}` : '—'}
+  <div className="space-y-5">
+   <div className="bb-kpi-strip">
+    <Kpi
+     label="Station completions"
+     value={stationCompletions}
+     sub="RFID exits across stations today"
     />
-    <PulseKpi
-     label="Slowest machine"
+    <Kpi
+     label="Orders completed"
+     value={orders.length ? `${ordersComplete}/${orders.length}` : '—'}
+     sub="Work orders at 100% RFID complete"
+    />
+    <Kpi
+     label="Slowest station"
      value={bottleneck?.station ?? '—'}
-     sub={bottleneck ? `Avg ${bottleneck.avg_dwell_display}` : undefined}
+     sub={bottleneck ? `Avg dwell ${bottleneck.avg_dwell_display}` : 'No dwell data yet'}
     />
-    <PulseKpi
-     label="Needs attention"
-     value={needsAttention || 'None'}
-     sub={needsAttention ? 'Over target or exceptions' : 'All clear'}
+    <Kpi
+     label="Orders behind target"
+     value={ordersBehind || 0}
+     sub={exceptionCount ? `${exceptionCount} session exceptions` : 'No open orders lagging'}
     />
    </div>
 
-   {orders.length > 0 && (
-    <section>
-     <h2 className="text-sm font-semibold text-[#8b939e] uppercase tracking-wider mb-3 flex items-center gap-2">
-      <Package className="w-4 h-4 text-[#4dc4f4]" />
-      Orders
-     </h2>
-     <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-      {orders.slice(0, 4).map(o => <OrderRow key={o.ibus_number} o={o} />)}
-     </div>
-    </section>
-   )}
-
-   <section>
-    <h2 className="text-sm font-semibold text-[#8b939e] uppercase tracking-wider mb-3 flex items-center gap-2">
-     <Factory className="w-4 h-4 text-[#4dc4f4]" />
-     Machines — actual vs target
-    </h2>
-    {machines.length === 0 ? (
-     <p className="text-sm text-[#8b939e] py-8 text-center">No machine data yet</p>
+   <section className="bb-section">
+    <h2 className="bb-section-title">Order progress</h2>
+    {orders.length === 0 ? (
+     <p className="bb-empty">No IBUS orders — ingest .R41 or run sim</p>
     ) : (
-     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
-      {machines.map(m => <MachineTile key={m.station_id ?? m.station} m={m} />)}
+     <div className="bb-table-wrap">
+      <table className="bb-table">
+       <thead className="bb-table-head">
+        <tr>
+         <th>IBUS</th>
+         <th>Customer</th>
+         <th className="text-right">RFID complete</th>
+         <th className="text-right">Expected</th>
+         <th className="text-right">In progress</th>
+         <th className="text-right">%</th>
+        </tr>
+       </thead>
+       <tbody>
+        {orders.map(o => {
+         const pct = o.completion_pct ?? 0
+         const done = pct >= 100
+         return (
+          <tr key={o.ibus_number} className="bb-table-row">
+           <td className="font-mono font-semibold text-[#eef2f7]">{o.ibus_number}</td>
+           <td className="text-[#8b939e] truncate max-w-[12rem]">{o.customer || '—'}</td>
+           <td className="text-right tabular-nums">{o.rfid_completed ?? 0}</td>
+           <td className="text-right tabular-nums text-[#8b939e]">{o.expected_parts ?? '—'}</td>
+           <td className="text-right tabular-nums text-[#8b939e]">{o.rfid_in_progress ?? 0}</td>
+           <td className="text-right">
+            <span className={`tabular-nums font-semibold ${done ? 'text-[#34d399]' : 'text-[#4dc4f4]'}`}>
+             {pct}%
+            </span>
+           </td>
+          </tr>
+         )
+        })}
+       </tbody>
+      </table>
+     </div>
+    )}
+    <p className="text-[11px] text-[#8b939e]">
+     RFID complete = unique parts with a closed session at Insert Station. Expected = BOM / work-order part count.
+    </p>
+   </section>
+
+   <section className="bb-section">
+    <h2 className="bb-section-title">Station performance</h2>
+    {machines.length === 0 ? (
+     <p className="bb-empty">No station data yet</p>
+    ) : (
+     <div className="bb-table-wrap">
+      <table className="bb-table">
+       <thead className="bb-table-head">
+        <tr>
+         <th>Station</th>
+         <th className="text-right">Parts</th>
+         <th className="text-right">Avg dwell</th>
+         <th className="text-right">Target</th>
+         <th className="text-right">Variance</th>
+         <th>Status</th>
+        </tr>
+       </thead>
+       <tbody>
+        {machines.map(m => {
+         const badge = targetLabel(m.vs_target_status)
+         const targetSec = m.target_part_dwell_seconds ?? parseTargetSeconds(m.target_part_dwell_display)
+         return (
+          <tr key={m.station_id ?? m.station} className="bb-table-row">
+           <td className="font-medium text-[#eef2f7]">{m.station}</td>
+           <td className="text-right tabular-nums">{m.completed_today ?? 0}</td>
+           <td className="text-right font-mono text-xs">{m.avg_dwell_display ?? '—'}</td>
+           <td className="text-right font-mono text-xs text-[#8b939e]">
+            {m.target_part_dwell_display ?? '—'}
+           </td>
+           <td className="text-right font-mono text-xs tabular-nums">
+            {formatVariance(m.avg_dwell_seconds, targetSec)}
+           </td>
+           <td>
+            <span className={badge.cls}>{badge.text}</span>
+            {(m.in_process ?? 0) > 0 && (
+             <span className="ml-2 text-[11px] text-[#4dc4f4]">{m.in_process} in process</span>
+            )}
+           </td>
+          </tr>
+         )
+        })}
+       </tbody>
+      </table>
+     </div>
+    )}
+    <p className="text-[11px] text-[#8b939e]">
+     Parts = RFID station completions today (a part counted once per station exit).
+    </p>
+   </section>
+
+   <section className="bb-section">
+    <h2 className="bb-section-title">Exceptions</h2>
+    {exceptionCount === 0 ? (
+     <p className="text-sm text-[#8b939e] py-3 px-1">
+      No stations currently exceeding target dwell time
+     </p>
+    ) : (
+     <div className="bb-table-wrap">
+      <table className="bb-table">
+       <thead className="bb-table-head">
+        <tr>
+         <th>Type</th>
+         <th className="text-right">Count</th>
+        </tr>
+       </thead>
+       <tbody>
+        {(ex.exceeding_target ?? 0) > 0 && (
+         <tr className="bb-table-row">
+          <td>Sessions over dwell target</td>
+          <td className="text-right tabular-nums text-[#fbbf24]">{ex.exceeding_target}</td>
+         </tr>
+        )}
+        {(ex.exit_only ?? 0) > 0 && (
+         <tr className="bb-table-row">
+          <td>Exit-only (missing entry read)</td>
+          <td className="text-right tabular-nums text-[#fbbf24]">{ex.exit_only}</td>
+         </tr>
+        )}
+        {(ex.abandoned ?? 0) > 0 && (
+         <tr className="bb-table-row">
+          <td>Abandoned sessions</td>
+          <td className="text-right tabular-nums text-[#f87171]">{ex.abandoned}</td>
+         </tr>
+        )}
+       </tbody>
+      </table>
      </div>
     )}
    </section>
-
-   {needsAttention > 0 && (
-    <div className="rounded-xl border border-[#fbbf24]/30 bg-[#fbbf24]/5 px-4 py-3 flex items-start gap-3 text-sm text-[#fbbf24]">
-     <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-     <div>
-      {(ex.exceeding_target ?? 0) > 0 && <p>{ex.exceeding_target} sessions over dwell target</p>}
-      {(ex.exit_only ?? 0) > 0 && <p>{ex.exit_only} exit-only (missing entry read)</p>}
-      {(ex.abandoned ?? 0) > 0 && <p>{ex.abandoned} abandoned sessions</p>}
-     </div>
-    </div>
-   )}
   </div>
  )
 }
@@ -173,11 +223,48 @@ function TodayTab({ a }) {
 function OrdersTab({ a }) {
  const orders = a.ibus_orders ?? []
  if (!orders.length) {
-  return <p className="text-sm text-[#8b939e] py-12 text-center">No IBUS orders — ingest .R41 or run sim</p>
+  return <p className="bb-empty">No IBUS orders — ingest .R41 or run sim</p>
  }
  return (
-  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-   {orders.map(o => <OrderRow key={o.ibus_number} o={o} />)}
+  <div className="bb-section">
+   <h2 className="bb-section-title">All orders</h2>
+   <div className="bb-table-wrap">
+    <table className="bb-table">
+     <thead className="bb-table-head">
+      <tr>
+       <th>IBUS</th>
+       <th>Work order</th>
+       <th>Customer</th>
+       <th>Status</th>
+       <th className="text-right">RFID complete</th>
+       <th className="text-right">Expected</th>
+       <th className="text-right">%</th>
+      </tr>
+     </thead>
+     <tbody>
+      {orders.map(o => {
+       const pct = o.completion_pct ?? 0
+       return (
+        <tr key={o.ibus_number} className="bb-table-row">
+         <td className="font-mono font-semibold">{o.ibus_number}</td>
+         <td className="font-mono text-xs text-[#8b939e]">{o.work_order || '—'}</td>
+         <td className="text-[#8b939e] truncate max-w-[12rem]">{o.customer || '—'}</td>
+         <td>
+          <span className={pct >= 100 ? 'bb-badge-green' : (o.rfid_in_progress ?? 0) > 0 ? 'bb-badge-blue' : 'bb-badge-muted'}>
+           {pct >= 100 ? 'Complete' : (o.rfid_in_progress ?? 0) > 0 ? 'In process' : o.status || 'Open'}
+          </span>
+         </td>
+         <td className="text-right tabular-nums">{o.rfid_completed ?? 0}</td>
+         <td className="text-right tabular-nums text-[#8b939e]">{o.expected_parts ?? '—'}</td>
+         <td className={`text-right tabular-nums font-semibold ${pct >= 100 ? 'text-[#34d399]' : 'text-[#4dc4f4]'}`}>
+          {pct}%
+         </td>
+        </tr>
+       )
+      })}
+     </tbody>
+    </table>
+   </div>
   </div>
  )
 }
@@ -197,28 +284,23 @@ function TrendsTab({ a }) {
  }))
 
  return (
-  <div className="space-y-6">
-   <div className="rounded-xl border border-[#27272f] bg-[#18181d] overflow-hidden">
-    <div className="px-5 py-4 border-b border-[#27272f] flex items-center gap-2">
-     <CalendarDays className="w-4 h-4 text-[#4dc4f4]" />
-     <h2 className="font-semibold text-[#eef2f7]">Throughput — last 14 days</h2>
-    </div>
-    <div className="px-5 py-5">
+  <div className="space-y-5">
+   <section className="bb-section">
+    <h2 className="bb-section-title">Throughput — last 14 days</h2>
+    <div className="bb-panel px-4 py-4">
      {dayData.some(d => d.value > 0)
       ? <AreaChart data={dayData} formatValue={v => `${v} parts`} />
-      : <p className="text-sm text-[#8b939e] py-8 text-center">No completions in this period</p>}
+      : <p className="bb-empty">No completions in this period</p>}
     </div>
-   </div>
+    <p className="text-[11px] text-[#8b939e]">Daily count of RFID station completions (closed sessions).</p>
+   </section>
 
-   <div className="rounded-xl border border-[#27272f] bg-[#18181d] overflow-hidden">
-    <div className="px-5 py-4 border-b border-[#27272f] flex items-center gap-2">
-     <Target className="w-4 h-4 text-[#4dc4f4]" />
-     <h2 className="font-semibold text-[#eef2f7]">Dwell vs target by machine</h2>
-    </div>
-    <div className="px-5 py-5">
+   <section className="bb-section">
+    <h2 className="bb-section-title">Dwell vs target by station</h2>
+    <div className="bb-panel px-4 py-4">
      <HorizontalBars data={dwellData} accent="bobrick" emptyText="No completed sessions" />
     </div>
-   </div>
+   </section>
   </div>
  )
 }
@@ -258,22 +340,19 @@ export function AnalyticsPage() {
  }, [load])
 
  return (
-  <div className="bobrick-shell rounded-2xl border border-[#27272f] bg-[#111114] p-4 sm:p-6 min-h-[70vh]">
-   <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+  <div className="bobrick-shell space-y-4 min-h-[70vh]">
+   <div className="flex flex-wrap items-end justify-between gap-3">
     <div>
-     <h1 className="text-xl font-bold text-[#eef2f7] flex items-center gap-2">
-      <Gauge className="w-5 h-5 text-[#4dc4f4]" />
-      Analytics
-     </h1>
-     <p className="text-sm text-[#8b939e] mt-0.5">Production efficiency at a glance</p>
+     <h1 className="bb-page-title">Analytics</h1>
+     <p className="bb-page-sub">Today&apos;s production and station performance</p>
     </div>
-    <div className="flex gap-1 p-1 rounded-lg bg-[#08080a] border border-[#27272f]">
+    <div className="flex gap-0.5 p-0.5 rounded-[6px] bg-[#08080a] border border-[#2a2a32]">
      {TABS.map(t => (
       <button
        key={t.id}
        type="button"
        onClick={() => setTab(t.id)}
-       className={`px-4 py-2 rounded-md text-sm font-medium transition-colors
+       className={`px-3 py-1.5 rounded-[4px] text-sm font-medium transition-colors
         ${tab === t.id
          ? 'bg-[#4dc4f4] text-[#08080a]'
          : 'text-[#8b939e] hover:text-[#eef2f7]'}`}
@@ -285,15 +364,15 @@ export function AnalyticsPage() {
    </div>
 
    {loadError && (
-    <div className="mb-4 rounded-lg border border-[#fbbf24]/40 bg-[#fbbf24]/10 px-4 py-3 text-sm text-[#fbbf24]">
+    <div className="border border-[#fbbf24]/40 bg-[#fbbf24]/10 px-3 py-2 text-sm text-[#fbbf24] rounded-[6px]">
      {loadError}
     </div>
    )}
 
    {!a ? (
-    <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+    <div className="bb-kpi-strip animate-pulse">
      {Array.from({ length: 4 }).map((_, i) => (
-      <div key={i} className="h-24 rounded-xl bg-[#18181d] border border-[#27272f] animate-pulse" />
+      <div key={i} className="h-14" />
      ))}
     </div>
    ) : (
@@ -304,9 +383,8 @@ export function AnalyticsPage() {
     </>
    )}
 
-   <p className="mt-8 text-[10px] text-[#8b939e] flex items-center gap-1">
-    <ChevronRight className="w-3 h-3" />
-    Operator detail lives on the Operators tab · Session detail on Full Report
+   <p className="text-[11px] text-[#8b939e]">
+    Operator activity is on the Operators tab · Session detail on Full Report
    </p>
   </div>
  )

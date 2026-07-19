@@ -1,26 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import {
- Users, MapPin, Clock, Award, ArrowLeft, Radio, Activity,
- Factory, Search, User, LayoutGrid,
-} from 'lucide-react'
+import { Search, X } from 'lucide-react'
 import { apiFetch } from '../api'
-import { Panel } from '../components/Panel'
-import { HorizontalBars, VerticalBars } from '../components/charts'
+import { VerticalBars, HorizontalBars } from '../components/charts'
 
-const CARD_COLORS = [
- 'from-[#4dc4f4]/10 to-[#18181d] border-[#4dc4f4]/25',
- 'from-[#4dc4f4]/10 to-[#18181d] border-[#4dc4f4]/25',
- 'from-[#34d399]/10 to-[#18181d] border-[#34d399]/25',
- 'from-[#fbbf24]/10 to-[#18181d] border-[#fbbf24]/25',
- 'from-[#f87171]/10 to-[#18181d] border-[#f87171]/25',
- 'from-[#4dc4f4]/10 to-[#18181d] border-[#4dc4f4]/25',
+const TABS = [
+ { id: 'live', label: 'Live' },
+ { id: 'trends', label: 'Trends' },
 ]
 
-function hourLabel(h) {
- const ampm = h < 12 ? 'AM' : 'PM'
- const hr = h % 12 === 0 ? 12 : h % 12
- return `${hr}${ampm}`
-}
+const RANGE_PRESETS = [
+ { id: 'all', label: 'All time' },
+ { id: '7', label: '1 week' },
+ { id: '14', label: '2 weeks' },
+ { id: '30', label: '30 days' },
+ { id: '90', label: '90 days' },
+]
 
 function formatWhen(iso) {
  if (!iso) return '—'
@@ -33,23 +27,23 @@ function formatWhen(iso) {
  }
 }
 
-function cardColor(id) {
- return CARD_COLORS[(id ?? 0) % CARD_COLORS.length]
-}
-
-function buildHourlyFromRecent(recent) {
- const buckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, assignments: 0 }))
- for (const r of recent) {
-  if (!r.assigned_at) continue
-  try {
-   const h = new Date(r.assigned_at).getHours()
-   buckets[h].assignments += 1
-  } catch { /* ignore */ }
+function formatMetricValue(metric, value) {
+ if (value == null || Number.isNaN(value)) return '—'
+ if (metric === 'active_time' || metric === 'median_operator_dwell' || metric === 'median_part_dwell') {
+  const sec = Math.round(value)
+  if (sec < 60) return `${sec} sec`
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  if (m < 60) return `${m}m ${s}s`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m % 60}m`
  }
- return buckets
+ if (metric === 'pct_within_target' || metric === 'exception_rate') return `${Number(value).toFixed(1)}%`
+ if (metric === 'parts') return String(Math.round(value))
+ return Number(value).toFixed(1)
 }
 
-async function loadOperatorData() {
+async function loadLiveData() {
  try {
   return await apiFetch('/api/analytics/operators')
  } catch {
@@ -60,12 +54,9 @@ async function loadOperatorData() {
   const op = analytics.operators ?? {}
   const lbMap = new Map((op.leaderboard ?? []).map(o => [o.operator_id, o]))
   return {
-   summary: op.summary ?? {},
+   summary: { ...(op.summary ?? {}), scope: 'today' },
    leaderboard: op.leaderboard ?? [],
-   presence: {},
    currently_in_zone: [],
-   station_coverage: [],
-   assignments_by_hour: [],
    roster: (operators ?? []).map(o => {
     const stats = lbMap.get(o.operator_id)
     return {
@@ -74,423 +65,111 @@ async function loadOperatorData() {
      employee_number: o.employee_number,
      rtls_badge_id: o.rtls_badge_id,
      is_active: !!o.is_active,
-     sessions: stats?.total_pieces ?? 0,
-     stations: stats?.stations_worked ?? 0,
-     last_assigned_at: null,
-     completed_pieces: stats?.completed_pieces ?? 0,
+     parts_today: stats?.completed_pieces ?? 0,
+     stations_today: stats?.stations_worked ?? 0,
      in_progress: stats?.in_progress ?? 0,
     }
    }),
    recent_assignments: [],
-   multi_station_operators: [],
-   _fallback: true,
   }
  }
 }
 
-function StationToggle({ stations, active, onChange }) {
- if (!stations.length) return null
- return (
-  <div className="flex flex-wrap items-center gap-2">
-   <span className="text-[11px] font-semibold uppercase tracking-wider text-[#8b939e] mr-1">
-    Station
-   </span>
-   <button
-    type="button"
-    onClick={() => onChange(null)}
-    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors
-     ${active == null
-      ? 'bg-violet-600 text-white shadow-sm'
-      : 'bg-[#27272f] text-[#8b939e] hover:bg-[#27272f]/60 dark:text-[#8b939e] hover:bg-[#4dc4f4]/10'}`}
-   >
-    <span className="inline-flex items-center gap-1">
-     <LayoutGrid className="w-3 h-3" />
-     All
-    </span>
-   </button>
-   {stations.map(s => (
-    <button
-     key={s.station}
-     type="button"
-     onClick={() => onChange(s.station)}
-     className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors
-      ${active === s.station
-       ? 'bg-violet-600 text-white shadow-sm'
-       : 'bg-[#27272f] text-[#8b939e] hover:bg-[#27272f]/60 dark:text-[#8b939e] hover:bg-[#4dc4f4]/10'}`}
-    >
-     {s.station}
-     <span className={`ml-1.5 tabular-nums ${active === s.station ? 'text-violet-200' : 'text-[#4dc4f4]'}`}>
-      {s.pieces ?? 0}
-     </span>
-    </button>
-   ))}
-  </div>
- )
-}
+/* ── Live drawer (who / where right now) ────────────────────────────────────── */
 
-function OperatorCard({ op, inZone, rank, onClick }) {
- const live = inZone?.station_name
- return (
-  <button
-   type="button"
-   onClick={onClick}
-   className={`relative aspect-[4/3] min-h-[9rem] rounded-xl border bg-gradient-to-b
-         overflow-hidden flex flex-col shadow-sm text-left p-4
-         hover:brightness-[1.03] focus:outline-none focus-visible:ring-2
-         focus-visible:ring-violet-400 cursor-pointer transition-all
-         ${cardColor(op.operator_id)}`}
-  >
-   {live && (
-    <span className="absolute top-2.5 right-2.5 flex items-center gap-1 text-[10px]
- font-semibold text-[#4dc4f4]">
-     <span className="w-2 h-2 rounded-full bg-[#4dc4f4]/100 animate-pulse" />
-     Live
-    </span>
-   )}
-   {rank > 0 && rank <= 3 && (
-    <span className="absolute top-2.5 left-2.5 text-[10px] font-bold tabular-nums
- text-[#fbbf24]">#{rank}</span>
-   )}
-   <div className="flex items-center gap-2.5 mt-1">
-    <span className="flex items-center justify-center w-10 h-10 rounded-full
- bg-[#18181d]/80 bg-[#18181d]/80 shrink-0">
-     <User className="w-5 h-5 text-[#4dc4f4]" />
-    </span>
-    <div className="min-w-0 flex-1">
-     <p className="font-semibold text-sm text-[#eef2f7] leading-snug truncate">
-      {op.operator_name}
-     </p>
-     <p className="text-[11px] text-[#8b939e] truncate">
-      Badge {op.rtls_badge_id ?? '—'}
-     </p>
-    </div>
-   </div>
-   <div className="mt-auto pt-3 space-y-1">
-    {live && (
-     <p className="text-[11px] text-[#4dc4f4] truncate flex items-center gap-1">
-      <MapPin className="w-3 h-3 shrink-0" />
-      {live}
-     </p>
-    )}
-    <div className="flex items-center justify-between gap-2 text-xs">
-     <span className="tabular-nums font-semibold text-[#34d399]">
-      {op.completed_pieces ?? op.sessions ?? 0} pieces
-     </span>
-     <span className="text-[#8b939e] tabular-nums">
-      {op.stations ?? 0} stations
-     </span>
-    </div>
-   </div>
-  </button>
- )
-}
-
-function OperatorDetailView({
- operatorId,
- leaderboardStats,
- rosterRow,
- inZoneProp,
- globalRecent,
- onBack,
- tick = 0,
-}) {
+function LiveDrawer({ operatorId, rosterRow, inZoneProp, onClose, tick = 0 }) {
  const [detail, setDetail] = useState(null)
- const [stationFilter, setStationFilter] = useState(null)
 
  useEffect(() => {
   let alive = true
-  setStationFilter(null)
   apiFetch(`/api/analytics/operators/${operatorId}`)
    .then(d => { if (alive) setDetail(d) })
    .catch(() => { if (alive) setDetail(null) })
   return () => { alive = false }
  }, [operatorId, tick])
 
- const stats = detail?.stats ?? leaderboardStats
- const op = detail?.operator ?? rosterRow
- const inZone = detail?.currently_in_zone ?? inZoneProp
- const stations = useMemo(() => {
-  const fromDetail = detail?.stations ?? []
-  const fromLb = stats?.stations ?? []
-  const fromZones = detail?.zone_dwell_by_station ?? []
-  const merged = new Map()
-  for (const s of fromDetail.length ? fromDetail : fromLb.map(x => ({
-   station: x.station,
-   pieces: x.pieces ?? 0,
-   completed: x.completed ?? x.pieces ?? 0,
-   avg_dwell_display: x.avg_dwell_display,
-   avg_dwell_seconds: x.avg_dwell_seconds,
-  }))) {
-   merged.set(s.station, { ...s })
-  }
-  for (const z of fromZones) {
-   const existing = merged.get(z.station) ?? { station: z.station, pieces: 0, completed: 0 }
-   merged.set(z.station, {
-    ...existing,
-    zone_visits: z.visits,
-    zone_avg_dwell_display: z.avg_dwell_display,
-    zone_total_dwell_display: z.total_dwell_display,
-   })
-  }
-  return [...merged.values()].sort((a, b) => (b.pieces ?? 0) - (a.pieces ?? 0))
- }, [detail, stats])
-
- const zoneVisits = detail?.zone_visits ?? []
- const filteredZoneVisits = useMemo(() => {
-  if (!stationFilter) return zoneVisits
-  return zoneVisits.filter(v => v.station_name === stationFilter)
- }, [zoneVisits, stationFilter])
-
- const activeZoneStation = useMemo(() => {
-  if (!stationFilter) return null
-  return (detail?.zone_dwell_by_station ?? []).find(z => z.station === stationFilter) ?? null
- }, [detail, stationFilter])
-
- const operatorName = op?.operator_name ?? rosterRow?.operator_name ?? 'Operator'
-
- const allRecent = useMemo(() => {
-  const fromApi = detail?.recent_assignments ?? []
-  if (fromApi.length) return fromApi
-  const name = operatorName.toLowerCase()
-  return (globalRecent ?? []).filter(r =>
-   (r.operator_name ?? '').toLowerCase() === name
-   || r.operator_id === operatorId,
-  )
- }, [detail, globalRecent, operatorName, operatorId])
-
- const filteredRecent = useMemo(() => {
-  if (!stationFilter) return allRecent
-  return allRecent.filter(r => r.station_name === stationFilter)
- }, [allRecent, stationFilter])
-
- const activeStation = useMemo(
-  () => stations.find(s => s.station === stationFilter) ?? null,
-  [stations, stationFilter],
- )
-
- const byHour = useMemo(() => {
-  if (stationFilter) return buildHourlyFromRecent(filteredRecent)
-  if (detail?.assignments_by_hour?.length) return detail.assignments_by_hour
-  return buildHourlyFromRecent(allRecent)
- }, [detail, stationFilter, filteredRecent, allRecent])
-
- const hourChart = byHour.map(h => ({
-  label: hourLabel(h.hour),
-  short: h.hour % 3 === 0 ? hourLabel(h.hour) : '',
-  value: h.assignments,
- }))
-
- const stationBars = stations.map(s => ({
-  label: s.station,
-  value: s.pieces ?? 0,
-  display: `${s.pieces ?? 0} pcs`,
- }))
-
- const kpis = stationFilter && activeStation
-  ? [
-    ['Pieces at station', activeStation.pieces ?? 0, 'text-[#34d399]'],
-    ['Completed', activeStation.completed ?? activeStation.pieces ?? 0, 'text-[#34d399]'],
-    ['Avg dwell', activeStation.avg_dwell_display ?? '—', 'text-[#eef2f7] font-mono'],
-    ['Zone visits', activeZoneStation?.visits ?? filteredZoneVisits.length, 'text-[#4dc4f4]'],
-   ]
-  : [
-    ['Completed', stats?.completed_pieces ?? rosterRow?.completed_pieces ?? 0, 'text-[#34d399]'],
-    ['In progress', stats?.in_progress ?? rosterRow?.in_progress ?? 0, 'text-[#4dc4f4]'],
-    ['Stations', stats?.stations_worked ?? stations.length, 'text-[#4dc4f4]'],
-    ['Avg dwell', stats?.avg_dwell_display ?? '—', 'text-[#eef2f7] font-mono'],
-   ]
+ const name = detail?.operator?.operator_name || rosterRow?.operator_name || 'Operator'
+ const badge = detail?.operator?.rtls_badge_id ?? rosterRow?.rtls_badge_id
+ const zone = detail?.currently_in_zone || inZoneProp
+ const recent = detail?.recent_assignments ?? []
 
  return (
-  <div className="space-y-6">
-   <div className="flex flex-wrap items-center gap-3">
-    <button
-     type="button"
-     onClick={onBack}
-     className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium
- border border-[#27272f] text-[#8b939e] dark:text-[#8b939e]
-           hover:bg-[#4dc4f4]/5 hover:bg-[#4dc4f4]/10"
-    >
-     <ArrowLeft className="w-4 h-4" />
-     All operators
-    </button>
-    <div>
-     <h1 className="text-xl font-bold text-[#eef2f7]">{operatorName}</h1>
-     <p className="text-sm text-[#8b939e]">
-      Badge {op?.rtls_badge_id ?? rosterRow?.rtls_badge_id ?? '—'}
-     </p>
+  <div className="bb-drawer-backdrop" onClick={onClose}>
+   <aside className="bb-drawer" onClick={e => e.stopPropagation()}>
+    <div className="bb-panel-header border-b border-[#2a2a32]">
+     <div className="min-w-0">
+      <h2 className="bb-title truncate">{name}</h2>
+      <p className="bb-subtitle">
+       {badge != null ? `Badge ${badge}` : 'No badge'}
+       {zone?.station_name ? ` · ${zone.station_name}` : ' · Idle'}
+      </p>
+     </div>
+     <button type="button" onClick={onClose} className="bb-btn-ghost p-1.5" aria-label="Close">
+      <X className="w-4 h-4" />
+     </button>
     </div>
-    {inZone && (
-     <span className="ml-auto inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs
- font-semibold bg-sky-100 text-[#4dc4f4] dark:bg-[#4dc4f4]/100/20">
-      <Radio className="w-3.5 h-3.5" />
-      In zone: {inZone.station_name ?? inZone}
-     </span>
-    )}
-   </div>
 
-   <StationToggle
-    stations={stations}
-    active={stationFilter}
-    onChange={setStationFilter}
-   />
-
-   <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-    {kpis.map(([label, val, cls]) => (
-     <div key={label} className="rounded-xl border border-[#27272f]
- bg-[#18181d] p-4">
-      <p className="text-[10px] uppercase tracking-wider text-[#8b939e]">{label}</p>
-      <p className={`text-2xl font-bold mt-1 tabular-nums truncate ${cls}`}>{val}</p>
-     </div>
-    ))}
-   </div>
-
-   {stationFilter && activeStation && (
-    <Panel
-     title={`${stationFilter} breakdown`}
-     icon={Factory}
-     iconColor="text-[#4dc4f4]"
-     subtitle="Stats for this station only"
-    >
-     <div className="px-5 py-4 grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
-      <div className="rounded-lg bg-[#a78bfa]/10/80 dark:bg-[#a78bfa]/100/10 p-4 border border-[#a78bfa]/30/60 border-[#a78bfa]/25">
-       <p className="text-[10px] uppercase tracking-wider text-[#a78bfa]/80/80">Pieces</p>
-       <p className="text-3xl font-bold tabular-nums text-[#a78bfa] mt-1">
-        {activeStation.pieces ?? 0}
-       </p>
+    <div className="p-4 space-y-4 overflow-y-auto flex-1">
+     <div className="bb-kpi-strip">
+      <div>
+       <p className="bb-kpi-label">Parts today</p>
+       <p className="bb-kpi-value">{rosterRow?.parts_today ?? rosterRow?.completed_pieces ?? 0}</p>
       </div>
-      <div className="rounded-lg bg-[#34d399]/10/80 dark:bg-[#34d399]/100/10 p-4 border border-[#34d399]/30/60 border-[#34d399]/25">
-       <p className="text-[10px] uppercase tracking-wider text-[#34d399]/80/80">Completed</p>
-       <p className="text-3xl font-bold tabular-nums text-[#34d399] mt-1">
-        {activeStation.completed ?? activeStation.pieces ?? 0}
-       </p>
+      <div>
+       <p className="bb-kpi-label">In progress</p>
+       <p className="bb-kpi-value">{rosterRow?.in_progress ?? 0}</p>
       </div>
-      <div className="rounded-lg bg-[#08080a]/40 p-4 border border-[#27272f]">
-       <p className="text-[10px] uppercase tracking-wider text-[#8b939e]">Avg dwell</p>
-       <p className="text-3xl font-bold font-mono text-[#eef2f7] mt-1">
-        {activeStation.avg_dwell_display ?? '—'}
-       </p>
+      <div>
+       <p className="bb-kpi-label">Stations today</p>
+       <p className="bb-kpi-value">{rosterRow?.stations_today ?? rosterRow?.stations ?? 0}</p>
       </div>
      </div>
-    </Panel>
-   )}
 
-   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-    {!stationFilter && (
-     <Panel title="All Stations" icon={Factory} iconColor="text-[#4dc4f4]"
-         subtitle="Pieces attributed at each machine">
-      <div className="px-5 py-5">
-       {stationBars.length > 0
-        ? <HorizontalBars data={stationBars} accent="blue" />
-        : <p className="text-sm text-[#8b939e] py-8 text-center">No machine data yet — run sim with demo operators</p>}
-      </div>
-     </Panel>
-    )}
-
-    <Panel
-     title="Activity by Hour"
-     icon={Activity}
-     iconColor="text-[#4dc4f4]"
-     subtitle={stationFilter ? `Assignments at ${stationFilter}` : 'All stations combined'}
-    >
-     <div className="px-4 py-4">
-      {hourChart.some(h => h.value > 0)
-       ? <VerticalBars data={hourChart} accent="violet" />
-       : <p className="text-sm text-[#8b939e] py-8 text-center">No hourly data for this view</p>}
-     </div>
-    </Panel>
-   </div>
-
-   <Panel
-    title="Zone Movement History"
-    icon={MapPin}
-    iconColor="text-sky-500"
-    subtitle={stationFilter ? `RTLS visits at ${stationFilter}` : 'Random station-to-station dwell (min 5s)'}
-   >
-    {filteredZoneVisits.length === 0 ? (
-     <p className="text-sm text-[#8b939e] py-8 text-center">
-      {stationFilter
-       ? `No zone visits at ${stationFilter} yet — run sim with operator movement`
-       : 'No zone visits yet — start sim to see operators roam between stations'}
-     </p>
-    ) : (
-     <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-       <thead>
-        <tr className="text-left bg-[#08080a] border-b border-[#27272f]">
-         {['Entered', 'Exited', 'Station', 'Dwell', 'Source'].map(h => (
-          <th key={h} className="px-4 py-3 font-semibold text-xs text-[#8b939e]">{h}</th>
-         ))}
-        </tr>
-       </thead>
-       <tbody className="divide-y divide-[#27272f]/50">
-        {filteredZoneVisits.map((v, i) => (
-         <tr key={`${v.entered_at}-${i}`} className="hover:bg-[#4dc4f4]/5 hover:bg-[#4dc4f4]/10/20">
-          <td className="px-4 py-2.5 text-xs whitespace-nowrap">{formatWhen(v.entered_at)}</td>
-          <td className="px-4 py-2.5 text-xs whitespace-nowrap">
-           {v.exited_at ? formatWhen(v.exited_at) : (
-            <span className="text-[#4dc4f4] font-medium">In zone</span>
-           )}
-          </td>
-          <td className="px-4 py-2.5">{v.station_name ?? '—'}</td>
-          <td className="px-4 py-2.5 font-mono text-xs tabular-nums">{v.dwell_display ?? '—'}</td>
-          <td className="px-4 py-2.5 text-xs capitalize text-[#8b939e]">{v.source ?? '—'}</td>
-         </tr>
-        ))}
-       </tbody>
-      </table>
-     </div>
-    )}
-   </Panel>
-
-   <Panel
-    title="Recent Work"
-    icon={Clock}
-    iconColor="text-[#34d399]"
-    subtitle={stationFilter ? `Parts at ${stationFilter}` : 'Latest parts this operator worked on'}
-   >
-    {filteredRecent.length === 0 ? (
-     <p className="text-sm text-[#8b939e] py-8 text-center">
-      {stationFilter
-       ? `No recorded work at ${stationFilter} yet`
-       : 'No assignments recorded yet — restart API after sim for full history'}
-     </p>
-    ) : (
-     <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-       <thead>
-        <tr className="text-left bg-[#08080a] border-b border-[#27272f]">
-         {['When', 'Station', 'Part EPC', 'Dwell', 'Status'].map(h => (
-          <th key={h} className="px-4 py-3 font-semibold text-xs text-[#8b939e]">{h}</th>
-         ))}
-        </tr>
-       </thead>
-       <tbody className="divide-y divide-[#27272f]/50">
-        {filteredRecent.map((r, i) => (
-         <tr key={`${r.assigned_at}-${i}`} className="hover:bg-[#4dc4f4]/5 hover:bg-[#4dc4f4]/10/20">
-          <td className="px-4 py-2.5 text-xs whitespace-nowrap">{formatWhen(r.assigned_at)}</td>
-          <td className="px-4 py-2.5">{r.station_name ?? '—'}</td>
-          <td className="px-4 py-2.5 font-mono text-[11px]">{r.epc ?? '—'}</td>
-          <td className="px-4 py-2.5 font-mono text-xs tabular-nums">{r.dwell_display ?? '—'}</td>
-          <td className="px-4 py-2.5 text-xs capitalize">{r.session_status ?? '—'}</td>
-         </tr>
-        ))}
-       </tbody>
-      </table>
-     </div>
-    )}
-   </Panel>
+     <section>
+      <h3 className="bb-section-title mb-2">Recent work</h3>
+      {recent.length === 0 ? (
+       <p className="text-sm text-[#8b939e]">No recent attributed sessions</p>
+      ) : (
+       <div className="bb-table-wrap">
+        <table className="bb-table">
+         <thead className="bb-table-head">
+          <tr>
+           <th>When</th>
+           <th>Station</th>
+           <th>Part</th>
+           <th className="text-right">Dwell</th>
+          </tr>
+         </thead>
+         <tbody>
+          {recent.slice(0, 20).map((r, i) => (
+           <tr key={i} className="bb-table-row">
+            <td className="text-xs text-[#8b939e] whitespace-nowrap">{formatWhen(r.assigned_at)}</td>
+            <td className="text-xs">{r.station_name || '—'}</td>
+            <td className="font-mono text-[11px] text-[#8b939e] truncate max-w-[8rem]">{r.epc ?? '—'}</td>
+            <td className="text-right font-mono text-xs">{r.dwell_display ?? '—'}</td>
+           </tr>
+          ))}
+         </tbody>
+        </table>
+       </div>
+      )}
+     </section>
+    </div>
+   </aside>
   </div>
  )
 }
 
-export function OperatorAnalyticsPage({ tick = 0 }) {
+/* ── Live tab ───────────────────────────────────────────────────────────────── */
+
+function LiveTab({ tick }) {
  const [data, setData] = useState(null)
  const [error, setError] = useState(null)
  const [search, setSearch] = useState('')
  const [selectedId, setSelectedId] = useState(null)
 
  const load = useCallback(() => {
-  loadOperatorData()
+  loadLiveData()
    .then(d => { setData(d); setError(null) })
    .catch(e => setError(e?.message || 'Failed to load operators'))
  }, [])
@@ -503,15 +182,7 @@ export function OperatorAnalyticsPage({ tick = 0 }) {
 
  const inZoneMap = useMemo(() => {
   const m = new Map()
-  for (const z of data?.currently_in_zone ?? []) {
-   m.set(z.operator_id, z)
-  }
-  return m
- }, [data])
-
- const rankMap = useMemo(() => {
-  const m = new Map()
-  ;(data?.leaderboard ?? []).forEach((o, i) => m.set(o.operator_id, i + 1))
+  for (const z of data?.currently_in_zone ?? []) m.set(z.operator_id, z)
   return m
  }, [data])
 
@@ -520,66 +191,43 @@ export function OperatorAnalyticsPage({ tick = 0 }) {
   [data],
  )
 
- const cards = useMemo(() => {
-  const roster = data?.roster ?? []
-  return roster
+ const rows = useMemo(() => {
+  return (data?.roster ?? [])
    .filter(r => r.is_active !== false)
    .map(r => {
     const stats = leaderboardMap.get(r.operator_id)
+    const zone = inZoneMap.get(r.operator_id)
     return {
      ...r,
-     completed_pieces: stats?.completed_pieces ?? r.completed_pieces ?? 0,
-     in_progress: stats?.in_progress ?? r.in_progress ?? 0,
-     stations: stats?.stations_worked ?? r.stations ?? 0,
+     parts_today: r.parts_today ?? stats?.completed_pieces ?? 0,
+     stations_today: r.stations_today ?? stats?.stations_worked ?? 0,
+     in_progress: r.in_progress ?? stats?.in_progress ?? 0,
+     current_station: zone?.station_name ?? null,
+     status: zone ? 'Active' : 'Idle',
     }
    })
-   .sort((a, b) => (b.completed_pieces - a.completed_pieces) || a.operator_name.localeCompare(b.operator_name))
- }, [data, leaderboardMap])
+   .sort((a, b) => (b.parts_today - a.parts_today) || a.operator_name.localeCompare(b.operator_name))
+ }, [data, leaderboardMap, inZoneMap])
 
- const filteredCards = useMemo(() => {
-  if (!search.trim()) return cards
+ const filtered = useMemo(() => {
+  if (!search.trim()) return rows
   const q = search.trim().toLowerCase()
-  return cards.filter(c =>
-   `${c.operator_name} ${c.rtls_badge_id} ${c.employee_number}`.toLowerCase().includes(q),
+  return rows.filter(c =>
+   `${c.operator_name} ${c.rtls_badge_id} ${c.employee_number} ${c.current_station ?? ''}`.toLowerCase().includes(q),
   )
- }, [cards, search])
+ }, [rows, search])
 
- if (selectedId != null) {
-  return (
-   <OperatorDetailView
-    operatorId={selectedId}
-    leaderboardStats={leaderboardMap.get(selectedId)}
-    rosterRow={cards.find(c => c.operator_id === selectedId)}
-    inZoneProp={inZoneMap.get(selectedId)}
-    globalRecent={data?.recent_assignments}
-    onBack={() => setSelectedId(null)}
-    tick={tick}
-   />
-  )
- }
+ const activeCount = data?.currently_in_zone?.length ?? rows.filter(r => r.status === 'Active').length
 
  if (!data && !error) {
-  return (
-   <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-4">
-    {Array.from({ length: 10 }).map((_, i) => (
-     <div key={i} className="aspect-[4/3] rounded-xl bg-[#18181d] border border-[#27272f]
- bg-[#18181d] animate-pulse" />
-    ))}
-   </div>
-  )
+  return <div className="bb-table-wrap animate-pulse"><div className="h-48 bg-[#16161a]" /></div>
  }
 
  return (
-  <div className="space-y-5">
+  <div className="space-y-4">
    <div className="flex flex-wrap items-end justify-between gap-3">
     <div>
-     <h1 className="text-xl font-bold text-[#eef2f7] flex items-center gap-2">
-      <Users className="w-5 h-5 text-[#4dc4f4]" />
-      Operators
-     </h1>
-     <p className="text-sm text-[#8b939e] mt-0.5">
-      Click an operator — toggle stations inside for per-machine stats
-     </p>
+     <p className="bb-page-sub">Who is working where right now?</p>
     </div>
     <div className="relative">
      <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-[#8b939e] pointer-events-none" />
@@ -587,40 +235,610 @@ export function OperatorAnalyticsPage({ tick = 0 }) {
       type="text"
       value={search}
       onChange={e => setSearch(e.target.value)}
-      placeholder="Search…"
-      className="pl-8 pr-3 py-1.5 text-sm rounded-md w-48 border border-[#27272f] bg-[#18181d]
- bg-[#08080a] text-[#eef2f7]"
+      placeholder="Search operators…"
+      className="bb-input pl-8 w-52"
      />
     </div>
    </div>
 
    {error && <p className="text-sm text-[#f87171]">{error}</p>}
 
-   {data?.summary?.top_operator && (
-    <div className="flex items-center gap-2 text-sm text-[#8b939e]">
-     <Award className="w-4 h-4 text-[#fbbf24]" />
-     Top: <span className="font-semibold text-[#eef2f7]">
-      {data.summary.top_operator.operator_name}
-     </span>
-     <span className="tabular-nums">({data.summary.top_operator.pieces} pieces)</span>
+   <p className="text-sm text-[#8b939e]">
+    <span className="tabular-nums font-semibold text-[#eef2f7]">{activeCount}</span> active now
+    <span className="mx-2 text-[#2a2a32]">|</span>
+    <span className="tabular-nums">{rows.length} on roster</span>
+   </p>
+
+   {filtered.length === 0 ? (
+    <p className="bb-empty">No operators match</p>
+   ) : (
+    <div className="bb-table-wrap">
+     <table className="bb-table">
+      <thead className="bb-table-head">
+       <tr>
+        <th>Operator</th>
+        <th className="text-right">Badge</th>
+        <th>Current station</th>
+        <th className="text-right">Parts today</th>
+        <th className="text-right">Stations today</th>
+        <th>Status</th>
+       </tr>
+      </thead>
+      <tbody>
+       {filtered.map(op => (
+        <tr
+         key={op.operator_id}
+         className={`bb-table-row cursor-pointer ${selectedId === op.operator_id ? 'bb-table-row-active' : ''}`}
+         onClick={() => setSelectedId(op.operator_id)}
+        >
+         <td className="font-medium text-[#eef2f7]">{op.operator_name}</td>
+         <td className="text-right font-mono text-xs tabular-nums text-[#8b939e]">
+          {op.rtls_badge_id ?? '—'}
+         </td>
+         <td className="text-[#8b939e]">{op.current_station ?? '—'}</td>
+         <td className="text-right tabular-nums font-semibold">{op.parts_today}</td>
+         <td className="text-right tabular-nums text-[#8b939e]">{op.stations_today}</td>
+         <td>
+          {op.status === 'Active' ? (
+           <span className="inline-flex items-center gap-1.5">
+            <span className="bb-status-dot bg-[#34d399]" />
+            <span className="text-[#34d399] text-xs font-medium">Active</span>
+           </span>
+          ) : (
+           <span className="inline-flex items-center gap-1.5">
+            <span className="bb-status-dot bg-[#8b939e]" />
+            <span className="text-[#8b939e] text-xs">Idle</span>
+           </span>
+          )}
+         </td>
+        </tr>
+       ))}
+      </tbody>
+     </table>
     </div>
    )}
 
-   {filteredCards.length === 0 ? (
-    <p className="text-center text-sm text-[#8b939e] py-16">No operators match</p>
-   ) : (
-    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-5 gap-4">
-     {filteredCards.map(op => (
-      <OperatorCard
-       key={op.operator_id}
-       op={op}
-       inZone={inZoneMap.get(op.operator_id)}
-       rank={rankMap.get(op.operator_id) ?? 0}
-       onClick={() => setSelectedId(op.operator_id)}
-      />
+   <p className="text-[11px] text-[#8b939e]">
+    Parts today = unique parts with a completed RFID session attributed to the operator today.
+   </p>
+
+   {selectedId != null && (
+    <LiveDrawer
+     operatorId={selectedId}
+     rosterRow={rows.find(c => c.operator_id === selectedId)}
+     inZoneProp={inZoneMap.get(selectedId)}
+     onClose={() => setSelectedId(null)}
+     tick={tick}
+    />
+   )}
+  </div>
+ )
+}
+
+/* ── Trends tab ─────────────────────────────────────────────────────────────── */
+
+const SUMMARY_ROWS = [
+ { key: 'parts_per_active_hour', label: 'Parts completed/hour' },
+ { key: 'median_operator_dwell_seconds', label: 'Median operator dwell' },
+ { key: 'parts_over_target_pct', label: 'Parts over target' },
+ { key: 'active_station_seconds', label: 'Active station time' },
+ { key: 'rfid_associated_parts', label: 'RFID-associated parts' },
+]
+
+function TrendsTab({ tick }) {
+ const [operators, setOperators] = useState([])
+ const [operatorId, setOperatorId] = useState('')
+ const [range, setRange] = useState('14')
+ const [station, setStation] = useState('')
+ const [workOrder, setWorkOrder] = useState('')
+ const [partType, setPartType] = useState('')
+ const [metric, setMetric] = useState('parts_per_active_hour')
+ const [data, setData] = useState(null)
+ const [error, setError] = useState(null)
+ const [loading, setLoading] = useState(false)
+ const [dayDrill, setDayDrill] = useState(null)
+ const [daySessions, setDaySessions] = useState([])
+
+ useEffect(() => {
+  apiFetch('/api/operators')
+   .then(list => {
+    const active = (list || []).filter(o => o.is_active !== false)
+    setOperators(active)
+    if (!operatorId && active.length) {
+     setOperatorId(String(active[0].operator_id))
+    }
+   })
+   .catch(() => setOperators([]))
+ }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+ const loadTrends = useCallback(() => {
+  if (!operatorId) return
+  setLoading(true)
+  const params = new URLSearchParams({
+   operator_id: operatorId,
+   days: String(range),
+   metric,
+  })
+  if (station) params.set('station', station)
+  if (workOrder) params.set('work_order', workOrder)
+  if (partType) params.set('part_type', partType)
+  apiFetch(`/api/analytics/operators/trends?${params}`)
+   .then(d => {
+    setData(d)
+    setError(null)
+   })
+   .catch(e => setError(e?.message || 'Failed to load trends'))
+   .finally(() => setLoading(false))
+ }, [operatorId, range, station, workOrder, partType, metric])
+
+ useEffect(() => {
+  loadTrends()
+ }, [loadTrends, tick])
+
+ const openDay = async (row) => {
+  setDayDrill(row)
+  setDaySessions([])
+  try {
+   const params = new URLSearchParams({
+    operator_id: operatorId,
+    date: row.date,
+   })
+   if (row.station) params.set('station', row.station)
+   const res = await apiFetch(`/api/analytics/operators/trends/sessions?${params}`)
+   setDaySessions(res.sessions ?? [])
+  } catch {
+   setDaySessions([])
+  }
+ }
+
+ const op = data?.operator
+ const summary = data?.summary ?? {}
+ const opts = data?.filter_options ?? {}
+ const peerCount = data?.filters?.peer_count ?? 0
+ const stationLabel = data?.filters?.station || station || 'selected station'
+ const rangeLabel = RANGE_PRESETS.find(p => p.id === range)?.label || 'selected period'
+ const dateFrom = data?.filters?.date_from
+ const dateTo = data?.filters?.date_to
+
+ const weekdayPrimary = (data?.by_weekday ?? []).map(d => ({
+  label: d.label,
+  short: d.label,
+  value: d.operator_value ?? 0,
+  samples: d.samples ?? 0,
+ }))
+ const weekdayPeer = (data?.by_weekday ?? []).map(d => ({
+  label: d.label,
+  value: d.peer_value,
+ }))
+ const hasWeekdayData = (data?.by_weekday ?? []).some(
+  d => d.operator_value != null || d.peer_value != null,
+ )
+
+ const peerBars = (data?.peers ?? []).map(p => ({
+  label: p.operator_name,
+  value: p.value ?? 0,
+  display: formatMetricValue(metric, p.value),
+  highlight: p.is_selected,
+  is_selected: p.is_selected,
+  is_median: p.is_median,
+ }))
+
+ const metricLabel = (opts.metrics ?? []).find(m => m.id === metric)?.label
+  || 'Parts per active hour'
+
+ return (
+  <div className="space-y-5">
+   <div className="flex flex-wrap items-end justify-between gap-3">
+    <p className="bb-page-sub">
+     Average performance by weekday, compared with others at the same station.
+    </p>
+    <div className="flex gap-0.5 p-0.5 rounded-[6px] bg-[#08080a] border border-[#2a2a32]">
+     {RANGE_PRESETS.map(p => (
+      <button
+       key={p.id}
+       type="button"
+       onClick={() => setRange(p.id)}
+       className={`px-2.5 py-1.5 rounded-[4px] text-xs font-medium transition-colors whitespace-nowrap
+        ${range === p.id
+         ? 'bg-[#4dc4f4] text-[#08080a]'
+         : 'text-[#8b939e] hover:text-[#eef2f7]'}`}
+      >
+       {p.label}
+      </button>
      ))}
     </div>
+   </div>
+
+   {/* Filters */}
+   <div className="bb-panel px-3 py-3">
+    <div className="flex flex-wrap items-end gap-3">
+     <label className="space-y-1 text-xs text-[#8b939e]">
+      <span className="uppercase tracking-wider">Operator</span>
+      <select
+       className="bb-input block min-w-[12rem]"
+       value={operatorId}
+       onChange={e => { setOperatorId(e.target.value); setStation('') }}
+      >
+       <option value="">Select…</option>
+       {operators.map(o => (
+        <option key={o.operator_id} value={o.operator_id}>{o.operator_name}</option>
+       ))}
+      </select>
+     </label>
+
+     <label className="space-y-1 text-xs text-[#8b939e]">
+      <span className="uppercase tracking-wider">Station</span>
+      <select
+       className="bb-input block min-w-[10rem]"
+       value={station || data?.filters?.station || ''}
+       onChange={e => setStation(e.target.value)}
+      >
+       {(opts.stations?.length
+        ? opts.stations
+        : (data?.filters?.station ? [data.filters.station] : [])
+       ).map(s => (
+        <option key={s} value={s}>
+         {s}{s === data?.operator?.primary_station ? ' (primary)' : ''}
+        </option>
+       ))}
+      </select>
+     </label>
+
+     <label className="space-y-1 text-xs text-[#8b939e]">
+      <span className="uppercase tracking-wider">Metric</span>
+      <select
+       className="bb-input block min-w-[11rem]"
+       value={metric}
+       onChange={e => setMetric(e.target.value)}
+      >
+       {(opts.metrics ?? [
+        { id: 'parts_per_active_hour', label: 'Parts per active hour' },
+       ]).map(m => (
+        <option key={m.id} value={m.id}>{m.label}</option>
+       ))}
+      </select>
+     </label>
+
+     <label className="space-y-1 text-xs text-[#8b939e]">
+      <span className="uppercase tracking-wider">Work order</span>
+      <select
+       className="bb-input block min-w-[9rem]"
+       value={workOrder}
+       onChange={e => setWorkOrder(e.target.value)}
+      >
+       <option value="">All</option>
+       {(opts.work_orders ?? []).map(w => (
+        <option key={w} value={w}>{w}</option>
+       ))}
+      </select>
+     </label>
+
+     <label className="space-y-1 text-xs text-[#8b939e]">
+      <span className="uppercase tracking-wider">Part type</span>
+      <select
+       className="bb-input block min-w-[8rem]"
+       value={partType}
+       onChange={e => setPartType(e.target.value)}
+      >
+       <option value="">All</option>
+       {(opts.part_types ?? []).map(t => (
+        <option key={t} value={t}>{t}</option>
+       ))}
+      </select>
+     </label>
+    </div>
+   </div>
+
+   {error && <p className="text-sm text-[#f87171]">{error}</p>}
+   {loading && !data && (
+    <div className="bb-table-wrap animate-pulse"><div className="h-32 bg-[#16161a]" /></div>
    )}
+
+   {op && (
+    <>
+     <div>
+      <h2 className="text-lg font-semibold text-[#eef2f7]">{op.operator_name}</h2>
+      <p className="text-sm text-[#8b939e]">
+       {op.rtls_badge_id != null ? `Badge ${op.rtls_badge_id}` : 'No badge'}
+       {' · '}{stationLabel}
+       {' · '}{op.active_days ?? 0} active days
+       {dateFrom && dateTo ? ` · ${dateFrom} → ${dateTo}` : ''}
+       {' · '}{rangeLabel}
+      </p>
+      {peerCount < 1 && (
+       <p className="text-[11px] text-[#fbbf24] mt-1">
+        No other operators at {stationLabel} in this period — peer comparison unavailable.
+       </p>
+      )}
+     </div>
+
+     {/* Mon–Sun averages */}
+     <section className="bb-section">
+      <h3 className="bb-section-title">
+       Average by day of week — vs {stationLabel}
+      </h3>
+      <div className="bb-panel px-4 py-4">
+       {!hasWeekdayData ? (
+        <p className="bb-empty">No weekday averages in this range</p>
+       ) : (
+        <VerticalBars
+         data={weekdayPrimary}
+         compareData={weekdayPeer}
+         formatValue={v => formatMetricValue(metric, v)}
+         primaryLabel={op.operator_name}
+         compareLabel={`${stationLabel} average`}
+        />
+       )}
+      </div>
+      <div className="bb-table-wrap mt-3">
+       <table className="bb-table">
+        <thead className="bb-table-head">
+         <tr>
+          <th>Day</th>
+          <th className="text-right">Operator avg</th>
+          <th className="text-right">Station avg</th>
+          <th className="text-right">Difference</th>
+          <th className="text-right">Samples</th>
+         </tr>
+        </thead>
+        <tbody>
+         {(data?.by_weekday ?? []).map(row => {
+          const opV = row.operator_value
+          const peerV = row.peer_value
+          const delta = opV != null && peerV != null ? opV - peerV : null
+          return (
+           <tr key={row.weekday} className="bb-table-row">
+            <td className="font-medium text-[#eef2f7]">{row.label}</td>
+            <td className="text-right font-mono tabular-nums font-semibold">
+             {opV != null ? formatMetricValue(metric, opV) : '—'}
+            </td>
+            <td className="text-right font-mono tabular-nums text-[#8b939e]">
+             {peerV != null ? formatMetricValue(metric, peerV) : '—'}
+            </td>
+            <td className={`text-right font-mono tabular-nums ${
+             delta > 0 ? 'text-[#34d399]' : delta < 0 ? 'text-[#fbbf24]' : 'text-[#8b939e]'
+            }`}>
+             {delta == null
+              ? '—'
+              : `${delta > 0 ? '+' : ''}${formatMetricValue(metric, delta)}`}
+            </td>
+            <td className="text-right tabular-nums text-[#8b939e]">{row.samples ?? 0}</td>
+           </tr>
+          )
+         })}
+        </tbody>
+       </table>
+      </div>
+      <p className="text-[11px] text-[#8b939e]">
+       Each cell is the average of that weekday across the selected period
+       (e.g. all Mondays in {rangeLabel.toLowerCase()}). Station average is other operators
+       at {stationLabel} on those same weekdays. Metric: {metricLabel}.
+      </p>
+     </section>
+
+     {/* Summary vs peers */}
+     <section className="bb-section">
+      <h3 className="bb-section-title">Period summary vs {stationLabel}</h3>
+      <div className="bb-table-wrap">
+       <table className="bb-table">
+        <thead className="bb-table-head">
+         <tr>
+          <th>Metric</th>
+          <th className="text-right">Operator</th>
+          <th className="text-right">Peer average</th>
+          <th className="text-right">Difference</th>
+         </tr>
+        </thead>
+        <tbody>
+         {SUMMARY_ROWS.map(row => {
+          const m = summary[row.key] || {}
+          return (
+           <tr key={row.key} className="bb-table-row">
+            <td className="text-[#eef2f7]">{row.label}</td>
+            <td className="text-right font-mono tabular-nums font-semibold">{m.display ?? '—'}</td>
+            <td className="text-right font-mono tabular-nums text-[#8b939e]">{m.peer_display ?? '—'}</td>
+            <td className={`text-right font-mono tabular-nums ${
+             m.delta > 0 ? 'text-[#34d399]' : m.delta < 0 ? 'text-[#fbbf24]' : 'text-[#8b939e]'
+            }`}>
+             {m.delta_display ?? '—'}
+            </td>
+           </tr>
+          )
+         })}
+        </tbody>
+       </table>
+      </div>
+     </section>
+
+     {/* Operator ranking at station */}
+     <section className="bb-section">
+      <h3 className="bb-section-title">
+       How does {op.operator_name} compare at {stationLabel}?
+      </h3>
+      <div className="bb-panel px-4 py-4 max-w-xl">
+       <HorizontalBars
+        data={peerBars}
+        formatValue={v => formatMetricValue(metric, v)}
+        emptyText="No peer data at this station"
+       />
+      </div>
+      <p className="text-[11px] text-[#8b939e]">
+       Ranking by {metricLabel} for all operators with activity at {stationLabel} in this period.
+      </p>
+     </section>
+
+     {/* Station breakdown */}
+     <section className="bb-section">
+      <h3 className="bb-section-title">Station breakdown</h3>
+      {(data?.stations ?? []).length === 0 ? (
+       <p className="bb-empty">No station activity in this range</p>
+      ) : (
+       <div className="bb-table-wrap">
+        <table className="bb-table">
+         <thead className="bb-table-head">
+          <tr>
+           <th>Station</th>
+           <th className="text-right">Sessions</th>
+           <th className="text-right">Parts</th>
+           <th className="text-right">Parts/hour</th>
+           <th className="text-right">Median dwell</th>
+           <th className="text-right">Within target</th>
+          </tr>
+         </thead>
+         <tbody>
+          {data.stations.map(s => (
+           <tr key={s.station} className="bb-table-row">
+            <td className="font-medium text-[#eef2f7]">{s.station}</td>
+            <td className="text-right tabular-nums">{s.sessions}</td>
+            <td className="text-right tabular-nums">{s.parts}</td>
+            <td className="text-right font-mono tabular-nums">
+             {s.parts_per_active_hour != null ? s.parts_per_active_hour.toFixed(1) : '—'}
+            </td>
+            <td className="text-right font-mono text-xs text-[#8b939e]">
+             {s.median_dwell_display ?? '—'}
+            </td>
+            <td className="text-right tabular-nums">
+             {s.within_target_pct != null ? `${s.within_target_pct}%` : '—'}
+            </td>
+           </tr>
+          ))}
+         </tbody>
+        </table>
+       </div>
+      )}
+     </section>
+
+     {/* Daily history */}
+     <section className="bb-section">
+      <h3 className="bb-section-title">Daily history</h3>
+      {(data?.days ?? []).length === 0 ? (
+       <p className="bb-empty">No daily rows in this range</p>
+      ) : (
+       <div className="bb-table-wrap">
+        <table className="bb-table">
+         <thead className="bb-table-head">
+          <tr>
+           <th>Date</th>
+           <th>Day</th>
+           <th>Station</th>
+           <th className="text-right">Active time</th>
+           <th className="text-right">Parts</th>
+           <th className="text-right">Parts/hour</th>
+           <th className="text-right">Median dwell</th>
+           <th className="text-right">Over target</th>
+          </tr>
+         </thead>
+         <tbody>
+          {data.days.map((row, i) => (
+           <tr
+            key={`${row.date}-${row.station}-${i}`}
+            className="bb-table-row cursor-pointer"
+            onClick={() => openDay(row)}
+           >
+            <td className="whitespace-nowrap">{row.label || row.date}</td>
+            <td className="text-[#8b939e]">{row.weekday ?? '—'}</td>
+            <td className="text-[#8b939e]">{row.station}</td>
+            <td className="text-right font-mono text-xs">{row.active_display ?? '—'}</td>
+            <td className="text-right tabular-nums font-semibold">{row.parts}</td>
+            <td className="text-right font-mono tabular-nums">
+             {row.parts_per_active_hour != null ? row.parts_per_active_hour.toFixed(1) : '—'}
+            </td>
+            <td className="text-right font-mono text-xs text-[#8b939e]">
+             {row.median_dwell_display ?? '—'}
+            </td>
+            <td className="text-right tabular-nums text-[#8b939e]">{row.over_target ?? 0}</td>
+           </tr>
+          ))}
+         </tbody>
+        </table>
+       </div>
+      )}
+      <p className="text-[11px] text-[#8b939e]">Click a day to see the sessions used in the calculation.</p>
+     </section>
+    </>
+   )}
+
+   {!operatorId && (
+    <p className="bb-empty">Select an operator to view trends</p>
+   )}
+
+   {dayDrill && (
+    <div className="bb-drawer-backdrop" onClick={() => setDayDrill(null)}>
+     <aside className="bb-drawer" onClick={e => e.stopPropagation()}>
+      <div className="bb-panel-header border-b border-[#2a2a32]">
+       <div>
+        <h2 className="bb-title">{dayDrill.label || dayDrill.date}</h2>
+        <p className="bb-subtitle">{dayDrill.station} · session detail</p>
+       </div>
+       <button type="button" onClick={() => setDayDrill(null)} className="bb-btn-ghost p-1.5">
+        <X className="w-4 h-4" />
+       </button>
+      </div>
+      <div className="p-4 overflow-y-auto flex-1">
+       {daySessions.length === 0 ? (
+        <p className="text-sm text-[#8b939e]">No sessions for this day</p>
+       ) : (
+        <div className="bb-table-wrap">
+         <table className="bb-table">
+          <thead className="bb-table-head">
+           <tr>
+            <th>When</th>
+            <th>Part</th>
+            <th>WO</th>
+            <th className="text-right">Dwell</th>
+            <th>Status</th>
+           </tr>
+          </thead>
+          <tbody>
+           {daySessions.map((s, i) => (
+            <tr key={i} className="bb-table-row">
+             <td className="text-xs text-[#8b939e] whitespace-nowrap">
+              {formatWhen(s.exit_time || s.assigned_at)}
+             </td>
+             <td className="font-mono text-[11px] truncate max-w-[8rem]">{s.epc ?? '—'}</td>
+             <td className="font-mono text-[11px] text-[#8b939e]">{s.ibus_number ?? '—'}</td>
+             <td className="text-right font-mono text-xs">{s.dwell_display ?? '—'}</td>
+             <td className="text-xs text-[#8b939e]">{s.session_status}</td>
+            </tr>
+           ))}
+          </tbody>
+         </table>
+        </div>
+       )}
+      </div>
+     </aside>
+    </div>
+   )}
+  </div>
+ )
+}
+
+/* ── Page shell ─────────────────────────────────────────────────────────────── */
+
+export function OperatorAnalyticsPage({ tick = 0 }) {
+ const [tab, setTab] = useState('live')
+
+ return (
+  <div className="space-y-4">
+   <div className="flex flex-wrap items-end justify-between gap-3">
+    <div>
+     <h1 className="bb-page-title">Operators</h1>
+    </div>
+    <div className="flex gap-1">
+     {TABS.map(t => (
+      <button
+       key={t.id}
+       type="button"
+       onClick={() => setTab(t.id)}
+       className={`bb-btn-outline ${tab === t.id ? 'bb-btn-outline-active' : ''}`}
+      >
+       {t.label}
+      </button>
+     ))}
+    </div>
+   </div>
+
+   {tab === 'live' ? <LiveTab tick={tick} /> : <TrendsTab tick={tick} />}
   </div>
  )
 }
