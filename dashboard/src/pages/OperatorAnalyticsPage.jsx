@@ -8,14 +8,6 @@ const TABS = [
  { id: 'trends', label: 'Trends' },
 ]
 
-const RANGE_PRESETS = [
- { id: 'all', label: 'All time' },
- { id: '7', label: '1 week' },
- { id: '14', label: '2 weeks' },
- { id: '30', label: '30 days' },
- { id: '90', label: '90 days' },
-]
-
 function formatWhen(iso) {
  if (!iso) return '—'
  try {
@@ -27,20 +19,15 @@ function formatWhen(iso) {
  }
 }
 
-function formatMetricValue(metric, value) {
- if (value == null || Number.isNaN(value)) return '—'
- if (metric === 'active_time' || metric === 'median_operator_dwell' || metric === 'median_part_dwell') {
-  const sec = Math.round(value)
-  if (sec < 60) return `${sec} sec`
-  const m = Math.floor(sec / 60)
-  const s = sec % 60
-  if (m < 60) return `${m}m ${s}s`
-  const h = Math.floor(m / 60)
-  return `${h}h ${m % 60}m`
- }
- if (metric === 'pct_within_target' || metric === 'exception_rate') return `${Number(value).toFixed(1)}%`
- if (metric === 'parts') return String(Math.round(value))
- return Number(value).toFixed(1)
+function formatDwell(sec) {
+ if (sec == null || Number.isNaN(sec)) return '—'
+ const s = Math.round(sec)
+ if (s < 60) return `${s}s`
+ const m = Math.floor(s / 60)
+ const r = s % 60
+ if (m < 60) return r ? `${m}m ${r}s` : `${m}m`
+ const h = Math.floor(m / 60)
+ return `${h}h ${m % 60}m`
 }
 
 async function loadLiveData() {
@@ -317,27 +304,155 @@ function LiveTab({ tick }) {
 
 /* ── Trends tab ─────────────────────────────────────────────────────────────── */
 
-const SUMMARY_ROWS = [
- { key: 'parts_per_active_hour', label: 'Parts completed/hour' },
- { key: 'median_operator_dwell_seconds', label: 'Median operator dwell' },
- { key: 'parts_over_target_pct', label: 'Parts over target' },
- { key: 'active_station_seconds', label: 'Active station time' },
- { key: 'rfid_associated_parts', label: 'RFID-associated parts' },
+const RANGE_PRESETS = [
+ { id: '7', label: 'Last week' },
+ { id: '14', label: 'Last 2 weeks' },
+ { id: '30', label: 'Last 30 days' },
+ { id: '90', label: 'Last 90 days' },
+ { id: 'all', label: 'All time' },
 ]
+
+const COMPARE_OPTIONS = [
+ { id: 'expected_target', label: 'Expected target' },
+ { id: 'all_average', label: 'All operators average' },
+ { id: 'operator', label: 'Another operator' },
+]
+
+function dwellDeltaClass(delta) {
+ if (delta == null || delta === 0) return 'text-[#8b939e]'
+ return delta < 0 ? 'text-[#34d399]' : 'text-[#fbbf24]'
+}
+
+function formatDwellDelta(delta) {
+ if (delta == null) return '—'
+ if (delta === 0) return '0'
+ const sign = delta > 0 ? '+' : '-'
+ return `${sign}${formatDwell(Math.abs(delta))}`
+}
+
+function partsDeltaClass(delta) {
+ if (delta == null || delta === 0) return 'text-[#8b939e]'
+ return delta > 0 ? 'text-[#34d399]' : 'text-[#fbbf24]'
+}
+
+function WeekdayCompareSection({
+ title,
+ subtitle,
+ footnote,
+ operatorName,
+ compareLabel,
+ rows,
+ operatorValue,
+ peerValue,
+ formatValue,
+ formatDelta,
+ deltaClass,
+ hasCompare = true,
+ machineFilter,
+}) {
+ const chartData = rows.map(d => ({
+  label: d.label,
+  short: d.label,
+  value: operatorValue(d) ?? 0,
+ }))
+ const compareData = hasCompare
+  ? rows.map(d => ({ label: d.label, value: peerValue(d) }))
+  : null
+ const hasData = rows.some(d => operatorValue(d) != null || (hasCompare && peerValue(d) != null))
+
+ return (
+  <section className="bb-section">
+   <div className="flex flex-wrap items-end justify-between gap-3">
+    <div>
+     <h3 className="bb-section-title">{title}</h3>
+     <p className="text-[11px] text-[#8b939e] mt-0.5">{subtitle}</p>
+    </div>
+    {machineFilter}
+   </div>
+   <div className="bb-panel px-4 py-4">
+    {!hasData ? (
+     <p className="bb-empty">No data in this period</p>
+    ) : (
+     <VerticalBars
+      data={chartData}
+      compareData={compareData}
+      formatValue={formatValue}
+      primaryLabel={operatorName}
+      compareLabel={compareLabel}
+     />
+    )}
+   </div>
+   {hasData && (
+    <div className="bb-table-wrap mt-3">
+     <table className="bb-table">
+      <thead className="bb-table-head">
+       <tr>
+        <th>Day</th>
+        <th className="text-right">{operatorName}</th>
+        {hasCompare && <th className="text-right">{compareLabel}</th>}
+        {hasCompare && <th className="text-right">Difference</th>}
+        <th className="text-right">Days sampled</th>
+       </tr>
+      </thead>
+      <tbody>
+       {rows.map(row => {
+        const opV = operatorValue(row)
+        const cmpV = hasCompare ? peerValue(row) : null
+        const delta = opV != null && cmpV != null ? opV - cmpV : null
+        return (
+         <tr key={row.weekday} className="bb-table-row">
+          <td className="font-medium text-[#eef2f7]">{row.label}</td>
+          <td className="text-right font-mono tabular-nums font-semibold">
+           {opV != null ? formatValue(opV) : '—'}
+          </td>
+          {hasCompare && (
+           <td className="text-right font-mono tabular-nums text-[#8b939e]">
+            {cmpV != null ? formatValue(cmpV) : '—'}
+           </td>
+          )}
+          {hasCompare && (
+           <td className={`text-right font-mono tabular-nums font-semibold ${deltaClass(delta)}`}>
+            {delta == null ? '—' : formatDelta(delta)}
+           </td>
+          )}
+          <td className="text-right tabular-nums text-[#8b939e]">{row.samples ?? 0}</td>
+         </tr>
+        )
+       })}
+      </tbody>
+     </table>
+    </div>
+   )}
+   {footnote && <p className="text-[11px] text-[#8b939e]">{footnote}</p>}
+  </section>
+ )
+}
+
+function SelectField({ label, value, onChange, children, className = '' }) {
+ return (
+  <label className={`space-y-1 text-xs text-[#8b939e] ${className}`}>
+   <span className="uppercase tracking-wider font-semibold">{label}</span>
+   <select className="bb-input block w-full min-w-[10rem]" value={value} onChange={onChange}>
+    {children}
+   </select>
+  </label>
+ )
+}
 
 function TrendsTab({ tick }) {
  const [operators, setOperators] = useState([])
  const [operatorId, setOperatorId] = useState('')
- const [range, setRange] = useState('14')
- const [station, setStation] = useState('')
- const [workOrder, setWorkOrder] = useState('')
+ const [compareMode, setCompareMode] = useState('expected_target')
+ const [compareOperatorId, setCompareOperatorId] = useState('')
+ const [range, setRange] = useState('30')
+ const [partsMachine, setPartsMachine] = useState('all')
+ const [dwellMachine, setDwellMachine] = useState('all')
  const [partType, setPartType] = useState('')
- const [metric, setMetric] = useState('parts_per_active_hour')
+ const [series, setSeries] = useState('')
+ const [drawing, setDrawing] = useState('')
  const [data, setData] = useState(null)
  const [error, setError] = useState(null)
  const [loading, setLoading] = useState(false)
- const [dayDrill, setDayDrill] = useState(null)
- const [daySessions, setDaySessions] = useState([])
 
  useEffect(() => {
   apiFetch('/api/operators')
@@ -351,17 +466,27 @@ function TrendsTab({ tick }) {
    .catch(() => setOperators([]))
  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
+ useEffect(() => {
+  if (compareMode !== 'operator' || compareOperatorId) return
+  const first = operators.find(o => String(o.operator_id) !== String(operatorId))
+  if (first) setCompareOperatorId(String(first.operator_id))
+ }, [compareMode, compareOperatorId, operators, operatorId])
+
  const loadTrends = useCallback(() => {
   if (!operatorId) return
   setLoading(true)
   const params = new URLSearchParams({
    operator_id: operatorId,
    days: String(range),
-   metric,
+   metric: 'avg_part_dwell',
+   compare_mode: compareMode,
   })
-  if (station) params.set('station', station)
-  if (workOrder) params.set('work_order', workOrder)
   if (partType) params.set('part_type', partType)
+  if (series) params.set('series', series)
+  if (drawing) params.set('drawing', drawing)
+  if (compareMode === 'operator' && compareOperatorId) {
+   params.set('compare_operator_id', compareOperatorId)
+  }
   apiFetch(`/api/analytics/operators/trends?${params}`)
    .then(d => {
     setData(d)
@@ -369,163 +494,178 @@ function TrendsTab({ tick }) {
    })
    .catch(e => setError(e?.message || 'Failed to load trends'))
    .finally(() => setLoading(false))
- }, [operatorId, range, station, workOrder, partType, metric])
+ }, [operatorId, range, partType, series, drawing, compareMode, compareOperatorId])
 
  useEffect(() => {
   loadTrends()
  }, [loadTrends, tick])
 
- const openDay = async (row) => {
-  setDayDrill(row)
-  setDaySessions([])
-  try {
-   const params = new URLSearchParams({
-    operator_id: operatorId,
-    date: row.date,
-   })
-   if (row.station) params.set('station', row.station)
-   const res = await apiFetch(`/api/analytics/operators/trends/sessions?${params}`)
-   setDaySessions(res.sessions ?? [])
-  } catch {
-   setDaySessions([])
-  }
- }
-
  const op = data?.operator
- const summary = data?.summary ?? {}
- const opts = data?.filter_options ?? {}
- const peerCount = data?.filters?.peer_count ?? 0
- const stationLabel = data?.filters?.station || station || 'selected station'
- const rangeLabel = RANGE_PRESETS.find(p => p.id === range)?.label || 'selected period'
+ const compareLabel = data?.filters?.compare_label || 'Compare'
+ const rangeLabel = RANGE_PRESETS.find(p => p.id === range)?.label || 'Selected period'
  const dateFrom = data?.filters?.date_from
  const dateTo = data?.filters?.date_to
 
- const weekdayPrimary = (data?.by_weekday ?? []).map(d => ({
-  label: d.label,
-  short: d.label,
-  value: d.operator_value ?? 0,
-  samples: d.samples ?? 0,
- }))
- const weekdayPeer = (data?.by_weekday ?? []).map(d => ({
-  label: d.label,
-  value: d.peer_value,
- }))
- const hasWeekdayData = (data?.by_weekday ?? []).some(
-  d => d.operator_value != null || d.peer_value != null,
+ const stationOptions = useMemo(() => {
+  const fromApi = data?.filter_options?.stations ?? []
+  if (fromApi.length) return fromApi
+  return (data?.stations ?? []).map(s => s.station)
+ }, [data])
+
+ const partTypeOptions = data?.filter_options?.part_types ?? []
+ const seriesOptions = data?.filter_options?.series ?? []
+ const drawingOptions = data?.filter_options?.drawings ?? []
+
+ const partFilterLabel = useMemo(() => {
+  if (drawing) return drawing
+  if (series) return `Series ${series}`
+  if (partType) return partType
+  return 'All parts'
+ }, [drawing, series, partType])
+
+ const weekdayByStation = data?.by_weekday_by_station ?? {}
+
+ const partsWeekdayRows = useMemo(() => {
+  if (partsMachine === 'all') return data?.by_weekday ?? []
+  return weekdayByStation[partsMachine] ?? []
+ }, [data, partsMachine, weekdayByStation])
+
+ const dwellWeekdayRows = useMemo(() => {
+  if (dwellMachine === 'all') return data?.by_weekday ?? []
+  return weekdayByStation[dwellMachine] ?? []
+ }, [data, dwellMachine, weekdayByStation])
+
+ const partsCompareAvailable = compareMode !== 'expected_target'
+
+ const machineFilterSelect = (value, onChange, allLabel) => (
+  <SelectField label="Machine" value={value} onChange={onChange} className="min-w-[11rem]">
+   <option value="all">{allLabel}</option>
+   {stationOptions.map(s => (
+    <option key={s} value={s}>{s}</option>
+   ))}
+  </SelectField>
  )
 
- const peerBars = (data?.peers ?? []).map(p => ({
-  label: p.operator_name,
-  value: p.value ?? 0,
-  display: formatMetricValue(metric, p.value),
-  highlight: p.is_selected,
-  is_selected: p.is_selected,
-  is_median: p.is_median,
- }))
+ const partsMachineLabel = partsMachine === 'all'
+  ? 'all stations'
+  : partsMachine
+ const dwellMachineLabel = dwellMachine === 'all'
+  ? 'all stations'
+  : dwellMachine
 
- const metricLabel = (opts.metrics ?? []).find(m => m.id === metric)?.label
-  || 'Parts per active hour'
+ const stationPartsBars = useMemo(() => (
+  (data?.stations ?? []).map(s => ({
+   label: s.station,
+   value: s.parts ?? 0,
+   display: `${s.parts ?? 0} parts`,
+  }))
+ ), [data])
+ const stationDwellCompare = useMemo(() => (
+  (data?.stations ?? []).map(s => ({
+   label: s.station,
+   value: s.avg_part_dwell_seconds ?? 0,
+   target: s.compare_part_dwell_seconds
+    ?? s.target_part_dwell_seconds
+    ?? s.peer_avg_part_dwell_seconds,
+   display: `${s.avg_part_dwell_display ?? '—'} vs ${s.compare_part_dwell_display ?? s.target_part_dwell_display ?? '—'}`,
+  }))
+ ), [data])
+
+ const compareOperators = operators.filter(
+  o => String(o.operator_id) !== String(operatorId),
+ )
+
+ const formatParts = v => `${Math.round(v)}`
+
+ const formatPartsDelta = delta => {
+  if (delta == null) return '—'
+  if (delta === 0) return '0'
+  return `${delta > 0 ? '+' : ''}${Math.round(delta)}`
+ }
 
  return (
   <div className="space-y-5">
-   <div className="flex flex-wrap items-end justify-between gap-3">
-    <p className="bb-page-sub">
-     Average performance by weekday, compared with others at the same station.
-    </p>
-    <div className="flex gap-0.5 p-0.5 rounded-[6px] bg-[#08080a] border border-[#2a2a32]">
-     {RANGE_PRESETS.map(p => (
-      <button
-       key={p.id}
-       type="button"
-       onClick={() => setRange(p.id)}
-       className={`px-2.5 py-1.5 rounded-[4px] text-xs font-medium transition-colors whitespace-nowrap
-        ${range === p.id
-         ? 'bg-[#4dc4f4] text-[#08080a]'
-         : 'text-[#8b939e] hover:text-[#eef2f7]'}`}
-      >
-       {p.label}
-      </button>
-     ))}
-    </div>
-   </div>
+   {/* Controls */}
+   <div className="bb-panel px-4 py-4">
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
+     <SelectField
+      label="Operator"
+      value={operatorId}
+      onChange={e => setOperatorId(e.target.value)}
+     >
+      <option value="">Select…</option>
+      {operators.map(o => (
+       <option key={o.operator_id} value={o.operator_id}>{o.operator_name}</option>
+      ))}
+     </SelectField>
 
-   {/* Filters */}
-   <div className="bb-panel px-3 py-3">
-    <div className="flex flex-wrap items-end gap-3">
-     <label className="space-y-1 text-xs text-[#8b939e]">
-      <span className="uppercase tracking-wider">Operator</span>
-      <select
-       className="bb-input block min-w-[12rem]"
-       value={operatorId}
-       onChange={e => { setOperatorId(e.target.value); setStation('') }}
+     <SelectField
+      label="Compare to"
+      value={compareMode}
+      onChange={e => setCompareMode(e.target.value)}
+     >
+      {COMPARE_OPTIONS.map(o => (
+       <option key={o.id} value={o.id}>{o.label}</option>
+      ))}
+     </SelectField>
+
+     {compareMode === 'operator' && (
+      <SelectField
+       label="Compare operator"
+       value={compareOperatorId}
+       onChange={e => setCompareOperatorId(e.target.value)}
       >
        <option value="">Select…</option>
-       {operators.map(o => (
+       {compareOperators.map(o => (
         <option key={o.operator_id} value={o.operator_id}>{o.operator_name}</option>
        ))}
-      </select>
-     </label>
+      </SelectField>
+     )}
 
-     <label className="space-y-1 text-xs text-[#8b939e]">
-      <span className="uppercase tracking-wider">Station</span>
-      <select
-       className="bb-input block min-w-[10rem]"
-       value={station || data?.filters?.station || ''}
-       onChange={e => setStation(e.target.value)}
-      >
-       {(opts.stations?.length
-        ? opts.stations
-        : (data?.filters?.station ? [data.filters.station] : [])
-       ).map(s => (
-        <option key={s} value={s}>
-         {s}{s === data?.operator?.primary_station ? ' (primary)' : ''}
-        </option>
-       ))}
-      </select>
-     </label>
+     <SelectField
+      label="Time period"
+      value={range}
+      onChange={e => setRange(e.target.value)}
+     >
+      {RANGE_PRESETS.map(p => (
+       <option key={p.id} value={p.id}>{p.label}</option>
+      ))}
+     </SelectField>
+    </div>
 
-     <label className="space-y-1 text-xs text-[#8b939e]">
-      <span className="uppercase tracking-wider">Metric</span>
-      <select
-       className="bb-input block min-w-[11rem]"
-       value={metric}
-       onChange={e => setMetric(e.target.value)}
-      >
-       {(opts.metrics ?? [
-        { id: 'parts_per_active_hour', label: 'Parts per active hour' },
-       ]).map(m => (
-        <option key={m.id} value={m.id}>{m.label}</option>
-       ))}
-      </select>
-     </label>
+    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 mt-3 pt-3 border-t border-[#2a2a32]">
+     <SelectField
+      label="Part type"
+      value={partType}
+      onChange={e => setPartType(e.target.value)}
+     >
+      <option value="">All part types</option>
+      {partTypeOptions.map(t => (
+       <option key={t} value={t}>{t}</option>
+      ))}
+     </SelectField>
 
-     <label className="space-y-1 text-xs text-[#8b939e]">
-      <span className="uppercase tracking-wider">Work order</span>
-      <select
-       className="bb-input block min-w-[9rem]"
-       value={workOrder}
-       onChange={e => setWorkOrder(e.target.value)}
-      >
-       <option value="">All</option>
-       {(opts.work_orders ?? []).map(w => (
-        <option key={w} value={w}>{w}</option>
-       ))}
-      </select>
-     </label>
+     <SelectField
+      label="Series"
+      value={series}
+      onChange={e => { setSeries(e.target.value); setDrawing('') }}
+     >
+      <option value="">All series</option>
+      {seriesOptions.map(s => (
+       <option key={s} value={s}>{s}</option>
+      ))}
+     </SelectField>
 
-     <label className="space-y-1 text-xs text-[#8b939e]">
-      <span className="uppercase tracking-wider">Part type</span>
-      <select
-       className="bb-input block min-w-[8rem]"
-       value={partType}
-       onChange={e => setPartType(e.target.value)}
-      >
-       <option value="">All</option>
-       {(opts.part_types ?? []).map(t => (
-        <option key={t} value={t}>{t}</option>
-       ))}
-      </select>
-     </label>
+     <SelectField
+      label="Drawing"
+      value={drawing}
+      onChange={e => setDrawing(e.target.value)}
+     >
+      <option value="">All drawings</option>
+      {drawingOptions.map(d => (
+       <option key={d} value={d}>{d}</option>
+      ))}
+     </SelectField>
     </div>
    </div>
 
@@ -534,280 +674,217 @@ function TrendsTab({ tick }) {
     <div className="bb-table-wrap animate-pulse"><div className="h-32 bg-[#16161a]" /></div>
    )}
 
+   {!operatorId && (
+    <p className="bb-empty">Select an operator to view trends</p>
+   )}
+
    {op && (
     <>
      <div>
       <h2 className="text-lg font-semibold text-[#eef2f7]">{op.operator_name}</h2>
       <p className="text-sm text-[#8b939e]">
-       {op.rtls_badge_id != null ? `Badge ${op.rtls_badge_id}` : 'No badge'}
-       {' · '}{stationLabel}
-       {' · '}{op.active_days ?? 0} active days
-       {dateFrom && dateTo ? ` · ${dateFrom} → ${dateTo}` : ''}
+       {partFilterLabel}
        {' · '}{rangeLabel}
+       {dateFrom && dateTo ? ` · ${dateFrom} → ${dateTo}` : ''}
+       {' · '}{op.active_days ?? 0} active days
       </p>
-      {peerCount < 1 && (
-       <p className="text-[11px] text-[#fbbf24] mt-1">
-        No other operators at {stationLabel} in this period — peer comparison unavailable.
-       </p>
-      )}
      </div>
 
-     {/* Mon–Sun averages */}
-     <section className="bb-section">
-      <h3 className="bb-section-title">
-       Average by day of week — vs {stationLabel}
-      </h3>
-      <div className="bb-panel px-4 py-4">
-       {!hasWeekdayData ? (
-        <p className="bb-empty">No weekday averages in this range</p>
-       ) : (
-        <VerticalBars
-         data={weekdayPrimary}
-         compareData={weekdayPeer}
-         formatValue={v => formatMetricValue(metric, v)}
-         primaryLabel={op.operator_name}
-         compareLabel={`${stationLabel} average`}
-        />
-       )}
-      </div>
-      <div className="bb-table-wrap mt-3">
-       <table className="bb-table">
-        <thead className="bb-table-head">
-         <tr>
-          <th>Day</th>
-          <th className="text-right">Operator avg</th>
-          <th className="text-right">Station avg</th>
-          <th className="text-right">Difference</th>
-          <th className="text-right">Samples</th>
-         </tr>
-        </thead>
-        <tbody>
-         {(data?.by_weekday ?? []).map(row => {
-          const opV = row.operator_value
-          const peerV = row.peer_value
-          const delta = opV != null && peerV != null ? opV - peerV : null
-          return (
-           <tr key={row.weekday} className="bb-table-row">
-            <td className="font-medium text-[#eef2f7]">{row.label}</td>
-            <td className="text-right font-mono tabular-nums font-semibold">
-             {opV != null ? formatMetricValue(metric, opV) : '—'}
-            </td>
-            <td className="text-right font-mono tabular-nums text-[#8b939e]">
-             {peerV != null ? formatMetricValue(metric, peerV) : '—'}
-            </td>
-            <td className={`text-right font-mono tabular-nums ${
-             delta > 0 ? 'text-[#34d399]' : delta < 0 ? 'text-[#fbbf24]' : 'text-[#8b939e]'
-            }`}>
-             {delta == null
-              ? '—'
-              : `${delta > 0 ? '+' : ''}${formatMetricValue(metric, delta)}`}
-            </td>
-            <td className="text-right tabular-nums text-[#8b939e]">{row.samples ?? 0}</td>
-           </tr>
-          )
-         })}
-        </tbody>
-       </table>
-      </div>
-      <p className="text-[11px] text-[#8b939e]">
-       Each cell is the average of that weekday across the selected period
-       (e.g. all Mondays in {rangeLabel.toLowerCase()}). Station average is other operators
-       at {stationLabel} on those same weekdays. Metric: {metricLabel}.
-      </p>
-     </section>
+     <WeekdayCompareSection
+      title="Parts by day of week"
+      subtitle={
+       partsCompareAvailable
+        ? `Total parts on each weekday (${partsMachineLabel}) vs ${compareLabel.toLowerCase()}`
+        : `Total parts on each weekday (${partsMachineLabel})`
+      }
+      footnote={
+       partsCompareAvailable
+        ? 'Higher is better. Green difference means more parts than the comparison.'
+        : undefined
+      }
+      operatorName={op.operator_name}
+      compareLabel={compareLabel}
+      rows={partsWeekdayRows}
+      operatorValue={row => row.operator_parts}
+      peerValue={row => row.peer_parts}
+      formatValue={formatParts}
+      formatDelta={formatPartsDelta}
+      deltaClass={partsDeltaClass}
+      hasCompare={partsCompareAvailable}
+      machineFilter={machineFilterSelect(
+       partsMachine,
+       e => setPartsMachine(e.target.value),
+       'All total parts',
+      )}
+     />
 
-     {/* Summary vs peers */}
-     <section className="bb-section">
-      <h3 className="bb-section-title">Period summary vs {stationLabel}</h3>
-      <div className="bb-table-wrap">
-       <table className="bb-table">
-        <thead className="bb-table-head">
-         <tr>
-          <th>Metric</th>
-          <th className="text-right">Operator</th>
-          <th className="text-right">Peer average</th>
-          <th className="text-right">Difference</th>
-         </tr>
-        </thead>
-        <tbody>
-         {SUMMARY_ROWS.map(row => {
-          const m = summary[row.key] || {}
-          return (
-           <tr key={row.key} className="bb-table-row">
-            <td className="text-[#eef2f7]">{row.label}</td>
-            <td className="text-right font-mono tabular-nums font-semibold">{m.display ?? '—'}</td>
-            <td className="text-right font-mono tabular-nums text-[#8b939e]">{m.peer_display ?? '—'}</td>
-            <td className={`text-right font-mono tabular-nums ${
-             m.delta > 0 ? 'text-[#34d399]' : m.delta < 0 ? 'text-[#fbbf24]' : 'text-[#8b939e]'
-            }`}>
-             {m.delta_display ?? '—'}
-            </td>
-           </tr>
-          )
-         })}
-        </tbody>
-       </table>
-      </div>
-     </section>
+     <WeekdayCompareSection
+      title="Avg dwell by day of week"
+      subtitle={`Average time per part on each weekday (${dwellMachineLabel}) vs ${compareLabel.toLowerCase()}`}
+      footnote={`Lower dwell is better. Green difference means faster than ${compareLabel.toLowerCase()}.`}
+      operatorName={op.operator_name}
+      compareLabel={compareLabel}
+      rows={dwellWeekdayRows}
+      operatorValue={row => row.operator_value}
+      peerValue={row => row.peer_value}
+      formatValue={formatDwell}
+      formatDelta={formatDwellDelta}
+      deltaClass={dwellDeltaClass}
+      machineFilter={machineFilterSelect(
+       dwellMachine,
+       e => setDwellMachine(e.target.value),
+       'All stations',
+      )}
+     />
 
-     {/* Operator ranking at station */}
+     {/* Station breakdown — hidden when comparing to another operator */}
+     {compareMode !== 'operator' && (
      <section className="bb-section">
-      <h3 className="bb-section-title">
-       How does {op.operator_name} compare at {stationLabel}?
-      </h3>
-      <div className="bb-panel px-4 py-4 max-w-xl">
-       <HorizontalBars
-        data={peerBars}
-        formatValue={v => formatMetricValue(metric, v)}
-        emptyText="No peer data at this station"
-       />
+      <div>
+       <h3 className="bb-section-title">By station</h3>
+       <p className="text-[11px] text-[#8b939e] mt-0.5">
+        Parts completed and avg dwell vs {compareLabel.toLowerCase()}
+        {partFilterLabel !== 'All parts' ? ` · ${partFilterLabel}` : ''}
+       </p>
       </div>
-      <p className="text-[11px] text-[#8b939e]">
-       Ranking by {metricLabel} for all operators with activity at {stationLabel} in this period.
-      </p>
-     </section>
 
-     {/* Station breakdown */}
-     <section className="bb-section">
-      <h3 className="bb-section-title">Station breakdown</h3>
       {(data?.stations ?? []).length === 0 ? (
-       <p className="bb-empty">No station activity in this range</p>
+       <p className="bb-empty">No station activity for this filter</p>
       ) : (
-       <div className="bb-table-wrap">
-        <table className="bb-table">
-         <thead className="bb-table-head">
-          <tr>
-           <th>Station</th>
-           <th className="text-right">Sessions</th>
-           <th className="text-right">Parts</th>
-           <th className="text-right">Parts/hour</th>
-           <th className="text-right">Median dwell</th>
-           <th className="text-right">Within target</th>
-          </tr>
-         </thead>
-         <tbody>
-          {data.stations.map(s => (
-           <tr key={s.station} className="bb-table-row">
-            <td className="font-medium text-[#eef2f7]">{s.station}</td>
-            <td className="text-right tabular-nums">{s.sessions}</td>
-            <td className="text-right tabular-nums">{s.parts}</td>
-            <td className="text-right font-mono tabular-nums">
-             {s.parts_per_active_hour != null ? s.parts_per_active_hour.toFixed(1) : '—'}
-            </td>
-            <td className="text-right font-mono text-xs text-[#8b939e]">
-             {s.median_dwell_display ?? '—'}
-            </td>
-            <td className="text-right tabular-nums">
-             {s.within_target_pct != null ? `${s.within_target_pct}%` : '—'}
-            </td>
-           </tr>
-          ))}
-         </tbody>
-        </table>
-       </div>
-      )}
-     </section>
+       <>
+        <div className="grid gap-4 lg:grid-cols-2">
+         <div className="bb-panel px-4 py-4">
+          <p className="text-[10px] uppercase tracking-wider text-[#8b939e] mb-3 font-semibold">
+           Parts completed
+          </p>
+          <HorizontalBars
+           data={stationPartsBars}
+           formatValue={v => `${Math.round(v)} parts`}
+           emptyText="No station activity"
+          />
+         </div>
+         <div className="bb-panel px-4 py-4">
+          <p className="text-[10px] uppercase tracking-wider text-[#8b939e] mb-3 font-semibold">
+           Avg dwell vs {compareLabel.toLowerCase()}
+          </p>
+          <HorizontalBars
+           data={stationDwellCompare}
+           ratioMode
+           formatValue={formatDwell}
+           emptyText="No dwell data"
+          />
+         </div>
+        </div>
 
-     {/* Daily history */}
-     <section className="bb-section">
-      <h3 className="bb-section-title">Daily history</h3>
-      {(data?.days ?? []).length === 0 ? (
-       <p className="bb-empty">No daily rows in this range</p>
-      ) : (
-       <div className="bb-table-wrap">
-        <table className="bb-table">
-         <thead className="bb-table-head">
-          <tr>
-           <th>Date</th>
-           <th>Day</th>
-           <th>Station</th>
-           <th className="text-right">Active time</th>
-           <th className="text-right">Parts</th>
-           <th className="text-right">Parts/hour</th>
-           <th className="text-right">Median dwell</th>
-           <th className="text-right">Over target</th>
-          </tr>
-         </thead>
-         <tbody>
-          {data.days.map((row, i) => (
-           <tr
-            key={`${row.date}-${row.station}-${i}`}
-            className="bb-table-row cursor-pointer"
-            onClick={() => openDay(row)}
-           >
-            <td className="whitespace-nowrap">{row.label || row.date}</td>
-            <td className="text-[#8b939e]">{row.weekday ?? '—'}</td>
-            <td className="text-[#8b939e]">{row.station}</td>
-            <td className="text-right font-mono text-xs">{row.active_display ?? '—'}</td>
-            <td className="text-right tabular-nums font-semibold">{row.parts}</td>
-            <td className="text-right font-mono tabular-nums">
-             {row.parts_per_active_hour != null ? row.parts_per_active_hour.toFixed(1) : '—'}
-            </td>
-            <td className="text-right font-mono text-xs text-[#8b939e]">
-             {row.median_dwell_display ?? '—'}
-            </td>
-            <td className="text-right tabular-nums text-[#8b939e]">{row.over_target ?? 0}</td>
-           </tr>
-          ))}
-         </tbody>
-        </table>
-       </div>
-      )}
-      <p className="text-[11px] text-[#8b939e]">Click a day to see the sessions used in the calculation.</p>
-     </section>
-    </>
-   )}
-
-   {!operatorId && (
-    <p className="bb-empty">Select an operator to view trends</p>
-   )}
-
-   {dayDrill && (
-    <div className="bb-drawer-backdrop" onClick={() => setDayDrill(null)}>
-     <aside className="bb-drawer" onClick={e => e.stopPropagation()}>
-      <div className="bb-panel-header border-b border-[#2a2a32]">
-       <div>
-        <h2 className="bb-title">{dayDrill.label || dayDrill.date}</h2>
-        <p className="bb-subtitle">{dayDrill.station} · session detail</p>
-       </div>
-       <button type="button" onClick={() => setDayDrill(null)} className="bb-btn-ghost p-1.5">
-        <X className="w-4 h-4" />
-       </button>
-      </div>
-      <div className="p-4 overflow-y-auto flex-1">
-       {daySessions.length === 0 ? (
-        <p className="text-sm text-[#8b939e]">No sessions for this day</p>
-       ) : (
-        <div className="bb-table-wrap">
+        <div className="bb-table-wrap mt-3">
          <table className="bb-table">
           <thead className="bb-table-head">
            <tr>
-            <th>When</th>
-            <th>Part</th>
-            <th>WO</th>
-            <th className="text-right">Dwell</th>
-            <th>Status</th>
+            <th>Station</th>
+            <th className="text-right">Avg dwell</th>
+            <th className="text-right">{compareLabel}</th>
+            <th className="text-right">Difference</th>
+            <th className="text-right">Within target</th>
+            <th className="text-right">Pieces</th>
            </tr>
           </thead>
           <tbody>
-           {daySessions.map((s, i) => (
-            <tr key={i} className="bb-table-row">
-             <td className="text-xs text-[#8b939e] whitespace-nowrap">
-              {formatWhen(s.exit_time || s.assigned_at)}
-             </td>
-             <td className="font-mono text-[11px] truncate max-w-[8rem]">{s.epc ?? '—'}</td>
-             <td className="font-mono text-[11px] text-[#8b939e]">{s.ibus_number ?? '—'}</td>
-             <td className="text-right font-mono text-xs">{s.dwell_display ?? '—'}</td>
-             <td className="text-xs text-[#8b939e]">{s.session_status}</td>
-            </tr>
-           ))}
+           {(data?.stations ?? []).map(s => {
+            const cmp = s.compare_part_dwell_seconds
+             ?? s.target_part_dwell_seconds
+             ?? s.peer_avg_part_dwell_seconds
+            const delta = s.avg_part_dwell_seconds != null && cmp != null
+             ? s.avg_part_dwell_seconds - cmp
+             : null
+            return (
+             <tr key={s.station} className="bb-table-row">
+              <td className="font-medium text-[#eef2f7]">{s.station}</td>
+              <td className="text-right font-mono text-xs tabular-nums font-semibold">
+               {s.avg_part_dwell_display ?? '—'}
+              </td>
+              <td className="text-right font-mono text-xs tabular-nums text-[#8b939e]">
+               {s.compare_part_dwell_display
+                ?? s.target_part_dwell_display
+                ?? s.peer_avg_part_dwell_display ?? '—'}
+              </td>
+              <td className={`text-right font-mono text-xs tabular-nums font-semibold ${dwellDeltaClass(delta)}`}>
+               {delta == null ? '—' : formatDwellDelta(delta)}
+              </td>
+              <td className="text-right tabular-nums text-[#8b939e]">
+               {s.within_target_pct != null ? `${s.within_target_pct}%` : '—'}
+              </td>
+              <td className="text-right tabular-nums text-[#8b939e]">{s.parts ?? 0}</td>
+             </tr>
+            )
+           })}
           </tbody>
          </table>
         </div>
-       )}
+       </>
+      )}
+     </section>
+     )}
+
+     {/* Period summary — parts and dwell */}
+     <section className="bb-section">
+      <h3 className="bb-section-title mb-3">Period summary</h3>
+      <div className="grid gap-4 lg:grid-cols-2">
+       <div className="bb-panel px-4 py-4 space-y-3">
+        <p className="text-[10px] uppercase tracking-wider text-[#8b939e] font-semibold">Parts</p>
+        <div className="bb-kpi-strip">
+         <div>
+          <p className="bb-kpi-label">{op.operator_name}</p>
+          <p className="bb-kpi-value">
+           {data?.summary?.rfid_associated_parts?.display ?? '—'}
+          </p>
+         </div>
+         {partsCompareAvailable && (
+          <>
+           <div>
+            <p className="bb-kpi-label">{compareLabel}</p>
+            <p className="bb-kpi-value text-[#8b939e]">
+             {data?.summary?.rfid_associated_parts?.peer_display ?? '—'}
+            </p>
+           </div>
+           <div>
+            <p className="bb-kpi-label">Difference</p>
+            <p className={`bb-kpi-value ${partsDeltaClass(data?.summary?.rfid_associated_parts?.delta)}`}>
+             {data?.summary?.rfid_associated_parts?.delta_display ?? '—'}
+            </p>
+           </div>
+          </>
+         )}
+        </div>
+        <p className="text-[11px] text-[#8b939e]">{rangeLabel}</p>
+       </div>
+
+       <div className="bb-panel px-4 py-4 space-y-3">
+        <p className="text-[10px] uppercase tracking-wider text-[#8b939e] font-semibold">Avg dwell</p>
+        <div className="bb-kpi-strip">
+         <div>
+          <p className="bb-kpi-label">{op.operator_name}</p>
+          <p className="bb-kpi-value">
+           {data?.summary?.avg_part_dwell_seconds?.display ?? '—'}
+          </p>
+         </div>
+         <div>
+          <p className="bb-kpi-label">{compareLabel}</p>
+          <p className="bb-kpi-value text-[#8b939e]">
+           {data?.summary?.avg_part_dwell_seconds?.peer_display ?? '—'}
+          </p>
+         </div>
+         <div>
+          <p className="bb-kpi-label">Difference</p>
+          <p className={`bb-kpi-value ${dwellDeltaClass(data?.summary?.avg_part_dwell_seconds?.delta)}`}>
+           {data?.summary?.avg_part_dwell_seconds?.delta_display ?? '—'}
+          </p>
+         </div>
+        </div>
+        <p className="text-[11px] text-[#8b939e]">{rangeLabel}</p>
+       </div>
       </div>
-     </aside>
-    </div>
+     </section>
+    </>
    )}
   </div>
  )

@@ -57,13 +57,22 @@ function offsetForSibling(index, total) {
 }
 
 /**
- * Colored dots for open parts at last antenna / machine center.
- * Stacks by location + IBUS order so different work orders keep distinct colors.
+ * White dots for open parts at last antenna / machine center.
+ * Warn/critical states override with amber/red; IBUS accent stays on popover UI.
  */
-function delayColor(level, fallbackHex) {
- if (level === 'critical') return { hex: '#f87171', ping: 'bg-[#f87171]', badge: 'bg-[#f87171]' }
- if (level === 'warn') return { hex: '#fbbf24', ping: 'bg-[#fbbf24]', badge: 'bg-[#fbbf24]' }
- return { hex: fallbackHex, ping: 'bg-white', badge: 'bg-[#27272f]' }
+function delayColor(level) {
+ if (level === 'critical') {
+  return { hex: '#f87171', ping: 'bg-[#f87171]', badge: 'bg-[#f87171]', ring: 'ring-white/80' }
+ }
+ if (level === 'warn') {
+  return { hex: '#fbbf24', ping: 'bg-[#fbbf24]', badge: 'bg-[#fbbf24]', ring: 'ring-white/80' }
+ }
+ return {
+  hex: '#eef2f7',
+  ping: 'bg-white',
+  badge: 'bg-[#27272f]',
+  ring: 'ring-[#27272f]/40',
+ }
 }
 
 /**
@@ -174,7 +183,7 @@ export function PartChipLayer({
      if (level === 'warn' && worst !== 'critical') return 'warn'
      return worst
     }, 'ok')
-    const delay = delayColor(worstDelay, group.accent.hex)
+    const delay = delayColor(worstDelay)
     const accent = group.accent
 
     return (
@@ -203,11 +212,13 @@ export function PartChipLayer({
         e.stopPropagation()
         setOpenKey(prev => (prev === group.key ? null : group.key))
        }}
-       className="relative flex items-center justify-center w-2.5 h-2.5 rounded-full
- ring-2 ring-white/80 focus:outline-none focus-visible:ring-2"
+       className={`relative flex items-center justify-center w-2.5 h-2.5 rounded-full
+ ring-2 ${delay.ring} focus:outline-none focus-visible:ring-2`}
        style={{
         backgroundColor: delay.hex,
-        boxShadow: worstDelay !== 'ok' ? `0 0 8px ${delay.hex}aa` : `0 0 6px ${delay.hex}66`,
+        boxShadow: worstDelay === 'ok'
+         ? '0 0 0 1px rgba(39,39,47,0.35), 0 1px 4px rgba(0,0,0,0.35)'
+         : `0 0 8px ${delay.hex}aa`,
        }}
       >
        {worstDelay === 'ok' && (
@@ -215,13 +226,12 @@ export function PartChipLayer({
          className={`absolute inset-0 rounded-full animate-ping opacity-20 ${delay.ping} [animation-duration:2s]`}
         />
        )}
-       <span className="relative w-1.5 h-1.5 rounded-full bg-[#18181d]" />
        {count > 1 && (
         <span
          className={`absolute -top-1.5 -right-1.5 min-w-[14px] h-[14px] px-0.5
                flex items-center justify-center rounded-full
                text-[8px] font-bold leading-none text-white border border-white/80
-               ${worstDelay !== 'ok' ? delay.badge : accent.badge}`}
+               ${delay.badge}`}
         >
          {count}
         </span>

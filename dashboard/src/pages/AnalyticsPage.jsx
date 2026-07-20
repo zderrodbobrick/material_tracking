@@ -698,15 +698,29 @@ function DrawingDetailDrawer({ drawing, days, onClose }) {
      {detail && (
       <>
        <div className="bb-kpi-strip">
-        <Kpi label="Parts" value={summary?.parts_completed} />
+        <Kpi label="Parts" value={summary?.parts_completed} sub={summary?.confidence ? `${summary.confidence} confidence` : undefined} />
         <Kpi label="Total avg" value={summary?.total_avg_display} />
         <Kpi label="Median" value={summary?.total_median_display} />
         <Kpi label="P90" value={summary?.total_p90_display} />
        </div>
-       <div className="text-xs text-[#8b939e]">
-        Fastest {summary?.total_min_display || '—'} · Slowest {summary?.total_max_display || '—'}
-        {' · '}{summary?.parts_over_target ?? 0} sessions over target
-        ({summary?.parts_over_target_pct ?? 0}%)
+       <div className="text-xs text-[#8b939e] space-y-1">
+        <p>
+         Fastest {summary?.total_min_display || '—'} · Slowest {summary?.total_max_display || '—'}
+         {' · '}Range {summary?.total_range_display || '—'}
+         {' · '}{summary?.parts_over_target ?? 0} sessions over target
+         ({summary?.parts_over_target_pct ?? 0}%)
+        </p>
+        {summary?.slowest_station && summary?.station_contribution_pct?.[summary.slowest_station] != null && (
+         <p className="text-[#4dc4f4]">
+          {summary.slowest_station} accounts for ~{summary.station_contribution_pct[summary.slowest_station]}% of total tracked time
+         </p>
+        )}
+        {summary?.pct_change_vs_prev != null && (
+         <p>
+          vs prior period: {summary.prev_total_avg_display || '—'} → {summary.total_avg_display || '—'}
+          {' '}({summary.pct_change_vs_prev > 0 ? '+' : ''}{summary.pct_change_vs_prev}%)
+         </p>
+        )}
        </div>
 
        {(detail.trend || []).length > 0 && (
@@ -847,22 +861,16 @@ function MultiSelectDropdown({ label, options, selected, onChange, emptyText = '
  )
 }
 
-function shortDrawingLabel(drawing, max = 18) {
+function shortDrawingLabel(drawing, max = 16) {
  if (!drawing) return '—'
  if (drawing.length <= max) return drawing
  return `${drawing.slice(0, max - 1)}…`
 }
 
-function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCustomFrom, setCustomTo }) {
+function DrawingsTab({ a, rangeId, setRangeId, customFrom, customTo, setCustomFrom, setCustomTo }) {
  const dp = a.drawing_performance ?? {}
  const drawings = dp.drawings ?? []
  const spine = dp.spine ?? a.progress_spine ?? []
- const kpis = dp.kpis ?? {}
- const [selected, setSelected] = useState(null)
- const [filterDrawing, setFilterDrawing] = useState('')
- const [filterSeries, setFilterSeries] = useState('')
- const [filterStation, setFilterStation] = useState('')
-
  const [compareSeries, setCompareSeries] = useState(() => new Set())
  const [compareDrawings, setCompareDrawings] = useState(() => new Set())
  const [initialized, setInitialized] = useState(false)
@@ -901,7 +909,6 @@ function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCu
    }))
  }, [drawings, compareSeries, availableSeries])
 
- // Seed once: all series + all drawings
  useEffect(() => {
   if (initialized || drawings.length === 0) return
   setCompareSeries(new Set(availableSeries.map(s => s.series)))
@@ -909,7 +916,6 @@ function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCu
   setInitialized(true)
  }, [availableSeries, drawings, initialized])
 
- // When series selection changes, drop drawings outside those series
  const onSeriesChange = (nextSeries) => {
   setCompareSeries(nextSeries)
   const allowed = new Set(
@@ -921,37 +927,83 @@ function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCu
  }
 
  const selectedDrawingRows = useMemo(() => {
-  const seriesOk = compareSeries.size === 0
-   ? () => false
-   : s => compareSeries.has(s)
+  if (compareSeries.size === 0) return []
   return drawings.filter(d =>
-   seriesOk(d.series || 'Unknown') && compareDrawings.has(d.drawing),
+   compareSeries.has(d.series || 'Unknown') && compareDrawings.has(d.drawing),
   )
  }, [drawings, compareSeries, compareDrawings])
 
- // One chart group per drawing — never aggregate into series
+ // Aggregate selected drawings → series averages (for slowest-series KPI)
+ const seriesStats = useMemo(() => {
+  const bySeries = new Map()
+  for (const d of selectedDrawingRows) {
+   const s = d.series || 'Unknown'
+   const acc = bySeries.get(s) || {
+    series: s,
+    parts: 0,
+    totalSum: 0,
+    totalW: 0,
+   }
+   const parts = d.parts_completed || 1
+   acc.parts += d.parts_completed || 0
+   if (d.total_avg_seconds != null) {
+    acc.totalSum += d.total_avg_seconds * parts
+    acc.totalW += parts
+   }
+   bySeries.set(s, acc)
+  }
+  return [...bySeries.values()].map(acc => {
+   const totalAvg = acc.totalW > 0 ? acc.totalSum / acc.totalW : 0
+   return {
+    series: acc.series,
+    parts: acc.parts,
+    total_avg_seconds: totalAvg,
+    total_avg_display: formatDwell(totalAvg),
+   }
+  }).sort((a, b) => (b.total_avg_seconds || 0) - (a.total_avg_seconds || 0))
+ }, [selectedDrawingRows])
+
+ const slowestSeries = seriesStats[0] || null
+
+ const slowestStation = useMemo(() => {
+  const totals = {}
+  for (const st of spine) totals[st] = { sum: 0, n: 0 }
+  for (const d of selectedDrawingRows) {
+   for (const st of spine) {
+    const v = d.stations?.[st]?.avg_seconds
+    if (v != null && v > 0) {
+     totals[st].sum += v
+     totals[st].n += 1
+    }
+   }
+  }
+  let best = null
+  let bestAvg = -1
+  for (const st of spine) {
+   if (!totals[st].n) continue
+   const avg = totals[st].sum / totals[st].n
+   if (avg > bestAvg) {
+    bestAvg = avg
+    best = st
+   }
+  }
+  return best ? { station: best, avg_seconds: bestAvg, avg_display: formatDwell(bestAvg) } : null
+ }, [selectedDrawingRows, spine])
+
+ // Chart: one group per selected drawing
  const groups = useMemo(() => (
-  selectedDrawingRows
+  [...selectedDrawingRows]
    .sort((a, b) => a.drawing.localeCompare(b.drawing))
    .map(d => ({
     label: d.drawing,
-    short: shortDrawingLabel(d.drawing),
     series: d.series,
     drawing: d.drawing,
+    short: shortDrawingLabel(d.drawing, 28),
     values: Object.fromEntries(
      spine.map(st => [st, d.stations?.[st]?.avg_seconds ?? 0]),
     ),
    }))
  ), [selectedDrawingRows, spine])
-
- const filtered = useMemo(() => {
-  return drawings.filter(d => {
-   if (filterDrawing && !d.drawing.toLowerCase().includes(filterDrawing.toLowerCase())) return false
-   if (filterSeries && !(d.series || '').toLowerCase().includes(filterSeries.toLowerCase())) return false
-   if (filterStation && d.slowest_station !== filterStation) return false
-   return true
-  })
- }, [drawings, filterDrawing, filterSeries, filterStation])
 
  return (
   <div className="space-y-5">
@@ -959,7 +1011,7 @@ function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCu
     <div>
      <h2 className="bb-section-title">Drawing performance</h2>
      <p className="text-[11px] text-[#8b939e] mt-0.5">
-      Compare station dwell time and total production time by drawing and series.
+      Which series and station take the longest
      </p>
     </div>
     <RangeControls
@@ -973,17 +1025,27 @@ function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCu
    </div>
 
    <div className="bb-kpi-strip">
-    <Kpi label="Slowest drawing" value={kpis.slowest_drawing || '—'} />
-    <Kpi label="Fastest drawing" value={kpis.fastest_drawing || '—'} />
-    <Kpi label="Most variable" value={kpis.most_variable_drawing || '—'} />
-    <Kpi label="Most often above target" value={kpis.most_over_target_drawing || '—'} />
+    <Kpi
+     label="Slowest series"
+     value={slowestSeries ? slowestSeries.series : '—'}
+     sub={slowestSeries
+      ? `Avg total ${slowestSeries.total_avg_display} · ${slowestSeries.parts} parts`
+      : 'No series data'}
+    />
+    <Kpi
+     label="Slowest station"
+     value={slowestStation?.station ?? '—'}
+     sub={slowestStation
+      ? `Avg ${slowestStation.avg_display} across selected drawings`
+      : 'No station data'}
+    />
    </div>
 
    <section className="bb-section">
     <div>
-     <h2 className="bb-section-title">Drawing comparison</h2>
+     <h2 className="bb-section-title">Average time by station</h2>
      <p className="text-[11px] text-[#8b939e] mt-0.5">
-      Each selected drawing is its own bar group
+      Each group is a drawing · bar labels show average dwell at that station
      </p>
     </div>
 
@@ -1010,94 +1072,11 @@ function DrawingsTab({ a, days, rangeId, setRangeId, customFrom, customTo, setCu
       keys={spine}
       colors={STATION_COLORS}
       formatValue={formatDwell}
+      showValues
       emptyText="Select series and drawings to compare"
-      onSelect={g => { if (g.drawing) setSelected(g.drawing) }}
      />
     </div>
-    <p className="text-[11px] text-[#8b939e]">
-     Showing {groups.length} drawing{groups.length === 1 ? '' : 's'} · click a group to drill in
-    </p>
    </section>
-
-   <div className="flex flex-wrap gap-2">
-    <input
-     className="bb-input text-xs min-w-[8rem]"
-     placeholder="Table: filter drawing"
-     value={filterDrawing}
-     onChange={e => setFilterDrawing(e.target.value)}
-    />
-    <input
-     className="bb-input text-xs min-w-[7rem]"
-     placeholder="Table: filter series"
-     value={filterSeries}
-     onChange={e => setFilterSeries(e.target.value)}
-    />
-    <select
-     className="bb-select text-xs"
-     value={filterStation}
-     onChange={e => setFilterStation(e.target.value)}
-    >
-     <option value="">All slowest stations</option>
-     {spine.map(st => <option key={st} value={st}>{st}</option>)}
-    </select>
-   </div>
-
-   <section className="bb-section">
-    <div className="bb-table-wrap">
-     <table className="bb-table">
-      <thead className="bb-table-head">
-       <tr>
-        <th>Drawing</th>
-        <th>Series</th>
-        <th className="text-right">Parts</th>
-        {spine.map(st => (
-         <th key={st} className="text-right">{st.split(' ')[0]} avg</th>
-        ))}
-        <th className="text-right">Total avg</th>
-        <th>Slowest</th>
-       </tr>
-      </thead>
-      <tbody>
-       {filtered.length === 0 ? (
-        <tr className="bb-table-row">
-         <td colSpan={5 + spine.length} className="text-center text-[#8b939e] py-6">
-          No drawings match these filters
-         </td>
-        </tr>
-       ) : filtered.map(d => (
-        <tr
-         key={d.drawing}
-         className="bb-table-row cursor-pointer"
-         onClick={() => setSelected(d.drawing)}
-        >
-         <td className="font-mono font-semibold text-[#eef2f7]">{d.drawing}</td>
-         <td className="text-[#8b939e]">{d.series || '—'}</td>
-         <td className="text-right tabular-nums">{d.parts_completed}</td>
-         {spine.map(st => (
-          <td key={st} className="text-right font-mono text-xs">
-           {d.stations?.[st]?.avg_display ?? '—'}
-          </td>
-         ))}
-         <td className="text-right font-mono text-xs font-semibold">{d.total_avg_display ?? '—'}</td>
-         <td>
-          {d.slowest_station
-           ? <span className="bb-badge-warn">{d.slowest_station}</span>
-           : '—'}
-         </td>
-        </tr>
-       ))}
-      </tbody>
-     </table>
-    </div>
-   </section>
-
-   {selected && (
-    <DrawingDetailDrawer
-     drawing={selected}
-     days={days}
-     onClose={() => setSelected(null)}
-    />
-   )}
   </div>
  )
 }
@@ -1156,7 +1135,7 @@ export function AnalyticsPage() {
   today: "Current production snapshot and attention items",
   orders: 'Work-order completion and part locations',
   trends: 'Historical performance and station trends',
-  drawings: 'Station dwell and total time by drawing / series',
+  drawings: 'Slowest series, slowest station, and station times',
  }[tab]
 
  return (

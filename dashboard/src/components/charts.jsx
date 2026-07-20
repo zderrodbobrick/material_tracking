@@ -343,8 +343,9 @@ export function GroupedBars({
  formatValue = v => v,
  emptyText = 'No data',
  onSelect,
+ showValues = true,
 }) {
- /** groups: [{ label, short?, values: { [key]: number } }] */
+ /** groups: [{ label, short?, series?, drawing?, values }] */
  if (!groups?.length || !keys?.length) {
   return <p className="text-sm text-[#8b939e] py-8 text-center">{emptyText}</p>
  }
@@ -352,6 +353,8 @@ export function GroupedBars({
   1,
   ...groups.flatMap(g => keys.map(k => g.values?.[k] ?? 0)),
  )
+ const ticks = [0, 0.25, 0.5, 0.75, 1].map(p => p * max)
+ const labelH = '4.5rem'
 
  return (
   <div className="space-y-2">
@@ -363,46 +366,89 @@ export function GroupedBars({
      </span>
     ))}
    </div>
-   <div className="flex items-end gap-2 h-52 w-full overflow-x-auto">
-    {groups.map((g, gi) => (
-     <button
-      key={gi}
-      type="button"
-      onClick={() => onSelect?.(g)}
-      className="group/bar relative flex flex-col items-center justify-end h-full min-w-[3.25rem] flex-1 basis-0"
-     >
-      <div className="opacity-0 group-hover/bar:opacity-100 transition-opacity absolute -top-1
- -translate-y-full z-10 px-2 py-1 rounded-md text-xs whitespace-nowrap
-               bg-[#18181d] text-[#eef2f7] border border-[#27272f] shadow-lg pointer-events-none">
-       <div className="font-semibold mb-0.5">{g.label}</div>
-       {keys.map((k, i) => (
-        <div key={k} className="text-[#8b939e]">
-         {k}: {g.values?.[k] != null ? formatValue(g.values[k]) : '—'}
-        </div>
-       ))}
-      </div>
-      <div className="flex items-end justify-center gap-0.5 w-full h-full">
-       {keys.map((k, i) => {
-        const val = g.values?.[k] ?? 0
-        const pct = (val / max) * 100
-        return (
-         <div
-          key={k}
-          style={{
-           height: `${Math.max(pct, val > 0 ? 4 : 0)}%`,
-           background: colors[i % colors.length],
-          }}
-          className={`rounded-t-sm transition-all duration-500 ${keys.length > 1 ? 'w-[22%]' : 'w-full'}
-                ${val === 0 ? 'min-h-[2px] !bg-[#27272f]' : ''}`}
-         />
-        )
-       })}
-      </div>
-      <span className="mt-1.5 text-[10px] leading-none text-[#8b939e] tabular-nums truncate max-w-full">
-       {g.short ?? g.label}
+   <div className="flex gap-2 w-full">
+    <div
+     className="flex flex-col justify-between w-11 shrink-0 pt-1"
+     style={{ height: `calc(14rem + ${labelH})`, paddingBottom: labelH }}
+    >
+     {[...ticks].reverse().map((t, i) => (
+      <span key={i} className="text-[10px] tabular-nums text-[#8b939e] text-right leading-none">
+       {formatValue(t)}
       </span>
-     </button>
-    ))}
+     ))}
+    </div>
+    <div className="relative flex-1 min-w-0" style={{ height: `calc(14rem + ${labelH})` }}>
+     <div
+      className="absolute inset-x-0 top-1 flex flex-col justify-between pointer-events-none"
+      style={{ bottom: labelH }}
+     >
+      {ticks.map((_, i) => (
+       <div key={i} className="border-t border-[#27272f]/80 w-full" />
+      ))}
+     </div>
+     <div className="relative flex items-end gap-3 w-full h-full overflow-x-auto">
+      {groups.map((g, gi) => {
+       const seriesLine = g.series ? `Series ${g.series}` : null
+       const drawingLine = g.drawing || g.short || g.label
+       return (
+        <button
+         key={g.label || gi}
+         type="button"
+         onClick={() => onSelect?.(g)}
+         title={g.label}
+         className="group/bar relative flex flex-col items-center justify-end h-full min-w-[7.5rem] flex-1 basis-0"
+        >
+         <div className="opacity-0 group-hover/bar:opacity-100 transition-opacity absolute bottom-full mb-1
+                         z-10 px-2 py-1.5 rounded-md text-xs max-w-[14rem]
+                         bg-[#18181d] text-[#eef2f7] border border-[#27272f] shadow-lg pointer-events-none text-left">
+          <div className="font-semibold mb-0.5 whitespace-normal break-words">{g.label}</div>
+          {keys.map(k => (
+           <div key={k} className="text-[#8b939e]">
+            {k}: {g.values?.[k] != null ? formatValue(g.values[k]) : '—'}
+           </div>
+          ))}
+         </div>
+         <div className="flex items-end justify-center gap-1 w-full" style={{ height: '14rem' }}>
+          {keys.map((k, i) => {
+           const val = g.values?.[k] ?? 0
+           const pct = (val / max) * 100
+           return (
+            <div key={k} className="flex flex-col items-center justify-end h-full" style={{ width: `${85 / keys.length}%` }}>
+             {showValues && val > 0 && (
+              <span className="text-[10px] font-semibold tabular-nums text-[#eef2f7] mb-0.5 leading-none">
+               {formatValue(val)}
+              </span>
+             )}
+             <div
+              style={{
+               height: `${Math.max(pct, val > 0 ? 4 : 0)}%`,
+               background: colors[i % colors.length],
+              }}
+              className={`w-full rounded-t-sm transition-all duration-500
+                    ${val === 0 ? 'min-h-[2px] !bg-[#27272f]' : ''}`}
+             />
+            </div>
+           )
+          })}
+         </div>
+         <div
+          className="w-full px-0.5 text-center shrink-0 flex flex-col justify-start gap-0.5"
+          style={{ height: labelH, paddingTop: '0.4rem' }}
+         >
+          {seriesLine && (
+           <span className="text-[10px] font-semibold text-[#4dc4f4] leading-tight">
+            {seriesLine}
+           </span>
+          )}
+          <span className="text-[10px] font-medium text-[#eef2f7] leading-snug break-words hyphens-auto">
+           {drawingLine}
+          </span>
+         </div>
+        </button>
+       )
+      })}
+     </div>
+    </div>
    </div>
   </div>
  )

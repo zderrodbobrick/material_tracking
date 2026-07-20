@@ -1074,7 +1074,7 @@ def end_session(session_id):
 
 @app.route("/api/summary")
 def summary():
-    today = datetime.now().strftime("%Y-%m-%d")
+    day_start, day_end = _local_day_utc_iso_bounds()
     db = get_db()
 
     in_process = db.execute(
@@ -1084,8 +1084,8 @@ def summary():
 
     completed_today = db.execute(
         "SELECT COUNT(*) FROM part_station_sessions "
-        "WHERE session_status = ? AND exit_time >= ?",
-        (STATUS_CLOSED, today),
+        "WHERE session_status = ? AND exit_time >= ? AND exit_time < ?",
+        (STATUS_CLOSED, day_start, day_end),
     ).fetchone()[0]
 
     # Unique parts that finished at Insert today (daily parts-completed KPI).
@@ -1096,8 +1096,8 @@ def summary():
            JOIN stations st ON s.station_id = st.station_id
            WHERE s.session_status = ?
              AND (st.station_name = ? OR st.station_name LIKE ?)
-             AND date(s.exit_time) = date(?)""",
-        (STATUS_CLOSED, INSERT_STATION_NAME, "%Insert%", today),
+             AND s.exit_time >= ? AND s.exit_time < ?""",
+        (STATUS_CLOSED, INSERT_STATION_NAME, "%Insert%", day_start, day_end),
     ).fetchone()[0]
 
     # Distinct IBUS orders with at least one Insert completion today.
@@ -1113,14 +1113,14 @@ def summary():
            JOIN stations st ON s.station_id = st.station_id
            WHERE s.session_status = ?
              AND (st.station_name = ? OR st.station_name LIKE ?)
-             AND date(s.exit_time) = date(?)""",
-        (STATUS_CLOSED, INSERT_STATION_NAME, "%Insert%", today),
+             AND s.exit_time >= ? AND s.exit_time < ?""",
+        (STATUS_CLOSED, INSERT_STATION_NAME, "%Insert%", day_start, day_end),
     ).fetchone()[0]
 
     avg_dwell = db.execute(
         "SELECT AVG(dwell_seconds) FROM part_station_sessions "
-        "WHERE session_status = ? AND exit_time >= ?",
-        (STATUS_CLOSED, today),
+        "WHERE session_status = ? AND exit_time >= ? AND exit_time < ?",
+        (STATUS_CLOSED, day_start, day_end),
     ).fetchone()[0]
 
     missing_exit = db.execute(
@@ -2399,10 +2399,16 @@ _WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
     """Date-scoped operator trends vs station peers."""
     operator_id = args.get("operator_id", type=int)
+    compare_operator_id = args.get("compare_operator_id", type=int)
     station_filter = (args.get("station") or "").strip() or None
     work_order = (args.get("work_order") or "").strip() or None
     part_type = (args.get("part_type") or "").strip() or None
-    metric = (args.get("metric") or "parts_per_active_hour").strip()
+    series_filter = (args.get("series") or "").strip() or None
+    drawing_filter = (args.get("drawing") or "").strip() or None
+    metric = (args.get("metric") or "avg_part_dwell").strip()
+    compare_mode = (
+        (args.get("compare_mode") or args.get("compare") or "station_average").strip()
+    )
     start_utc, end_utc, date_from, date_to, all_time = _parse_trends_range(args)
 
     specs = fetch_specs_by_name(db)
@@ -2435,21 +2441,39 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
            WHERE station_name IS NOT NULL AND dwell_seconds IS NOT NULL"""
     ).fetchall()
 
-    # Filter assignments into range (+ optional WO / part type).
-    filtered = []
-    for r in assign_rows:
-        ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
-        if not _ts_in_range(ts, start_utc, end_utc):
-            continue
+    drawings_by_epc = _drawings_by_epc(db)
+
+    def _row_drawing(r) -> str:
+        epc = r["epc"]
+        return drawings_by_epc.get(epc, "") if epc else ""
+
+    def _row_series(r) -> str:
+        return _series_from_drawing(_row_drawing(r)) or ""
+
+    def _passes_part_filters(r) -> bool:
         if work_order:
             wo = (r["ibus_number"] or r["job_number"] or "").upper()
             if work_order.upper() not in wo and work_order.upper() not in (
                 f"IBUS{(r['job_number'] or '')}"
             ).upper():
-                continue
+                return False
         if part_type and (r["part_type"] or "").lower() != part_type.lower():
+            return False
+        if series_filter and _row_series(r) != series_filter:
+            return False
+        if drawing_filter and _row_drawing(r) != drawing_filter:
+            return False
+        return True
+
+    # Date range first, then optional part / series / drawing filters.
+    range_filtered = []
+    for r in assign_rows:
+        ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
+        if not _ts_in_range(ts, start_utc, end_utc):
             continue
-        filtered.append(r)
+        range_filtered.append(r)
+
+    filtered = [r for r in range_filtered if _passes_part_filters(r)]
 
     # Active seconds from zone visits (fallback: closed session dwells).
     def _active_seconds(oid: int, station: str | None, day=None) -> float:
@@ -2544,6 +2568,7 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
 
         over_pct = round(100.0 * over / sessions, 1) if sessions else None
         within_pct = round(100.0 * (sessions - over) / sessions, 1) if sessions else None
+        avg_part = round(sum(dwells) / len(dwells), 1) if dwells else None
         return {
             "parts": parts,
             "sessions": sessions,
@@ -2551,6 +2576,7 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
             "parts_per_active_hour": _parts_per_active_hour(parts, active),
             "median_operator_dwell_seconds": _median(op_dwells),
             "median_part_dwell_seconds": _median(dwells),
+            "avg_part_dwell_seconds": avg_part,
             "parts_over_target_pct": over_pct,
             "within_target_pct": within_pct,
             "over_target": over,
@@ -2571,7 +2597,7 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
         if counts:
             primary_station = max(counts.items(), key=lambda x: x[1])[0]
 
-    station = primary_station
+    station = station_filter
 
     # Operators with activity at this station in range.
     peer_ids: set[int] = set()
@@ -2591,6 +2617,8 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
     def _metric_value(st: dict) -> float | None:
         if metric == "parts":
             return float(st["parts"])
+        if metric == "avg_part_dwell":
+            return st.get("avg_part_dwell_seconds")
         if metric == "median_operator_dwell":
             return st["median_operator_dwell_seconds"]
         if metric == "median_part_dwell":
@@ -2601,7 +2629,9 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
             return st["active_seconds"]
         if metric == "exception_rate":
             return st["parts_over_target_pct"]
-        return st["parts_per_active_hour"]  # default
+        if metric == "parts_per_active_hour":
+            return st["parts_per_active_hour"]
+        return st.get("avg_part_dwell_seconds")
 
     peer_metric_vals = []
     for oid, st in peer_stats.items():
@@ -2632,6 +2662,7 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
         "sessions": 0,
         "active_seconds": 0,
         "parts_per_active_hour": None,
+        "avg_part_dwell_seconds": None,
         "median_operator_dwell_seconds": None,
         "parts_over_target_pct": None,
         "by_day": {},
@@ -2676,6 +2707,10 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
         op_over = day_b["over"] if day_b else 0
         if metric == "parts":
             return float(op_parts) if op_parts else None
+        if metric == "avg_part_dwell":
+            if day_b and day_b["dwells"]:
+                return round(sum(day_b["dwells"]) / len(day_b["dwells"]), 1)
+            return None
         if metric == "median_operator_dwell":
             day_op_dwells = [
                 int(z["dwell_seconds"])
@@ -2723,28 +2758,297 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
     # Weekday averages sample every day that had station activity (any peer).
     scan_days = activity_days if activity_days else series_days
 
+    def _expected_dwell_target() -> float | None:
+        if station:
+            spec = _spec_for_station(specs, station)
+            target = spec.get("target_part_dwell_seconds") if spec else None
+            return float(target) if target else None
+        weights: dict[str, int] = {}
+        for r in filtered:
+            if operator_id and r["operator_id"] != operator_id:
+                continue
+            if r["session_status"] != STATUS_CLOSED:
+                continue
+            st_name = r["station_name"] or STATION_NAME
+            weights[st_name] = weights.get(st_name, 0) + 1
+        total = 0.0
+        n = 0
+        for st_name, count in weights.items():
+            spec = _spec_for_station(specs, st_name)
+            target = spec.get("target_part_dwell_seconds") if spec else None
+            if target:
+                total += float(target) * count
+                n += count
+        return round(total / n, 1) if n else None
+
+    expected_dwell_target = _expected_dwell_target()
+
+    # Optional previous period (same span, immediately before current range).
+    prev_peer_stats: dict[int, dict] = {}
+    if compare_mode == "previous_period" and operator_id:
+        d0 = datetime.fromisoformat(date_from).date()
+        d1 = datetime.fromisoformat(date_to).date()
+        span = (d1 - d0).days + 1
+        prev_end_d = d0 - timedelta(days=1)
+        prev_start_d = prev_end_d - timedelta(days=span - 1)
+        tz = datetime.now().astimezone().tzinfo
+        prev_start_utc = datetime.combine(
+            prev_start_d, datetime.min.time(), tzinfo=tz,
+        ).astimezone(timezone.utc)
+        prev_end_utc = datetime.combine(
+            prev_end_d, datetime.max.time(), tzinfo=tz,
+        ).astimezone(timezone.utc)
+        prev_filtered = []
+        for r in assign_rows:
+            ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
+            if not _ts_in_range(ts, prev_start_utc, prev_end_utc):
+                continue
+            if not _passes_part_filters(r):
+                continue
+            prev_filtered.append(r)
+
+        def _prev_op_station_stats(oid: int, st_name: str | None) -> dict:
+            epcs: set[str] = set()
+            by_day: dict = {}
+            for r in prev_filtered:
+                if r["operator_id"] != oid:
+                    continue
+                st = r["station_name"] or STATION_NAME
+                if st_name and st != st_name:
+                    continue
+                if r["session_status"] != STATUS_CLOSED:
+                    continue
+                ts = r["exit_time"] or r["assigned_at"] or r["entry_time"]
+                day = _local_date(ts)
+                if not day:
+                    continue
+                epc = r["epc"] or f"session-{r['session_id']}"
+                epcs.add(epc)
+                bucket = by_day.setdefault(
+                    day,
+                    {"epcs": set(), "dwells": [], "over": 0, "sessions": 0, "station": st},
+                )
+                bucket["epcs"].add(epc)
+                bucket["sessions"] += 1
+                dwell = int(r["dwell_seconds"]) if r["dwell_seconds"] is not None else None
+                if dwell is not None:
+                    bucket.setdefault("dwells", []).append(dwell)
+            return {"parts": len(epcs), "by_day": by_day}
+
+        prev_peer_stats = {
+            operator_id: _prev_op_station_stats(operator_id, station),
+        }
+
+    prev_weekday_avg: dict[int, float | None] = {}
+    if compare_mode == "previous_period" and operator_id:
+        prev_wd_lists: dict[int, list[float]] = {i: [] for i in range(7)}
+        prev_st = prev_peer_stats.get(operator_id) or {}
+        for day, day_b in (prev_st.get("by_day") or {}).items():
+            v = _day_metric(operator_id, day, day_b)
+            if v is not None:
+                prev_wd_lists[day.weekday()].append(float(v))
+        prev_weekday_avg = {
+            wd: round(sum(vs) / len(vs), 2) if vs else None
+            for wd, vs in prev_wd_lists.items()
+        }
+
+    compare_label = "Station average"
+    if compare_mode == "expected_target":
+        compare_label = "Expected target"
+    elif compare_mode == "all_average":
+        compare_label = "All operators average"
+    elif compare_mode == "operator" and compare_operator_id:
+        compare_label = names.get(compare_operator_id)
+        if not compare_label and op_row and compare_operator_id == operator_id:
+            compare_label = op_row["operator_name"]
+        if not compare_label:
+            cmp_row = db.execute(
+                "SELECT operator_name FROM operators WHERE operator_id = ?",
+                (compare_operator_id,),
+            ).fetchone()
+            compare_label = cmp_row["operator_name"] if cmp_row else "Other operator"
+    elif compare_mode == "previous_period":
+        compare_label = "Previous period"
+
+    def _weekday_rows_for_station(st_scope: str | None) -> list[dict]:
+        loc_sel = (
+            _op_station_stats(operator_id, st_scope)
+            if operator_id else {}
+        )
+        loc_peer_ids: set[int] = set()
+        for r in filtered:
+            st = r["station_name"] or STATION_NAME
+            if st_scope and st != st_scope:
+                continue
+            loc_peer_ids.add(r["operator_id"])
+        loc_peer_stats = {
+            oid: _op_station_stats(oid, st_scope) for oid in loc_peer_ids
+        }
+        if st_scope:
+            spec = _spec_for_station(specs, st_scope)
+            loc_expected = (
+                float(spec["target_part_dwell_seconds"])
+                if spec and spec.get("target_part_dwell_seconds") else None
+            )
+        else:
+            loc_expected = expected_dwell_target
+
+        op_wv: dict[int, list[float]] = {i: [] for i in range(7)}
+        peer_wv: dict[int, list[float]] = {i: [] for i in range(7)}
+        op_wp: dict[int, int] = {i: 0 for i in range(7)}
+        peer_wp: dict[int, int] = {i: 0 for i in range(7)}
+
+        def _loc_day_parts(oid: int | None, day) -> int:
+            if oid is None:
+                return 0
+            if operator_id is not None and oid == operator_id:
+                day_b = (loc_sel.get("by_day") or {}).get(day)
+            else:
+                st = loc_peer_stats.get(oid)
+                if not st:
+                    st = _op_station_stats(oid, st_scope)
+                day_b = (st.get("by_day") or {}).get(day)
+            return len(day_b["epcs"]) if day_b else 0
+
+        def _loc_peer_day(day) -> float | None:
+            if compare_mode == "expected_target":
+                return loc_expected
+            if compare_mode == "previous_period" and operator_id:
+                return prev_weekday_avg.get(day.weekday())
+            if compare_mode == "operator" and compare_operator_id:
+                cmp_st = loc_peer_stats.get(compare_operator_id)
+                if not cmp_st:
+                    cmp_st = _op_station_stats(compare_operator_id, st_scope)
+                return _day_metric(
+                    compare_operator_id,
+                    day,
+                    (cmp_st.get("by_day") or {}).get(day),
+                )
+            peer_day_vals = []
+            for oid, st in loc_peer_stats.items():
+                if compare_mode == "station_average" and operator_id and oid == operator_id:
+                    continue
+                v = _day_metric(oid, day, (st.get("by_day") or {}).get(day))
+                if v is not None:
+                    peer_day_vals.append(v)
+            return (
+                round(sum(peer_day_vals) / len(peer_day_vals), 2)
+                if peer_day_vals else None
+            )
+
+        for day in scan_days:
+            op_day = (loc_sel.get("by_day") or {}).get(day)
+            op_val = _day_metric(operator_id, day, op_day)
+            peer_val = _loc_peer_day(day)
+            wd = day.weekday()
+            op_wp[wd] += _loc_day_parts(operator_id, day)
+            if compare_mode == "operator" and compare_operator_id:
+                peer_wp[wd] += _loc_day_parts(compare_operator_id, day)
+            elif compare_mode == "all_average":
+                for oid in loc_peer_ids:
+                    peer_wp[wd] += _loc_day_parts(oid, day)
+            if op_val is not None:
+                op_wv[wd].append(float(op_val))
+            if peer_val is not None:
+                peer_wv[wd].append(float(peer_val))
+
+        rows = []
+        for wd in range(7):
+            op_samples = op_wv[wd]
+            peer_samples = peer_wv[wd]
+            peer_part_total = peer_wp[wd]
+            if compare_mode == "all_average" and loc_peer_ids:
+                peer_part_total = round(peer_part_total / len(loc_peer_ids))
+            rows.append({
+                "weekday": wd,
+                "label": _WEEKDAY_LABELS[wd],
+                "operator_value": (
+                    round(sum(op_samples) / len(op_samples), 2) if op_samples else None
+                ),
+                "peer_value": (
+                    round(sum(peer_samples) / len(peer_samples), 2)
+                    if peer_samples else None
+                ),
+                "operator_parts": op_wp[wd],
+                "peer_parts": (
+                    None if compare_mode == "expected_target" else peer_part_total
+                ),
+                "samples": len(op_samples),
+                "peer_samples": len(peer_samples),
+            })
+        return rows
+
+    operator_station_names = sorted({
+        (r["station_name"] or STATION_NAME)
+        for r in filtered
+        if operator_id and r["operator_id"] == operator_id
+    })
+    by_weekday = _weekday_rows_for_station(None)
+    by_weekday_by_station = {
+        st_name: _weekday_rows_for_station(st_name)
+        for st_name in operator_station_names
+    }
+
+    # Keep day_cache for daily series (uses current station filter).
     op_weekday_vals: dict[int, list[float]] = {i: [] for i in range(7)}
     peer_weekday_vals: dict[int, list[float]] = {i: [] for i in range(7)}
+    op_weekday_parts: dict[int, int] = {i: 0 for i in range(7)}
+    peer_weekday_parts: dict[int, int] = {i: 0 for i in range(7)}
     day_cache: dict = {}
 
-    for day in scan_days:
-        op_day = (sel.get("by_day") or {}).get(day)
-        op_val = _day_metric(operator_id, day, op_day)
+    def _day_parts(oid: int | None, day) -> int:
+        if oid is None:
+            return 0
+        if operator_id is not None and oid == operator_id:
+            day_b = (sel.get("by_day") or {}).get(day)
+        else:
+            st = peer_stats.get(oid)
+            if not st:
+                st = _op_station_stats(oid, station)
+            day_b = (st.get("by_day") or {}).get(day)
+        return len(day_b["epcs"]) if day_b else 0
+
+    def _peer_day_value(day) -> float | None:
+        if compare_mode == "expected_target":
+            return expected_dwell_target
+        if compare_mode == "previous_period" and operator_id:
+            return prev_weekday_avg.get(day.weekday())
+        if compare_mode == "operator" and compare_operator_id:
+            cmp_st = peer_stats.get(compare_operator_id)
+            if not cmp_st:
+                cmp_st = _op_station_stats(compare_operator_id, station)
+            return _day_metric(
+                compare_operator_id,
+                day,
+                (cmp_st.get("by_day") or {}).get(day),
+            )
         peer_day_vals = []
         for oid, st in peer_stats.items():
-            if operator_id and oid == operator_id:
+            if compare_mode == "station_average" and operator_id and oid == operator_id:
                 continue
             v = _day_metric(oid, day, (st.get("by_day") or {}).get(day))
             if v is not None:
                 peer_day_vals.append(v)
-        peer_val = (
+        return (
             round(sum(peer_day_vals) / len(peer_day_vals), 2)
             if peer_day_vals else None
         )
+
+    for day in scan_days:
+        op_day = (sel.get("by_day") or {}).get(day)
+        op_val = _day_metric(operator_id, day, op_day)
+        peer_val = _peer_day_value(day)
+        wd = day.weekday()
+        op_weekday_parts[wd] += _day_parts(operator_id, day)
+        if compare_mode == "operator" and compare_operator_id:
+            peer_weekday_parts[wd] += _day_parts(compare_operator_id, day)
+        elif compare_mode == "all_average":
+            for oid in peer_ids:
+                peer_weekday_parts[wd] += _day_parts(oid, day)
         if op_val is not None:
-            op_weekday_vals[day.weekday()].append(float(op_val))
+            op_weekday_vals[wd].append(float(op_val))
         if peer_val is not None:
-            peer_weekday_vals[day.weekday()].append(float(peer_val))
+            peer_weekday_vals[wd].append(float(peer_val))
         day_cache[day] = {
             "op_day": op_day,
             "op_val": op_val,
@@ -2761,17 +3065,7 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
         else:
             op_day = (sel.get("by_day") or {}).get(day)
             op_val = _day_metric(operator_id, day, op_day)
-            peer_day_vals = []
-            for oid, st in peer_stats.items():
-                if operator_id and oid == operator_id:
-                    continue
-                v = _day_metric(oid, day, (st.get("by_day") or {}).get(day))
-                if v is not None:
-                    peer_day_vals.append(v)
-            peer_val = (
-                round(sum(peer_day_vals) / len(peer_day_vals), 2)
-                if peer_day_vals else None
-            )
+            peer_val = _peer_day_value(day)
         op_parts = len(op_day["epcs"]) if op_day else 0
         op_active = _active_seconds(operator_id, station, day) if operator_id else 0
         op_med = _median(op_day["dwells"]) if op_day and op_day["dwells"] else None
@@ -2786,23 +3080,6 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
             "active_seconds": op_active,
             "over_target": op_over,
             "median_dwell_seconds": op_med,
-        })
-
-    by_weekday = []
-    for wd in range(7):
-        op_samples = op_weekday_vals[wd]
-        peer_samples = peer_weekday_vals[wd]
-        by_weekday.append({
-            "weekday": wd,
-            "label": _WEEKDAY_LABELS[wd],
-            "operator_value": (
-                round(sum(op_samples) / len(op_samples), 2) if op_samples else None
-            ),
-            "peer_value": (
-                round(sum(peer_samples) / len(peer_samples), 2) if peer_samples else None
-            ),
-            "samples": len(op_samples),
-            "peer_samples": len(peer_samples),
         })
 
     # Peer comparison bars for selected metric (include selected even if null → 0).
@@ -2844,13 +3121,62 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
         })
         for st_name in st_names:
             st = _op_station_stats(operator_id, st_name)
+            spec = _spec_for_station(specs, st_name)
+            target = spec.get("target_part_dwell_seconds") if spec else None
+            peer_dwell_vals = [
+                _op_station_stats(oid, st_name).get("avg_part_dwell_seconds")
+                for oid in peer_ids
+                if operator_id is None or oid != operator_id
+            ]
+            peer_dwell_vals = [v for v in peer_dwell_vals if v is not None]
+            peer_avg_dwell = (
+                round(sum(peer_dwell_vals) / len(peer_dwell_vals), 1)
+                if peer_dwell_vals else None
+            )
+            compare_dwell = peer_avg_dwell
+            if compare_mode == "expected_target":
+                compare_dwell = float(target) if target else None
+            elif compare_mode == "operator" and compare_operator_id:
+                cmp_st = _op_station_stats(compare_operator_id, st_name)
+                compare_dwell = cmp_st.get("avg_part_dwell_seconds")
+            elif compare_mode == "previous_period" and operator_id:
+                prev_st = prev_peer_stats.get(operator_id) or {}
+                prev_dwells = [
+                    d
+                    for day_b in (prev_st.get("by_day") or {}).values()
+                    for d in (day_b.get("dwells") or [])
+                    if day_b.get("station") == st_name
+                ]
+                compare_dwell = (
+                    round(sum(prev_dwells) / len(prev_dwells), 1)
+                    if prev_dwells else None
+                )
+            elif compare_mode == "all_average":
+                all_vals = [
+                    _op_station_stats(oid, st_name).get("avg_part_dwell_seconds")
+                    for oid in peer_ids
+                ]
+                all_vals = [v for v in all_vals if v is not None]
+                compare_dwell = (
+                    round(sum(all_vals) / len(all_vals), 1) if all_vals else None
+                )
             stations_out.append({
                 "station": st_name,
                 "sessions": st["sessions"],
                 "parts": st["parts"],
                 "parts_per_active_hour": st["parts_per_active_hour"],
-                "median_dwell_seconds": st["median_operator_dwell_seconds"],
-                "median_dwell_display": _dwell_display(st["median_operator_dwell_seconds"]),
+                "avg_part_dwell_seconds": st["avg_part_dwell_seconds"],
+                "avg_part_dwell_display": _dwell_display(st["avg_part_dwell_seconds"]),
+                "median_part_dwell_seconds": st["median_part_dwell_seconds"],
+                "median_part_dwell_display": _dwell_display(st["median_part_dwell_seconds"]),
+                "median_dwell_seconds": st["median_part_dwell_seconds"],
+                "median_dwell_display": _dwell_display(st["median_part_dwell_seconds"]),
+                "target_part_dwell_seconds": int(target) if target else None,
+                "target_part_dwell_display": _dwell_display(target),
+                "peer_avg_part_dwell_seconds": peer_avg_dwell,
+                "peer_avg_part_dwell_display": _dwell_display(peer_avg_dwell),
+                "compare_part_dwell_seconds": compare_dwell,
+                "compare_part_dwell_display": _dwell_display(compare_dwell),
                 "within_target_pct": st["within_target_pct"],
             })
         stations_out.sort(key=lambda s: s["parts"], reverse=True)
@@ -2898,16 +3224,69 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
                     "over_target": b["over"],
                 })
 
-    # Filter option lists
+    # Filter option lists (from date range for selected operator, before part filters).
+    option_rows = [
+        r for r in range_filtered
+        if not operator_id or r["operator_id"] == operator_id
+    ]
     wo_opts = sorted({
         (r["ibus_number"] or (f"IBUS{r['job_number']}" if r["job_number"] else None))
-        for r in filtered
+        for r in option_rows
         if r["ibus_number"] or r["job_number"]
     } - {None})
-    pt_opts = sorted({r["part_type"] for r in filtered if r["part_type"]})
+    pt_opts = sorted({r["part_type"] for r in option_rows if r["part_type"]})
+    series_opts = sorted({_row_series(r) for r in option_rows if _row_series(r)})
+    drawing_rows = option_rows
+    if series_filter:
+        drawing_rows = [r for r in option_rows if _row_series(r) == series_filter]
+    drawing_opts = sorted({_row_drawing(r) for r in drawing_rows if _row_drawing(r)})
     station_opts = sorted({
-        (r["station_name"] or STATION_NAME) for r in filtered
+        (r["station_name"] or STATION_NAME) for r in option_rows
     })
+
+    compare_dwell_peer = _peer_avg_of("avg_part_dwell_seconds")
+    if compare_mode == "expected_target":
+        compare_dwell_peer = expected_dwell_target
+    elif compare_mode == "all_average":
+        vals = [
+            st["avg_part_dwell_seconds"]
+            for st in peer_stats.values()
+            if st.get("avg_part_dwell_seconds") is not None
+        ]
+        compare_dwell_peer = round(sum(vals) / len(vals), 1) if vals else None
+    elif compare_mode == "operator" and compare_operator_id:
+        cmp_st = peer_stats.get(compare_operator_id) or _op_station_stats(
+            compare_operator_id, station,
+        )
+        compare_dwell_peer = cmp_st.get("avg_part_dwell_seconds")
+    elif compare_mode == "previous_period" and operator_id:
+        prev_st = prev_peer_stats.get(operator_id) or {}
+        prev_dwells = [
+            d["dwells"]
+            for d in (prev_st.get("by_day") or {}).values()
+            if d.get("dwells")
+        ]
+        flat = [x for bucket in prev_dwells for x in bucket]
+        compare_dwell_peer = round(sum(flat) / len(flat), 1) if flat else None
+    summary["avg_part_dwell_seconds"] = _metric_bundle(
+        sel.get("avg_part_dwell_seconds"),
+        compare_dwell_peer,
+        kind="seconds",
+    )
+    compare_parts_peer = _peer_avg_of("parts")
+    if compare_mode == "all_average":
+        vals = [st["parts"] for st in peer_stats.values() if st.get("parts") is not None]
+        compare_parts_peer = round(sum(vals) / len(vals), 1) if vals else None
+    elif compare_mode == "operator" and compare_operator_id:
+        cmp_st = peer_stats.get(compare_operator_id) or _op_station_stats(
+            compare_operator_id, station,
+        )
+        compare_parts_peer = cmp_st.get("parts")
+    summary["rfid_associated_parts"] = _metric_bundle(
+        sel.get("parts"),
+        compare_parts_peer,
+        kind="count",
+    )
 
     return {
         "operator": {
@@ -2925,14 +3304,20 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
             "all_time": all_time,
             "work_order": work_order,
             "part_type": part_type,
+            "series": series_filter,
+            "drawing": drawing_filter,
             "metric": metric,
-            "compare": "station_average",
+            "compare_mode": compare_mode,
+            "compare_operator_id": compare_operator_id,
+            "compare_label": compare_label,
             "peer_count": peer_operator_count,
         },
         "filter_options": {
             "stations": station_opts,
             "work_orders": wo_opts,
             "part_types": pt_opts,
+            "series": series_opts,
+            "drawings": drawing_opts,
             "ranges": [
                 {"id": "all", "label": "All time"},
                 {"id": "7", "label": "1 week"},
@@ -2952,10 +3337,11 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
                 )
             ],
             "metrics": [
-                {"id": "parts_per_active_hour", "label": "Parts per active hour"},
+                {"id": "avg_part_dwell", "label": "Average dwell per part"},
+                {"id": "median_part_dwell", "label": "Median dwell per part"},
                 {"id": "parts", "label": "Parts completed"},
+                {"id": "parts_per_active_hour", "label": "Parts per active hour"},
                 {"id": "median_operator_dwell", "label": "Median operator dwell"},
-                {"id": "median_part_dwell", "label": "Median part dwell"},
                 {"id": "pct_within_target", "label": "Percentage within target"},
                 {"id": "active_time", "label": "Active time"},
                 {"id": "exception_rate", "label": "Exception rate"},
@@ -2963,11 +3349,14 @@ def _build_operator_trends(db: sqlite3.Connection, args) -> dict:
         },
         "summary": summary,
         "by_weekday": by_weekday,
+        "by_weekday_by_station": by_weekday_by_station,
         "daily": daily,
         "peers": peer_bars,
         "stations": stations_out,
         "days": days_out,
         "peer_average": peer_avg,
+        "expected_dwell_seconds": expected_dwell_target,
+        "expected_dwell_display": _dwell_display(expected_dwell_target),
     }
 
 
@@ -3315,6 +3704,19 @@ def _local_hour(ts: str | None) -> int | None:
 def _local_date(ts: str | None):
     dt = _local_dt(ts)
     return dt.date() if dt else None
+
+
+def _local_day_utc_iso_bounds(day=None) -> tuple[str, str]:
+    """UTC ISO bounds [start, end) for a local calendar day (default: today)."""
+    if day is None:
+        day = datetime.now().astimezone().date()
+    tz = datetime.now().astimezone().tzinfo
+    start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    end = start + timedelta(days=1)
+    return (
+        start.astimezone(timezone.utc).isoformat(),
+        end.astimezone(timezone.utc).isoformat(),
+    )
 
 
 def _in_analytics_period(ts: str | None, days: int | None) -> bool:
@@ -3954,39 +4356,75 @@ def _build_attention_items(
     return items[:40]
 
 
+def _sample_confidence(parts: int) -> str:
+    if parts < 5:
+        return "low"
+    if parts < 20:
+        return "moderate"
+    return "high"
+
+
+def _in_previous_period(ts: str | None, days: int | None) -> bool:
+    """Same-length window immediately before the current analytics period."""
+    if days is None:
+        return False
+    dt = _parse_ts(ts)
+    if not dt:
+        return False
+    now = datetime.now(timezone.utc)
+    end = now - timedelta(days=days)
+    start = end - timedelta(days=days)
+    return start <= dt < end
+
+
 def _build_drawing_analytics(
     db: sqlite3.Connection,
     specs_by_name: dict,
     days: int | None = None,
 ) -> dict:
-    """Aggregate station dwell / totals by drawing + series."""
+    """Aggregate station dwell / totals by drawing + series (supervisor insights)."""
     spine = progress_spine_names(specs_by_name)
     drawings_by_epc = _drawings_by_epc(db)
 
     rows = db.execute(
-        """SELECT v.epc, v.station_name, v.dwell_seconds, v.exit_time, v.entry_time,
-                  v.ibus_number, v.job_number, v.part_name, v.session_status
+        """SELECT v.session_id, v.epc, v.station_name, v.dwell_seconds, v.exit_time, v.entry_time,
+                  v.ibus_number, v.job_number, v.part_name, v.session_status,
+                  (SELECT GROUP_CONCAT(o.operator_name, ', ')
+                   FROM part_operator_assignments poa
+                   JOIN operators o ON o.operator_id = poa.operator_id
+                   WHERE poa.session_id = v.session_id) AS operators
            FROM vw_live_part_status v
            WHERE v.session_status = ? AND v.dwell_seconds IS NOT NULL AND v.epc IS NOT NULL""",
         (STATUS_CLOSED,),
     ).fetchall()
 
-    # drawing -> station -> dwells; drawing -> epc totals
-    by_drawing: dict[str, dict] = {}
-    for r in rows:
-        if not _in_analytics_period(r["exit_time"], days):
-            continue
-        drawing = drawings_by_epc.get((r["epc"] or "").strip()) or ""
-        if not drawing:
-            continue
-        acc = by_drawing.setdefault(drawing, {
-            "series": _series_from_drawing(drawing),
+    def _blank_acc():
+        return {
+            "series": "",
             "station_dwells": {},
             "epc_station_dwells": {},
             "epcs": set(),
             "over_target": 0,
+            "over_by_station": {},
+            "over_excess_sum": 0,
             "closed": 0,
-        })
+            "sessions": [],
+        }
+
+    by_drawing: dict[str, dict] = {}
+    by_drawing_prev: dict[str, dict] = {}
+
+    for r in rows:
+        drawing = drawings_by_epc.get((r["epc"] or "").strip()) or ""
+        if not drawing:
+            continue
+        in_cur = _in_analytics_period(r["exit_time"], days)
+        in_prev = _in_previous_period(r["exit_time"], days) if days else False
+        if not in_cur and not in_prev:
+            continue
+        acc = (by_drawing if in_cur else by_drawing_prev).setdefault(drawing, _blank_acc())
+        if not acc["series"]:
+            acc["series"] = _series_from_drawing(drawing)
         st = r["station_name"] or ""
         dwell = int(r["dwell_seconds"])
         acc["station_dwells"].setdefault(st, []).append(dwell)
@@ -3994,15 +4432,26 @@ def _build_drawing_analytics(
         acc["closed"] += 1
         epc_map = acc["epc_station_dwells"].setdefault(r["epc"], {})
         epc_map[st] = epc_map.get(st, 0) + dwell
+        if in_cur:
+            acc["sessions"].append({
+                "epc": r["epc"],
+                "part_name": r["part_name"],
+                "ibus_number": _normalize_ibus_key(r["ibus_number"], r["job_number"]),
+                "station": st,
+                "dwell_seconds": dwell,
+                "dwell_display": _dwell_display(dwell),
+                "operators": r["operators"],
+                "exit_time": r["exit_time"],
+            })
         spec = _spec_for_station(specs_by_name, st)
         target = spec.get("target_part_dwell_seconds") if spec else None
         if target and dwell > target:
             acc["over_target"] += 1
+            acc["over_by_station"][st] = acc["over_by_station"].get(st, 0) + 1
+            acc["over_excess_sum"] += dwell - target
 
-    drawings = []
-    for drawing, acc in by_drawing.items():
+    def _finalize(acc: dict, drawing: str, prev_acc: dict | None = None) -> dict:
         station_avgs = {}
-        total_avgs = []
         slowest_station = None
         slowest_avg = -1
         for st in spine:
@@ -4032,65 +4481,288 @@ def _build_drawing_analytics(
                 slowest_avg = avg
                 slowest_station = st
 
-        # Total process time per part = sum of station dwells for that EPC
-        part_totals = []
-        for epc, st_map in acc["epc_station_dwells"].items():
-            part_totals.append(sum(st_map.values()))
+        part_totals = [sum(st_map.values()) for st_map in acc["epc_station_dwells"].values()]
         total_avg = sum(part_totals) / len(part_totals) if part_totals else None
         total_med = _median(part_totals) if part_totals else None
         total_p90 = _percentile(part_totals, 90) if part_totals else None
+        total_min = min(part_totals) if part_totals else None
+        total_max = max(part_totals) if part_totals else None
+        total_range = (total_max - total_min) if total_min is not None and total_max is not None else None
 
-        # Coefficient of variation on total times for "most variable"
         variance_score = None
+        std_seconds = None
         if len(part_totals) >= 2 and total_avg:
-            mean = total_avg
-            var = sum((x - mean) ** 2 for x in part_totals) / len(part_totals)
-            variance_score = round((var ** 0.5) / mean, 3) if mean else None
+            var = sum((x - total_avg) ** 2 for x in part_totals) / len(part_totals)
+            std_seconds = round(var ** 0.5, 1)
+            variance_score = round(std_seconds / total_avg, 3) if total_avg else None
+
+        # Station contribution to total avg
+        station_contribution = {}
+        if total_avg and total_avg > 0:
+            for st in spine:
+                avg = station_avgs[st].get("avg_seconds")
+                if avg is not None:
+                    station_contribution[st] = round(100.0 * avg / total_avg, 1)
 
         over_pct = round(100.0 * acc["over_target"] / acc["closed"], 1) if acc["closed"] else 0
+        primary_over_station = None
+        if acc["over_by_station"]:
+            primary_over_station = max(acc["over_by_station"].items(), key=lambda kv: kv[1])[0]
+        avg_over_by = (
+            round(acc["over_excess_sum"] / acc["over_target"], 1)
+            if acc["over_target"] else None
+        )
 
-        drawings.append({
+        parts_n = len(acc["epcs"])
+        confidence = _sample_confidence(parts_n)
+
+        # Previous period total avg
+        prev_total_avg = None
+        pct_change = None
+        if prev_acc and prev_acc.get("epc_station_dwells"):
+            prev_totals = [sum(m.values()) for m in prev_acc["epc_station_dwells"].values()]
+            if prev_totals:
+                prev_total_avg = sum(prev_totals) / len(prev_totals)
+                if prev_total_avg and total_avg is not None:
+                    pct_change = round(100.0 * (total_avg - prev_total_avg) / prev_total_avg, 1)
+
+        longest = sorted(acc.get("sessions") or [], key=lambda s: s["dwell_seconds"], reverse=True)[:5]
+
+        return {
             "drawing": drawing,
-            "series": acc["series"],
-            "parts_completed": len(acc["epcs"]),
+            "series": acc["series"] or _series_from_drawing(drawing),
+            "parts_completed": parts_n,
             "sessions_closed": acc["closed"],
+            "confidence": confidence,
             "stations": station_avgs,
+            "station_contribution_pct": station_contribution,
             "total_avg_seconds": round(total_avg, 1) if total_avg is not None else None,
             "total_avg_display": _dwell_display(total_avg),
             "total_median_seconds": total_med,
             "total_median_display": _dwell_display(total_med),
             "total_p90_seconds": round(total_p90, 1) if total_p90 is not None else None,
             "total_p90_display": _dwell_display(total_p90),
-            "total_min_seconds": min(part_totals) if part_totals else None,
-            "total_min_display": _dwell_display(min(part_totals) if part_totals else None),
-            "total_max_seconds": max(part_totals) if part_totals else None,
-            "total_max_display": _dwell_display(max(part_totals) if part_totals else None),
+            "total_min_seconds": total_min,
+            "total_min_display": _dwell_display(total_min),
+            "total_max_seconds": total_max,
+            "total_max_display": _dwell_display(total_max),
+            "total_range_seconds": total_range,
+            "total_range_display": _dwell_display(total_range),
+            "std_seconds": std_seconds,
+            "std_display": _dwell_display(std_seconds),
             "slowest_station": slowest_station,
             "parts_over_target": acc["over_target"],
             "parts_over_target_pct": over_pct,
+            "primary_over_target_station": primary_over_station,
+            "avg_over_target_seconds": avg_over_by,
+            "avg_over_target_display": _dwell_display(avg_over_by),
             "variance_score": variance_score,
-        })
+            "prev_total_avg_seconds": round(prev_total_avg, 1) if prev_total_avg is not None else None,
+            "prev_total_avg_display": _dwell_display(prev_total_avg),
+            "pct_change_vs_prev": pct_change,
+            "longest_sessions": longest,
+            "is_no_drilling": "no drilling" in drawing.lower(),
+        }
+
+    drawings = []
+    for drawing, acc in by_drawing.items():
+        drawings.append(_finalize(drawing=drawing, acc=acc, prev_acc=by_drawing_prev.get(drawing)))
 
     drawings.sort(key=lambda d: d.get("total_avg_seconds") or 0, reverse=True)
 
-    kpis = {
-        "slowest_drawing": None,
-        "fastest_drawing": None,
-        "most_variable_drawing": None,
-        "most_over_target_drawing": None,
-    }
-    with_avg = [d for d in drawings if d.get("total_avg_seconds") is not None]
-    if with_avg:
-        kpis["slowest_drawing"] = max(with_avg, key=lambda d: d["total_avg_seconds"])["drawing"]
-        kpis["fastest_drawing"] = min(with_avg, key=lambda d: d["total_avg_seconds"])["drawing"]
-    with_var = [d for d in drawings if d.get("variance_score") is not None]
-    if with_var:
-        kpis["most_variable_drawing"] = max(with_var, key=lambda d: d["variance_score"])["drawing"]
-    with_over = [d for d in drawings if d.get("parts_over_target_pct")]
-    if with_over:
-        kpis["most_over_target_drawing"] = max(with_over, key=lambda d: d["parts_over_target_pct"])["drawing"]
+    def _pick_kpi(rows, key, reverse=True, min_parts=1):
+        eligible = [d for d in rows if d.get(key) is not None and d["parts_completed"] >= min_parts]
+        if not eligible:
+            eligible = [d for d in rows if d.get(key) is not None]
+        if not eligible:
+            return None
+        return max(eligible, key=lambda d: d[key]) if reverse else min(eligible, key=lambda d: d[key])
 
-    # Grouped bar chart payload: top drawings by volume
+    slowest = _pick_kpi(drawings, "total_avg_seconds", reverse=True)
+    fastest = _pick_kpi(drawings, "total_avg_seconds", reverse=False)
+    most_var = _pick_kpi(drawings, "variance_score", reverse=True, min_parts=2)
+    most_over = _pick_kpi(
+        [d for d in drawings if d.get("parts_over_target")],
+        "parts_over_target_pct",
+        reverse=True,
+    )
+
+    def _kpi_card(d, kind):
+        if not d:
+            return None
+        base = {
+            "drawing": d["drawing"],
+            "series": d["series"],
+            "parts_completed": d["parts_completed"],
+            "confidence": d["confidence"],
+            "total_avg_display": d["total_avg_display"],
+            "total_avg_seconds": d["total_avg_seconds"],
+            "message": "",
+            "insufficient_data": d["confidence"] == "low",
+        }
+        if kind == "slowest":
+            base["message"] = (
+                f"{d['drawing']} is currently the slowest drawing, averaging "
+                f"{d['total_avg_display']} across the tracked stations."
+            )
+            if d.get("is_no_drilling"):
+                visited_gannomat = any(
+                    "gannomat" in (st or "").lower() and (stats.get("sample_size") or 0) > 0
+                    for st, stats in (d.get("stations") or {}).items()
+                )
+                if visited_gannomat:
+                    base["message"] += (
+                        " As a no-drilling drawing, recorded time at Gannomat may indicate "
+                        "unexpected handling or routing."
+                    )
+        elif kind == "fastest":
+            base["message"] = (
+                f"{d['drawing']} is currently the fastest drawing"
+                f" (avg {d['total_avg_display']})."
+            )
+            if d["confidence"] == "low":
+                base["message"] += f" Based on only {d['parts_completed']} part — insufficient data."
+        elif kind == "variable":
+            base["range_display"] = d.get("total_range_display")
+            base["min_display"] = d.get("total_min_display")
+            base["max_display"] = d.get("total_max_display")
+            base["message"] = (
+                f"{d['drawing']} has the greatest variation in processing time"
+                f" (avg {d['total_avg_display']}, range {d.get('total_range_display') or '—'}; "
+                f"fastest {d.get('total_min_display') or '—'}, slowest {d.get('total_max_display') or '—'})."
+            )
+        elif kind == "over_target":
+            st = d.get("primary_over_target_station") or "a station"
+            base["parts_over_target"] = d["parts_over_target"]
+            base["parts_over_target_pct"] = d["parts_over_target_pct"]
+            base["primary_station"] = d.get("primary_over_target_station")
+            base["message"] = (
+                f"{d['drawing']} exceeded target on {d['parts_over_target']} of "
+                f"{d['sessions_closed']} sessions ({d['parts_over_target_pct']}%), primarily at {st}."
+            )
+        return base
+
+    kpis = {
+        "slowest": _kpi_card(slowest, "slowest"),
+        "fastest": _kpi_card(fastest, "fastest"),
+        "most_variable": _kpi_card(most_var, "variable"),
+        "most_over_target": _kpi_card(most_over, "over_target"),
+        # legacy string keys for compatibility
+        "slowest_drawing": slowest["drawing"] if slowest else None,
+        "fastest_drawing": fastest["drawing"] if fastest else None,
+        "most_variable_drawing": most_var["drawing"] if most_var else None,
+        "most_over_target_drawing": most_over["drawing"] if most_over else None,
+    }
+
+    # Bottleneck among all drawings
+    bottleneck_counts: dict[str, int] = {}
+    for d in drawings:
+        st = d.get("slowest_station")
+        if st:
+            bottleneck_counts[st] = bottleneck_counts.get(st, 0) + 1
+    top_bottleneck = None
+    if bottleneck_counts:
+        st, n = max(bottleneck_counts.items(), key=lambda kv: kv[1])
+        top_bottleneck = {
+            "station": st,
+            "drawing_count": n,
+            "total_drawings": len(drawings),
+            "message": f"{st} is the bottleneck for {n} of {len(drawings)} drawings.",
+        }
+
+    # Attention items
+    attention = []
+    for d in drawings:
+        if d["confidence"] == "low":
+            attention.append({
+                "priority": "Low",
+                "drawing": d["drawing"],
+                "finding": f"Result based on only {d['parts_completed']} part(s)",
+                "station": "All",
+                "recommended_review": "Collect more production data before acting",
+            })
+        if d.get("variance_score") and d["variance_score"] >= 0.35 and d["parts_completed"] >= 3:
+            attention.append({
+                "priority": "Medium",
+                "drawing": d["drawing"],
+                "finding": (
+                    f"High time variation (range {d.get('total_range_display') or '—'}; "
+                    f"avg {d.get('total_avg_display')})"
+                ),
+                "station": d.get("slowest_station") or "—",
+                "recommended_review": "Review longest sessions for this drawing",
+            })
+        if d.get("parts_over_target"):
+            attention.append({
+                "priority": "High",
+                "drawing": d["drawing"],
+                "finding": (
+                    f"Exceeded station target on {d['parts_over_target']} sessions "
+                    f"({d['parts_over_target_pct']}%)"
+                ),
+                "station": d.get("primary_over_target_station") or "—",
+                "recommended_review": "Inspect over-target sessions and operator notes",
+            })
+        if d.get("is_no_drilling"):
+            gann = None
+            for st, stats in (d.get("stations") or {}).items():
+                if "gannomat" in st.lower() and (stats.get("sample_size") or 0) > 0:
+                    gann = st
+                    break
+            if gann:
+                attention.append({
+                    "priority": "High",
+                    "drawing": d["drawing"],
+                    "finding": "No-drilling drawing recorded at drilling station",
+                    "station": gann,
+                    "recommended_review": "Verify routing and RFID events",
+                })
+        if d.get("pct_change_vs_prev") is not None and d["pct_change_vs_prev"] >= 20:
+            attention.append({
+                "priority": "Medium",
+                "drawing": d["drawing"],
+                "finding": (
+                    f"Total process time up {d['pct_change_vs_prev']}% vs prior period "
+                    f"({d.get('prev_total_avg_display')} → {d.get('total_avg_display')})"
+                ),
+                "station": d.get("slowest_station") or "All",
+                "recommended_review": "Compare recent sessions to prior week",
+            })
+
+    priority_rank = {"High": 0, "Medium": 1, "Low": 2}
+    attention.sort(key=lambda x: (priority_rank.get(x["priority"], 9), x["drawing"]))
+
+    # Supervisor summary narrative
+    low_n = sum(1 for d in drawings if d["confidence"] == "low")
+    over_n = sum(1 for d in drawings if d.get("parts_over_target"))
+    summary_bits = [
+        f"{len(drawings)} drawing{'s' if len(drawings) != 1 else ''} "
+        f"{'were' if len(drawings) != 1 else 'was'} processed during the selected period."
+    ]
+    if top_bottleneck:
+        summary_bits.append(top_bottleneck["message"])
+    if slowest:
+        summary_bits.append(
+            f"Drawing {slowest['drawing']} had the highest average total time "
+            f"({slowest['total_avg_display']})."
+        )
+    if most_var:
+        summary_bits.append(
+            f"Drawing {most_var['drawing']} had the most inconsistent processing time "
+            f"(range {most_var.get('total_range_display') or '—'})."
+        )
+    if over_n:
+        summary_bits.append(f"{over_n} drawing{'s' if over_n != 1 else ''} exceeded station targets.")
+    else:
+        summary_bits.append("No drawings exceeded their established targets.")
+    if low_n:
+        summary_bits.append(
+            f"{low_n} result{'s' if low_n != 1 else ''} "
+            f"{'are' if low_n != 1 else 'is'} based on fewer than five parts "
+            "and should be treated as preliminary."
+        )
+    supervisor_summary = " ".join(summary_bits)
+
     comparison = []
     for d in sorted(drawings, key=lambda x: x["parts_completed"], reverse=True)[:12]:
         row = {"drawing": d["drawing"], "series": d["series"], "stations": {}}
@@ -4099,11 +4771,23 @@ def _build_drawing_analytics(
             row["stations"][st] = st_stats.get("avg_seconds")
         comparison.append(row)
 
+    # Longest sessions across all drawings
+    all_longest = []
+    for d in drawings:
+        for s in d.get("longest_sessions") or []:
+            all_longest.append({**s, "drawing": d["drawing"], "series": d["series"]})
+    all_longest.sort(key=lambda s: s["dwell_seconds"], reverse=True)
+
     return {
         "drawings": drawings,
         "kpis": kpis,
         "comparison": comparison,
         "spine": spine,
+        "supervisor_summary": supervisor_summary,
+        "attention": attention[:25],
+        "bottleneck": top_bottleneck,
+        "longest_sessions": all_longest[:15],
+        "period_days": days,
     }
 
 
