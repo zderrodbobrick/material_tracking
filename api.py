@@ -20,6 +20,7 @@ import threading
 import time as _time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
+from statistics import median
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -37,6 +38,7 @@ from config import (
     SEWIO_API_KEY, SEWIO_REST_URL, SEWIO_VERIFY_SSL,
     PROGRESS_STATIONS,
     HIDDEN_IBUS_ORDERS,
+    LISTENER_PORT,
 )
 from database.migrate import run_migrations
 from tracking.station_specs import (
@@ -141,6 +143,7 @@ def _attach_order_time_estimates(
     specs_by_name: dict,
     part_actuals: dict[str, float] | None,
     wo_parts_by_ibus: dict[str, int] | None,
+    transit_legs: dict[tuple[str, str], float] | None = None,
 ) -> None:
     key = (journey.get("key") or journey.get("ibus_order") or "").upper()
     bom_expected = (wo_parts_by_ibus or {}).get(key)
@@ -151,13 +154,17 @@ def _attach_order_time_estimates(
         est_parts,
         specs_by_name,
         part_actuals=part_actuals,
+        transit_legs=transit_legs,
     )
     journey["expected_parts"] = bom_expected
     journey["estimated_parts"] = est_parts
     journey["estimated_transit_seconds"] = est["transit_seconds"]
+    journey["estimated_transit_breakdown"] = est["transit_breakdown"]
     journey["estimated_machine_dwell_seconds"] = est["machine_dwell_seconds"]
     journey["estimated_per_part_seconds"] = est["per_part_seconds"]
     journey["estimated_per_part_display"] = _dwell_display(est["per_part_seconds"])
+    journey["estimated_bottleneck_station"] = est["bottleneck_station"]
+    journey["estimated_bottleneck_seconds"] = est["bottleneck_seconds"]
     journey["estimated_total_seconds"] = est["estimated_total_seconds"]
     journey["estimated_total_display"] = (
         _dwell_display(est["estimated_total_seconds"])
@@ -692,6 +699,7 @@ def _build_ibus_journeys(
     part_actuals: dict[str, float] | None = None,
     wo_parts_by_ibus: dict[str, int] | None = None,
     drawings_by_epc: dict[str, str] | None = None,
+    transit_legs: dict[tuple[str, str], float] | None = None,
 ) -> list[dict]:
     """Group station sessions by IBUS order (work order), not individual part EPC."""
     groups: dict[str, list[dict]] = {}
@@ -950,7 +958,7 @@ def _build_ibus_journeys(
         }
         if specs_by_name:
             _attach_order_time_estimates(
-                journey, specs_by_name, part_actuals, wo_parts_by_ibus
+                journey, specs_by_name, part_actuals, wo_parts_by_ibus, transit_legs
             )
         else:
             # Still expose BOM size so the UI can show "34 parts" without specs.
@@ -982,10 +990,13 @@ def ibus_journeys():
     part_actuals, _ = _station_actual_dwells(db)
     wo_parts_by_ibus = _work_order_parts_by_ibus(db)
     drawings_by_epc = _drawings_by_epc(db)
+    spine = progress_spine_names(specs_by_name) if specs_by_name else []
+    transit_legs = _measure_transit_legs(db, spine) if spine else {}
     db.close()
 
     journeys = _build_ibus_journeys(
-        sessions, specs_by_name, part_actuals, wo_parts_by_ibus, drawings_by_epc
+        sessions, specs_by_name, part_actuals, wo_parts_by_ibus, drawings_by_epc,
+        transit_legs,
     )
     if status in ("open", "live", "in"):
         journeys = [j for j in journeys if j["status"] == "open"]
@@ -1068,6 +1079,93 @@ def end_session(session_id):
     db.close()
     _direct_emit("session_ended")
     return jsonify({"success": True, "dwell_seconds": dwell})
+
+
+# ── POST /api/admin/reset-sessions  ("Clean Start" — live dashboard) ─────────
+#
+# Wipes tracking/session data only: raw reads, ENTER/EXIT events, station
+# sessions, and operator-presence/assignment history. Deliberately leaves
+# configuration and reference data untouched: stations, rfid_readers,
+# rfid_antennas, station_specifications, operators (roster), and all
+# work-order/BOM data (parts, rfid_tags, part_tag_assignments, work_orders,
+# work_order_components) ingested from .R41 files — none of that needs
+# re-ingesting after a reset.
+#
+# parts.tenoner_return_count is the one exception: it's a per-part *tracking*
+# counter (Tennoner rework passes) that happens to live on the otherwise-kept
+# parts table, so it's reset to 0 explicitly below rather than left to
+# accumulate across every test/production run forever.
+#
+# Current operator/zone state also clears: wiping operator_current_zone and
+# then emitting "rtls_zone_refresh" (see _direct_emit) re-syncs the API's
+# in-memory zone-presence cache from that now-empty table — otherwise every
+# station would keep showing whatever operator (demo or real) was last
+# cached until its next real RTLS event.
+#
+# Delete order satisfies FK constraints (children before parents); every
+# table here only references tables in this same list or tables we keep.
+_RESET_TABLES = (
+    "part_operator_assignments",   # -> part_station_sessions, operators
+    "session_operator_presence",   # -> part_station_sessions, operators, stations
+    "part_station_sessions",       # -> part_station_events, stations, rfid_tags, parts
+    "part_station_events",         # -> rfid_raw_reads, stations, rfid_tags, parts
+    "rfid_raw_reads",              # -> rfid_antennas, rfid_readers, rfid_tags
+    "operator_station_presence",   # -> stations, operators
+    "operator_zone_visits",        # -> operators
+    "operator_current_zone",       # -> operators
+)
+
+
+@app.route("/api/admin/reset-sessions", methods=["POST"])
+def reset_sessions():
+    db = get_db()
+    backup_name = None
+    try:
+        backup_path = DB_PATH.parent / (
+            f"{DB_PATH.stem}.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}{DB_PATH.suffix}"
+        )
+        db.execute("VACUUM INTO ?", (str(backup_path),))
+        backup_name = backup_path.name
+
+        for table in _RESET_TABLES:
+            db.execute(f"DELETE FROM {table}")
+        db.execute(
+            "UPDATE parts SET tenoner_return_count = 0 "
+            "WHERE tenoner_return_count IS NOT NULL AND tenoner_return_count != 0"
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        db.close()
+        return jsonify({"error": str(exc)}), 500
+    db.close()
+
+    # Best-effort: also clear the listener's in-memory session state so it
+    # stops tracking sessions/streaks tied to rows that no longer exist.
+    # api.py and listener.py are separate processes — this is the only way
+    # to reach the listener's in-memory DwellTracker.
+    listener_reset_ok = False
+    listener_error = None
+    try:
+        import httpx
+        r = httpx.post(f"http://127.0.0.1:{LISTENER_PORT}/reset", timeout=3.0)
+        listener_reset_ok = r.status_code == 200
+        if not listener_reset_ok:
+            listener_error = f"HTTP {r.status_code}"
+    except Exception as exc:
+        listener_error = str(exc)
+
+    # "rtls_zone_refresh" makes _direct_emit re-sync the in-memory zone/operator
+    # cache from operator_current_zone (now empty) — without this, stations
+    # would keep showing whatever operators were last cached (demo or real)
+    # until the next actual RTLS event happened to touch each one.
+    _direct_emit("rtls_zone_refresh")
+    return jsonify({
+        "success": True,
+        "backup_file": backup_name,
+        "listener_reset": listener_reset_ok,
+        "listener_error": listener_error,
+    })
 
 
 # ── GET /api/summary  (dashboard cards) ───────────────────────────────────────
@@ -1177,7 +1275,7 @@ def _station_actual_dwells(db: sqlite3.Connection) -> tuple[dict[str, float], di
         """SELECT st.station_name, AVG(s.dwell_seconds) AS avg_dwell
            FROM part_station_sessions s
            JOIN stations st ON st.station_id = s.station_id
-           WHERE s.session_status = ? AND s.dwell_seconds IS NOT NULL
+           WHERE s.session_status = ? AND s.dwell_seconds > 0
            GROUP BY st.station_name""",
         (STATUS_CLOSED,),
     ):
@@ -1190,7 +1288,7 @@ def _station_actual_dwells(db: sqlite3.Connection) -> tuple[dict[str, float], di
     for r in db.execute(
         """SELECT station_name, AVG(dwell_seconds) AS avg_dwell
            FROM operator_zone_visits
-           WHERE exited_at IS NOT NULL AND dwell_seconds IS NOT NULL
+           WHERE exited_at IS NOT NULL AND dwell_seconds > 0
              AND station_name IS NOT NULL
            GROUP BY station_name"""
     ):
@@ -1200,6 +1298,57 @@ def _station_actual_dwells(db: sqlite3.Connection) -> tuple[dict[str, float], di
             op_map.setdefault(canon, float(r["avg_dwell"]))
 
     return part_map, op_map
+
+
+def _measure_transit_legs(
+    db: sqlite3.Connection, spine: list[str]
+) -> dict[tuple[str, str], float]:
+    """Median measured transit seconds for each adjacent pair of spine stations.
+
+    For every tag, pairs station A's exit_time with the very next session's
+    entry_time at the next spine station B. Uses median (not mean) so a rare
+    overnight/shift-change gap can't blow out the estimate. Legs with no
+    historical data are simply absent from the result — the caller falls back
+    to a flat default for those.
+    """
+    if len(spine) < 2:
+        return {}
+    spine_index = {name: i for i, name in enumerate(spine)}
+
+    rows = db.execute(
+        """SELECT s.tag_id, st.station_name, s.entry_time, s.exit_time
+           FROM part_station_sessions s
+           JOIN stations st ON st.station_id = s.station_id
+           WHERE s.entry_time IS NOT NULL
+           ORDER BY s.tag_id, s.entry_time"""
+    ).fetchall()
+
+    by_tag: dict[int, list[tuple[str, str, str | None]]] = {}
+    for r in rows:
+        canon = canonical_station(r["station_name"]) or r["station_name"]
+        if canon not in spine_index:
+            continue
+        by_tag.setdefault(r["tag_id"], []).append((canon, r["entry_time"], r["exit_time"]))
+
+    leg_samples: dict[tuple[str, str], list[float]] = {}
+    for seq in by_tag.values():
+        for i in range(len(seq) - 1):
+            station_a, _, exit_a = seq[i]
+            station_b, entry_b, _ = seq[i + 1]
+            if exit_a is None:
+                continue
+            if spine_index[station_b] != spine_index[station_a] + 1:
+                continue  # only count moves straight to the next spine station
+            dt_a = _parse_ts(exit_a)
+            dt_b = _parse_ts(entry_b)
+            if not dt_a or not dt_b:
+                continue
+            gap = (dt_b - dt_a).total_seconds()
+            if gap < 0 or gap > 8 * 3600:
+                continue  # skip negative/overnight-shift gaps — not real transit
+            leg_samples.setdefault((station_a, station_b), []).append(gap)
+
+    return {leg: median(vals) for leg, vals in leg_samples.items() if vals}
 
 
 @app.route("/api/station-specifications")
@@ -4950,7 +5099,17 @@ def analytics():
     specs_by_name = fetch_specs_by_name(db)
     machines = _build_machine_analytics(db, specs_by_name, days=days)
     ibus_orders = _build_ibus_order_analytics(db, specs_by_name)
-    attention = _build_attention_items(db, specs_by_name, ibus_orders, days=days if days is not None else 1)
+    # For now, "Attention required" on the Today view only surfaces parts that
+    # have overrun their station's allotted dwell time — the other exception
+    # types _build_attention_items can produce (missing entries, stale orders,
+    # exit-only/abandoned, sequence anomalies) are suppressed here by request.
+    # The order-detail drawer's own "Exceptions" section (_build_attention_items
+    # called again below with a single order) is untouched.
+    attention = [
+        item for item in
+        _build_attention_items(db, specs_by_name, ibus_orders, days=days if days is not None else 1)
+        if item.get("type") == "overdue_session"
+    ]
     drawing_analytics = _build_drawing_analytics(db, specs_by_name, days=days)
     trend_days = days if days is not None else 14
     trends = _build_trend_series(db, specs_by_name, days=trend_days)

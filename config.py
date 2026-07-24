@@ -90,9 +90,18 @@ EXIT_RSSI_MIN = int(os.getenv("EXIT_RSSI_MIN", "-65"))
 # Insert antenna (port 3): only strong reads close the Gannomat session / end dwell.
 THIRD_RSSI_MIN = int(os.getenv("THIRD_RSSI_MIN", str(EXIT_RSSI_MIN)))
 
-# Temporal filtering: require N reads within throttle window before session starts
-# Prevents stray/distant tags from creating sessions (1=disabled, 3=balanced, 5=strict)
-MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "5"))
+# Temporal filtering: require N reads within the streak window below before
+# session-affecting logic (open/close) fires. Prevents stray/distant tags from
+# creating or closing sessions (1=disabled, 3=balanced, 5=strict).
+MIN_READS_FOR_SESSION = int(os.getenv("MIN_READS_FOR_SESSION", "3"))
+
+# Window for counting "sustained" reads toward MIN_READS_FOR_SESSION. Deliberately
+# separate from RAW_THROTTLE_SEC (that one dedupes literal duplicate reports of the
+# same detection event, on the order of milliseconds). Real readers report a
+# lingering tag every ~1-3s, not every 50ms, so the sustained-read counter needs
+# its own, much larger window or it resets to 1 on every read and never reaches
+# MIN_READS_FOR_SESSION.
+SESSION_READ_WINDOW_SEC = float(os.getenv("SESSION_READ_WINDOW_SEC", "6.0"))
 
 # Set to True to only process tags containing "IBUS" in their EPC value.
 # Set to False to accept all tags regardless of EPC content.
@@ -115,6 +124,10 @@ ABANDON_TIMEOUT_SEC = float(os.getenv("ABANDON_TIMEOUT_SEC", "14400"))  # 4 h
 # Insert presence holds until the IBUS order completes. Kept separate so a short
 # ABANDON_TIMEOUT cannot drop parts off Insert before siblings arrive.
 INSERT_HOLD_TIMEOUT_SEC = float(os.getenv("INSERT_HOLD_TIMEOUT_SEC", "14400"))  # 4 h
+# Per-part Insert presence completes this long after the tag is last detected
+# (feeds the progress bar immediately). Separate from the IBUS-order-level
+# completion, which still waits for every sibling part to pass Insert.
+INSERT_IDLE_TIMEOUT_SEC = float(os.getenv("INSERT_IDLE_TIMEOUT_SEC", "5.0"))
 SWEEP_INTERVAL_SEC = float(os.getenv("SWEEP_INTERVAL_SEC", "1.0"))  # Check every second
 
 # ── Database Pruning ──────────────────────────────────────────────────────────

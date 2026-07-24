@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp database/rfid_reads.db /tmp/test_reset.db)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Read(//tmp/**)",
+      "Bash(.venv/Scripts/python.exe -c \"import os; print\\(os.path.exists\\('/tmp/test_reset.db'\\)\\)\")",
+      "Bash(mkdir -p \"/c/Users/ZANE~1.DER/AppData/Local/Temp/claude/c--Users-zane-derrod-material-tracking/7b449e03-3b3b-4612-b3f8-a6d03a5d4a23/scratchpad\")",
+      "Bash(cp database/rfid_reads.db \"/c/Users/ZANE~1.DER/AppData/Local/Temp/claude/c--Users-zane-derrod-material-tracking/7b449e03-3b3b-4612-b3f8-a6d03a5d4a23/scratchpad/test_reset.db\")",
+      "Bash(rm -f \"/c/Users/ZANE~1.DER/AppData/Local/Temp/claude/c--Users-zane-derrod-material-tracking/7b449e03-3b3b-4612-b3f8-a6d03a5d4a23/scratchpad/test_reset.db\" \"/c/Users/ZANE~1.DER/AppData/Local/Temp/claude/c--Users-zane-derrod-material-tracking/7b449e03-3b3b-4612-b3f8-a6d03a5d4a23/scratchpad/test_reset.bak.db\")",
+      "Bash(npx oxlint *)",
+      "Bash(npm run *)",
+      "Read(//c/Users/zane.derrect/material_tracking/**)",
+      "Bash(cp database/rfid_reads.db \"/c/Users/ZANE~1.DER/AppData/Local/Temp/claude/c--Users-zane-derrod-material-tracking/7b449e03-3b3b-4612-b3f8-a6d03a5d4a23/scratchpad/test_reset2.db\")",
+      "Bash(rm -f \"/c/Users/ZANE~1.DER/AppData/Local/Temp/claude/c--Users-zane-derrod-material-tracking/7b449e03-3b3b-4612-b3f8-a6d03a5d4a23/scratchpad/test_reset2.db\")",
+      "Bash(.venv/Scripts/python.exe r41/ingest.py r41/inbox/IBUS471010.R41)",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\")",
+      "PowerShell(Get-NetTCPConnection -LocalPort 5000,5001 -State Listen)",
+      "PowerShell(Get-Process -Name python -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-NetTCPConnection -LocalPort 5000,5001 -ErrorAction SilentlyContinue)",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"ProcessId=10860 or ProcessId=33568\")",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"ProcessId=20044 or ProcessId=22852\")",
+      "PowerShell(\\(Invoke-WebRequest -Uri \"http://169.254.135.1:5000/healthz\" -UseBasicParsing -TimeoutSec 5\\).Content)",
+      "Read(//c/Users/zane.derrod/**)",
+      "PowerShell(try { Invoke-WebRequest -Uri \"http://169.254.135.1:5000/healthz\" -UseBasicParsing -TimeoutSec 3 | Out-Null; \"5000 responding\" } catch { \"5000 NOT responding: $\\($_.Exception.Message\\)\" })"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\ZANE~1.DER\\AppData\\Local\\Temp\\claude\\c--Users-zane-derrod-material-tracking\\7b449e03-3b3b-4612-b3f8-a6d03a5d4a23\\scratchpad"
+    ]
+  }
+}

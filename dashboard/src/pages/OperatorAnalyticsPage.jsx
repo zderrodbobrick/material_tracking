@@ -62,9 +62,9 @@ async function loadLiveData() {
  }
 }
 
-/* ── Live drawer (who / where right now) ────────────────────────────────────── */
+/* ── Operator drawer (recent work detail) ─────────────────────────────────── */
 
-function LiveDrawer({ operatorId, rosterRow, inZoneProp, onClose, tick = 0 }) {
+function LiveDrawer({ operatorId, rosterRow, onClose, tick = 0 }) {
  const [detail, setDetail] = useState(null)
 
  useEffect(() => {
@@ -77,7 +77,6 @@ function LiveDrawer({ operatorId, rosterRow, inZoneProp, onClose, tick = 0 }) {
 
  const name = detail?.operator?.operator_name || rosterRow?.operator_name || 'Operator'
  const badge = detail?.operator?.rtls_badge_id ?? rosterRow?.rtls_badge_id
- const zone = detail?.currently_in_zone || inZoneProp
  const recent = detail?.recent_assignments ?? []
 
  return (
@@ -88,7 +87,6 @@ function LiveDrawer({ operatorId, rosterRow, inZoneProp, onClose, tick = 0 }) {
       <h2 className="bb-title truncate">{name}</h2>
       <p className="bb-subtitle">
        {badge != null ? `Badge ${badge}` : 'No badge'}
-       {zone?.station_name ? ` · ${zone.station_name}` : ' · Idle'}
       </p>
      </div>
      <button type="button" onClick={onClose} className="bb-btn-ghost p-1.5" aria-label="Close">
@@ -167,12 +165,6 @@ function LiveTab({ tick }) {
   return () => clearInterval(id)
  }, [load, tick])
 
- const inZoneMap = useMemo(() => {
-  const m = new Map()
-  for (const z of data?.currently_in_zone ?? []) m.set(z.operator_id, z)
-  return m
- }, [data])
-
  const leaderboardMap = useMemo(
   () => new Map((data?.leaderboard ?? []).map(o => [o.operator_id, o])),
   [data],
@@ -183,28 +175,23 @@ function LiveTab({ tick }) {
    .filter(r => r.is_active !== false)
    .map(r => {
     const stats = leaderboardMap.get(r.operator_id)
-    const zone = inZoneMap.get(r.operator_id)
     return {
      ...r,
      parts_today: r.parts_today ?? stats?.completed_pieces ?? 0,
      stations_today: r.stations_today ?? stats?.stations_worked ?? 0,
      in_progress: r.in_progress ?? stats?.in_progress ?? 0,
-     current_station: zone?.station_name ?? null,
-     status: zone ? 'Active' : 'Idle',
     }
    })
    .sort((a, b) => (b.parts_today - a.parts_today) || a.operator_name.localeCompare(b.operator_name))
- }, [data, leaderboardMap, inZoneMap])
+ }, [data, leaderboardMap])
 
  const filtered = useMemo(() => {
   if (!search.trim()) return rows
   const q = search.trim().toLowerCase()
   return rows.filter(c =>
-   `${c.operator_name} ${c.rtls_badge_id} ${c.employee_number} ${c.current_station ?? ''}`.toLowerCase().includes(q),
+   `${c.operator_name} ${c.rtls_badge_id} ${c.employee_number}`.toLowerCase().includes(q),
   )
  }, [rows, search])
-
- const activeCount = data?.currently_in_zone?.length ?? rows.filter(r => r.status === 'Active').length
 
  if (!data && !error) {
   return <div className="bb-table-wrap animate-pulse"><div className="h-48 bg-[#16161a]" /></div>
@@ -214,7 +201,7 @@ function LiveTab({ tick }) {
   <div className="space-y-4">
    <div className="flex flex-wrap items-end justify-between gap-3">
     <div>
-     <p className="bb-page-sub">Who is working where right now?</p>
+     <p className="bb-page-sub">Operator roster</p>
     </div>
     <div className="relative">
      <Search className="absolute left-2.5 top-2 w-3.5 h-3.5 text-[#8b939e] pointer-events-none" />
@@ -231,9 +218,7 @@ function LiveTab({ tick }) {
    {error && <p className="text-sm text-[#f87171]">{error}</p>}
 
    <p className="text-sm text-[#8b939e]">
-    <span className="tabular-nums font-semibold text-[#eef2f7]">{activeCount}</span> active now
-    <span className="mx-2 text-[#2a2a32]">|</span>
-    <span className="tabular-nums">{rows.length} on roster</span>
+    <span className="tabular-nums font-semibold text-[#eef2f7]">{rows.length}</span> on roster
    </p>
 
    {filtered.length === 0 ? (
@@ -245,10 +230,8 @@ function LiveTab({ tick }) {
        <tr>
         <th>Operator</th>
         <th className="text-right">Badge</th>
-        <th>Current station</th>
         <th className="text-right">Parts today</th>
         <th className="text-right">Stations today</th>
-        <th>Status</th>
        </tr>
       </thead>
       <tbody>
@@ -262,22 +245,8 @@ function LiveTab({ tick }) {
          <td className="text-right font-mono text-xs tabular-nums text-[#8b939e]">
           {op.rtls_badge_id ?? '—'}
          </td>
-         <td className="text-[#8b939e]">{op.current_station ?? '—'}</td>
          <td className="text-right tabular-nums font-semibold">{op.parts_today}</td>
          <td className="text-right tabular-nums text-[#8b939e]">{op.stations_today}</td>
-         <td>
-          {op.status === 'Active' ? (
-           <span className="inline-flex items-center gap-1.5">
-            <span className="bb-status-dot bg-[#34d399]" />
-            <span className="text-[#34d399] text-xs font-medium">Active</span>
-           </span>
-          ) : (
-           <span className="inline-flex items-center gap-1.5">
-            <span className="bb-status-dot bg-[#8b939e]" />
-            <span className="text-[#8b939e] text-xs">Idle</span>
-           </span>
-          )}
-         </td>
         </tr>
        ))}
       </tbody>
@@ -293,7 +262,6 @@ function LiveTab({ tick }) {
     <LiveDrawer
      operatorId={selectedId}
      rosterRow={rows.find(c => c.operator_id === selectedId)}
-     inZoneProp={inZoneMap.get(selectedId)}
      onClose={() => setSelectedId(null)}
      tick={tick}
     />
@@ -312,10 +280,11 @@ const RANGE_PRESETS = [
  { id: 'all', label: 'All time' },
 ]
 
+// "Compare to another operator" was removed — small per-operator/per-station
+// sample sizes made it unreliable (frequently no overlapping data to compare).
 const COMPARE_OPTIONS = [
  { id: 'expected_target', label: 'Expected target' },
  { id: 'all_average', label: 'All operators average' },
- { id: 'operator', label: 'Another operator' },
 ]
 
 function dwellDeltaClass(delta) {
@@ -443,9 +412,7 @@ function TrendsTab({ tick }) {
  const [operators, setOperators] = useState([])
  const [operatorId, setOperatorId] = useState('')
  const [compareMode, setCompareMode] = useState('expected_target')
- const [compareOperatorId, setCompareOperatorId] = useState('')
  const [range, setRange] = useState('30')
- const [partsMachine, setPartsMachine] = useState('all')
  const [dwellMachine, setDwellMachine] = useState('all')
  const [partType, setPartType] = useState('')
  const [series, setSeries] = useState('')
@@ -466,12 +433,6 @@ function TrendsTab({ tick }) {
    .catch(() => setOperators([]))
  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
- useEffect(() => {
-  if (compareMode !== 'operator' || compareOperatorId) return
-  const first = operators.find(o => String(o.operator_id) !== String(operatorId))
-  if (first) setCompareOperatorId(String(first.operator_id))
- }, [compareMode, compareOperatorId, operators, operatorId])
-
  const loadTrends = useCallback(() => {
   if (!operatorId) return
   setLoading(true)
@@ -484,9 +445,6 @@ function TrendsTab({ tick }) {
   if (partType) params.set('part_type', partType)
   if (series) params.set('series', series)
   if (drawing) params.set('drawing', drawing)
-  if (compareMode === 'operator' && compareOperatorId) {
-   params.set('compare_operator_id', compareOperatorId)
-  }
   apiFetch(`/api/analytics/operators/trends?${params}`)
    .then(d => {
     setData(d)
@@ -494,7 +452,7 @@ function TrendsTab({ tick }) {
    })
    .catch(e => setError(e?.message || 'Failed to load trends'))
    .finally(() => setLoading(false))
- }, [operatorId, range, partType, series, drawing, compareMode, compareOperatorId])
+ }, [operatorId, range, partType, series, drawing, compareMode])
 
  useEffect(() => {
   loadTrends()
@@ -525,11 +483,6 @@ function TrendsTab({ tick }) {
 
  const weekdayByStation = data?.by_weekday_by_station ?? {}
 
- const partsWeekdayRows = useMemo(() => {
-  if (partsMachine === 'all') return data?.by_weekday ?? []
-  return weekdayByStation[partsMachine] ?? []
- }, [data, partsMachine, weekdayByStation])
-
  const dwellWeekdayRows = useMemo(() => {
   if (dwellMachine === 'all') return data?.by_weekday ?? []
   return weekdayByStation[dwellMachine] ?? []
@@ -546,9 +499,6 @@ function TrendsTab({ tick }) {
   </SelectField>
  )
 
- const partsMachineLabel = partsMachine === 'all'
-  ? 'all stations'
-  : partsMachine
  const dwellMachineLabel = dwellMachine === 'all'
   ? 'all stations'
   : dwellMachine
@@ -570,18 +520,6 @@ function TrendsTab({ tick }) {
    display: `${s.avg_part_dwell_display ?? '—'} vs ${s.compare_part_dwell_display ?? s.target_part_dwell_display ?? '—'}`,
   }))
  ), [data])
-
- const compareOperators = operators.filter(
-  o => String(o.operator_id) !== String(operatorId),
- )
-
- const formatParts = v => `${Math.round(v)}`
-
- const formatPartsDelta = delta => {
-  if (delta == null) return '—'
-  if (delta === 0) return '0'
-  return `${delta > 0 ? '+' : ''}${Math.round(delta)}`
- }
 
  return (
   <div className="space-y-5">
@@ -608,19 +546,6 @@ function TrendsTab({ tick }) {
        <option key={o.id} value={o.id}>{o.label}</option>
       ))}
      </SelectField>
-
-     {compareMode === 'operator' && (
-      <SelectField
-       label="Compare operator"
-       value={compareOperatorId}
-       onChange={e => setCompareOperatorId(e.target.value)}
-      >
-       <option value="">Select…</option>
-       {compareOperators.map(o => (
-        <option key={o.operator_id} value={o.operator_id}>{o.operator_name}</option>
-       ))}
-      </SelectField>
-     )}
 
      <SelectField
       label="Time period"
@@ -689,34 +614,6 @@ function TrendsTab({ tick }) {
        {' · '}{op.active_days ?? 0} active days
       </p>
      </div>
-
-     <WeekdayCompareSection
-      title="Parts by day of week"
-      subtitle={
-       partsCompareAvailable
-        ? `Total parts on each weekday (${partsMachineLabel}) vs ${compareLabel.toLowerCase()}`
-        : `Total parts on each weekday (${partsMachineLabel})`
-      }
-      footnote={
-       partsCompareAvailable
-        ? 'Higher is better. Green difference means more parts than the comparison.'
-        : undefined
-      }
-      operatorName={op.operator_name}
-      compareLabel={compareLabel}
-      rows={partsWeekdayRows}
-      operatorValue={row => row.operator_parts}
-      peerValue={row => row.peer_parts}
-      formatValue={formatParts}
-      formatDelta={formatPartsDelta}
-      deltaClass={partsDeltaClass}
-      hasCompare={partsCompareAvailable}
-      machineFilter={machineFilterSelect(
-       partsMachine,
-       e => setPartsMachine(e.target.value),
-       'All total parts',
-      )}
-     />
 
      <WeekdayCompareSection
       title="Avg dwell by day of week"

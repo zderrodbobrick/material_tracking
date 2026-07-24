@@ -38,11 +38,9 @@ def decode_epc(epc: str) -> str:
     return format_tag_id(raw)
 
 def epc_matches_filter(epc: str) -> bool:
-    decoded = decode_epc(epc)
-    if not parse_tag_id(decoded)["is_known"]:
-        return False
     if not EPC_FILTER_PATTERN:
         return True
+    decoded = decode_epc(epc)
     return re.fullmatch(EPC_FILTER_PATTERN, decoded) is not None
 
 def ts():
@@ -237,6 +235,19 @@ def run_http():
             "third_antenna_last_at":   state["third_antenna_last_at"],
         }
         return jsonify(body), (200 if db_ok else 503)
+
+    @app.route("/reset", methods=["POST"])
+    def reset():
+        """Drop in-memory session state after api.py wipes the session/read tables.
+
+        Called by the dashboard's "Clean Start" action (via api.py), not meant
+        to be hit directly by the reader.
+        """
+        tracker.reset_state()
+        state["antenna_hits"] = {str(p): 0 for p in _all_antenna_ports()}
+        state["third_antenna_last_at"] = None
+        print(f"[{ts()}] Reset — in-memory session state cleared", flush=True)
+        return jsonify({"success": True}), 200
 
     @app.route("/tags", methods=["POST"])
     def receive_tags():

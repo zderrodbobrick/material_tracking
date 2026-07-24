@@ -5,7 +5,6 @@ import {
  HorizontalBars,
  AreaChart,
  VerticalBars,
- MultiLineChart,
  GroupedBars,
 } from '../components/charts'
 
@@ -496,39 +495,6 @@ function TrendsTab({ a, rangeId, setRangeId, customFrom, customTo, setCustomFrom
   value: d.completed,
  }))
 
- const overTargetDay = (a.pct_over_target_by_day ?? []).map(d => ({
-  label: d.date,
-  short: shortDate(d.date),
-  value: d.pct ?? 0,
- }))
-
- const exceptionSeries = [
-  {
-   id: 'over',
-   label: 'Over target',
-   color: '#fbbf24',
-   points: (a.exceptions_by_day ?? []).map(d => ({
-    label: d.date, short: shortDate(d.date), value: d.over_target ?? 0,
-   })),
-  },
-  {
-   id: 'exit',
-   label: 'Exit-only / missing entry',
-   color: '#f87171',
-   points: (a.exceptions_by_day ?? []).map(d => ({
-    label: d.date, short: shortDate(d.date), value: d.exit_only ?? 0,
-   })),
-  },
-  {
-   id: 'abandon',
-   label: 'Abandoned',
-   color: '#a78bfa',
-   points: (a.exceptions_by_day ?? []).map(d => ({
-    label: d.date, short: shortDate(d.date), value: d.abandoned ?? 0,
-   })),
-  },
- ]
-
  const dwellRatioData = machines
   .filter(m => m.avg_dwell_seconds != null)
   .map(m => ({
@@ -635,25 +601,6 @@ function TrendsTab({ a, rangeId, setRangeId, customFrom, customTo, setCustomFrom
      </div>
      <p className="text-[11px] text-[#8b939e]">
       Bar length = average dwell ÷ target. Short bars mean well under target.
-     </p>
-    </section>
-
-    <section className="bb-section">
-     <h2 className="bb-section-title">% parts exceeding target</h2>
-     <div className="bb-panel px-4 py-4">
-      {overTargetDay.some(d => d.value > 0)
-       ? <AreaChart data={overTargetDay} primaryLabel="% over target" formatValue={v => `${v}%`} />
-       : <p className="bb-empty">No over-target sessions in this period</p>}
-     </div>
-    </section>
-
-    <section className="bb-section">
-     <h2 className="bb-section-title">Exception trend</h2>
-     <div className="bb-panel px-4 py-4">
-      <MultiLineChart series={exceptionSeries} formatValue={v => `${v}`} emptyText="No exceptions" />
-     </div>
-     <p className="text-[11px] text-[#8b939e]">
-      Overdue sessions, missing entry reads, and abandoned sessions by day.
      </p>
     </section>
    </div>

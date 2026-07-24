@@ -20,7 +20,10 @@ Session modes
 
   Presence (LBD, Insert Station):
     A valid read means the part is there. LBD closes on short idle (left zone).
-    Insert holds until the IBUS order completes (or INSERT_HOLD_TIMEOUT).
+    Insert completes per-part after a short idle (INSERT_IDLE_TIMEOUT_SEC) —
+    dwell excludes that idle wait. The IBUS *order* is separately marked
+    complete only once every sibling part has passed Insert
+    (_maybe_complete_ibus_order), independent of each part's own session.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from config import (
     EXIT_RSSI_MIN,
     THIRD_RSSI_MIN,
     MIN_READS_FOR_SESSION,
+    SESSION_READ_WINDOW_SEC,
     EPC_FILTER_PATTERN,
     ENTER_EVENT,
     EXIT_EVENT,
@@ -57,6 +61,7 @@ from config import (
     SWEEP_INTERVAL_SEC,
     ABANDON_TIMEOUT_SEC,
     INSERT_HOLD_TIMEOUT_SEC,
+    INSERT_IDLE_TIMEOUT_SEC,
     DB_PATH,
     STATION_NAME,
     STATION_TYPE,
@@ -155,11 +160,9 @@ def _decode_epc(epc: str) -> str:
 
 
 def _epc_matches_filter(epc: str) -> bool:
-    decoded = _decode_epc(epc)
-    if not parse_tag_id(decoded)["is_known"]:
-        return False
     if not EPC_FILTER_PATTERN:
         return True
+    decoded = _decode_epc(epc)
     return re.fullmatch(EPC_FILTER_PATTERN, decoded) is not None
 
 
@@ -243,6 +246,9 @@ class DwellTracker:
         self._tenoner_saw_table: set[str] = set()
         self._last_raw: dict[tuple[str, int], float] = {}
         self._read_counts: dict[tuple[str, int], int] = {}
+        # Separate last-seen clock for the sustained-read streak (see ingest_batch
+        # step 3b) — deliberately independent of _last_raw/RAW_THROTTLE_SEC.
+        self._streak_last: dict[tuple[str, int], float] = {}
 
         self._recover_open_sessions()
 
@@ -497,16 +503,25 @@ class DwellTracker:
                     summary["raw_stale"] += 1
                     continue  # never drive session logic from stale reads
 
-                # ── 3. throttle / debounce ─────────────────────────────
+                # ── 3. throttle / debounce (raw dedupe bookkeeping only) ──
                 key = (epc, antenna_port)
                 now_epoch = reader_dt.timestamp()
                 last = self._last_raw.get(key, 0.0)
                 if now_epoch - last >= RAW_THROTTLE_SEC:
                     self._last_raw[key] = now_epoch
-                    self._read_counts[key] = 1
                 else:
                     summary["raw_throttled"] += 1
+
+                # ── 3b. sustained-read streak toward MIN_READS_FOR_SESSION ──
+                # Independent window from RAW_THROTTLE_SEC: real readers report a
+                # lingering tag every ~1-3s, not every 50ms, so this needs a much
+                # larger gap-tolerance or the streak would reset on every read.
+                streak_last = self._streak_last.get(key, 0.0)
+                if now_epoch - streak_last >= SESSION_READ_WINDOW_SEC:
+                    self._read_counts[key] = 1
+                else:
                     self._read_counts[key] = self._read_counts.get(key, 0) + 1
+                self._streak_last[key] = now_epoch
 
                 # ── 4. event + session logic (port-based) ──────────────
                 if antenna_port == ENTRY_ANTENNA:
@@ -597,6 +612,12 @@ class DwellTracker:
     def _close_other_buckets(self, epc: str, keep: dict, summary: dict) -> None:
         for bucket in self._all_open_buckets():
             if bucket is keep:
+                continue
+            if bucket is self._open:
+                # Gannomat dwell only ends via antenna 3 (Insert), the abandon
+                # timeout, or a manual end — never as a side effect of a read
+                # opening a session elsewhere (e.g. LBD/Tennoner antenna bleed
+                # picking up a tag that is still sitting in the Gannomat).
                 continue
             other = bucket.get(epc)
             if other is None:
@@ -979,7 +1000,26 @@ class DwellTracker:
                 if key[0] == epc:
                     self._read_counts.pop(key, None)
                     self._last_raw.pop(key, None)
+                    self._streak_last.pop(key, None)
         return closed
+
+    def reset_state(self) -> None:
+        """Drop all in-memory session/debounce state.
+
+        Used after an external "clean start" DB wipe (api.py deletes the
+        session/read tables directly, in its own process) so this tracker
+        stops holding session_ids that no longer exist and starts every
+        antenna's read streak from zero.
+        """
+        with self._lock:
+            self._open.clear()
+            self._tenoner_open.clear()
+            self._presence_open.clear()
+            self._completed_wos.clear()
+            self._tenoner_saw_table.clear()
+            self._last_raw.clear()
+            self._read_counts.clear()
+            self._streak_last.clear()
 
     def close(self) -> None:
         self._stop_evt.set()
@@ -1020,7 +1060,9 @@ class DwellTracker:
                         self._finalize(sess, STATUS_ABANDONED, bucket)
 
             # Presence:
-            #   Insert — long hold until order complete (INSERT_HOLD_TIMEOUT_SEC)
+            #   Insert — per-part complete after a short idle (INSERT_IDLE_TIMEOUT_SEC).
+            #     The IBUS-order-level completion (_maybe_complete_ibus_order) is
+            #     separate and still waits for every sibling part to pass Insert.
             #   LBD — idle timeout (no reads => not there)
             #   (Tennoner table hold uses _tenoner_open dwell bucket, not presence)
             for epc in list(self._presence_open.keys()):
@@ -1029,14 +1071,12 @@ class DwellTracker:
                     self._drop_stale_open(epc, self._presence_open)
                     continue
                 idle = (now - sess.last_seen_wall).total_seconds()
-                hold_ids = {self._insert_station_id}
-                timeout = (
-                    INSERT_HOLD_TIMEOUT_SEC
-                    if sess.station_id in hold_ids
-                    else IDLE_TIMEOUT_SEC
-                )
+                is_insert = sess.station_id == self._insert_station_id
+                timeout = INSERT_IDLE_TIMEOUT_SEC if is_insert else IDLE_TIMEOUT_SEC
                 if idle >= timeout:
-                    sess.exit_ts = now
+                    # Exit at the last real read, not "now" — the idle wait itself
+                    # (e.g. Insert's 5s no-detection window) shouldn't inflate dwell.
+                    sess.exit_ts = sess.last_seen_wall if is_insert else now
                     sess.has_exit = True
                     self._finalize(sess, STATUS_CLOSED, self._presence_open)
 

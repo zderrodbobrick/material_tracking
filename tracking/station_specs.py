@@ -288,14 +288,26 @@ def station_part_dwell_estimate(
     specs_by_name: dict[str, dict],
     part_actuals: dict[str, float] | None = None,
 ) -> int:
-    """Average seconds at one spine station (actual avg, else target, else default)."""
+    """Average seconds at one spine station (Settings target first, else actual, else default).
+
+    The Settings-tab "Part dwell target" is a deliberately configured
+    expectation of what the station should take, so it wins whenever it's
+    set. Actual observed dwell only fills in for stations with no target
+    configured — real averages can be skewed by bad data (see the negative-
+    dwell guard above) or by test/simulator runs, and shouldn't silently
+    override a number a person set on purpose.
+    """
     canon = canonical_station(station_name) or station_name
+    spec = specs_by_name.get(station_name) or specs_by_name.get(canon)
+    if spec and spec.get("target_part_dwell_seconds"):
+        return int(spec["target_part_dwell_seconds"])
     if part_actuals:
         for key in (station_name, canon):
-            if key in part_actuals and part_actuals[key]:
+            # > 0, not just truthy — a bad row (exit before entry) can average
+            # out negative, and that must never feed into a time estimate.
+            if key in part_actuals and part_actuals[key] and part_actuals[key] > 0:
                 return int(round(part_actuals[key]))
-    spec = specs_by_name.get(station_name) or specs_by_name.get(canon)
-    return _target_part_dwell(spec)
+    return DEFAULT_PART_DWELL
 
 
 def estimate_order_pipeline(
@@ -304,34 +316,83 @@ def estimate_order_pipeline(
     *,
     part_actuals: dict[str, float] | None = None,
     transit_seconds: int | None = None,
+    transit_legs: dict[tuple[str, str], float] | None = None,
 ) -> dict[str, Any]:
     """
-    Estimated line time for a work order.
+    Pipeline (flow-shop) estimate for a multi-part work order.
 
-    per_part = sum(spine station avg dwells) + transit buffer (default 1 h)
-    total    = part_count × per_part
+    Each spine station holds one part at a time, so once every station has a
+    part in it, the slowest ("bottleneck") station sets the pace for every
+    part behind the first — the line pipelines instead of processing parts
+    one-at-a-time end-to-end. Modeling it as per_part_seconds x part_count
+    (the old approach) assumes zero overlap between parts and heavily
+    overestimates anything beyond a handful of parts.
+
+        first_part_seconds = sum(per-station dwell) + sum(transit legs)
+        bottleneck_seconds = the single slowest station's per-part dwell
+        estimated_total     = first_part_seconds + (part_count - 1) x bottleneck_seconds
+
+    Transit between adjacent spine stations uses the measured median gap
+    (station A's exit -> station B's next entry, same tag) from historical
+    completed sessions when available (`transit_legs`), falling back to an
+    even split of IBUS_TRANSIT_BUFFER_SEC across legs with no data yet.
     """
-    transit = IBUS_TRANSIT_BUFFER_SEC if transit_seconds is None else int(transit_seconds)
     spine = progress_spine_names(specs_by_name)
     station_breakdown: list[dict[str, Any]] = []
+    per_station_seconds: dict[str, int] = {}
     machine_total = 0
     for name in spine:
         sec = station_part_dwell_estimate(name, specs_by_name, part_actuals)
+        per_station_seconds[name] = sec
         station_breakdown.append({
             "station_name": name,
             "average_dwell_seconds": sec,
         })
         machine_total += sec
-    per_part = machine_total + transit
+
+    legs = transit_legs or {}
+    num_legs = max(len(spine) - 1, 0)
+    fallback_leg = IBUS_TRANSIT_BUFFER_SEC if transit_seconds is None else int(transit_seconds)
+    fallback_per_leg = (fallback_leg / num_legs) if num_legs else 0.0
+
+    transit_breakdown: list[dict[str, Any]] = []
+    transit_total = 0.0
+    for i in range(num_legs):
+        a, b = spine[i], spine[i + 1]
+        measured = legs.get((a, b))
+        leg_sec = float(measured) if measured is not None else fallback_per_leg
+        transit_total += leg_sec
+        transit_breakdown.append({
+            "from_station": a,
+            "to_station": b,
+            "transit_seconds": round(leg_sec, 1),
+            "measured": measured is not None,
+        })
+
+    first_part_seconds = machine_total + transit_total
+    bottleneck_seconds = max(per_station_seconds.values()) if per_station_seconds else 0
+    bottleneck_station = (
+        max(per_station_seconds, key=per_station_seconds.get) if per_station_seconds else None
+    )
+
     pc = max(int(part_count or 0), 0)
-    total = per_part * pc if pc > 0 else None
+    if pc <= 0:
+        total = None
+    elif pc == 1:
+        total = first_part_seconds
+    else:
+        total = first_part_seconds + (pc - 1) * bottleneck_seconds
+
     return {
         "part_count": pc,
         "spine_station_count": len(spine),
-        "transit_seconds": transit,
+        "transit_seconds": round(transit_total),
+        "transit_breakdown": transit_breakdown,
         "machine_dwell_seconds": machine_total,
-        "per_part_seconds": per_part,
-        "estimated_total_seconds": total,
+        "per_part_seconds": round(first_part_seconds),
+        "bottleneck_station": bottleneck_station,
+        "bottleneck_seconds": bottleneck_seconds,
+        "estimated_total_seconds": int(round(total)) if total is not None else None,
         "station_breakdown": station_breakdown,
     }
 

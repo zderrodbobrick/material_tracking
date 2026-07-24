@@ -360,7 +360,7 @@ export function StationSettingsPage() {
  }
 
  return (
-  <div className="space-y-5 w-full max-w-[1800px]">
+  <div className="space-y-5 w-full">
    <div className="flex flex-wrap items-start justify-between gap-3">
     <div className="min-w-0">
      <h1 className="bb-page-title">Machine Analytics Settings</h1>

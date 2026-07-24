@@ -30,7 +30,10 @@ export function VerticalBars({
  const hasCompare = Array.isArray(compareData) && compareData.length > 0
 
  return (
-  <div className="space-y-2">
+  // pt-10 reserves room for the hover tooltip, which pops up above the tallest
+  // bar — without it, a bar near 100% height clips its own tooltip against the
+  // parent .bb-panel's overflow-hidden.
+  <div className="space-y-2 pt-10">
    {hasCompare && (
     <div className="flex flex-wrap gap-3 text-[11px] text-[#8b939e]">
      <span className="inline-flex items-center gap-1.5">
@@ -357,7 +360,9 @@ export function GroupedBars({
  const labelH = '4.5rem'
 
  return (
-  <div className="space-y-2">
+  // pt-16 reserves room for the hover tooltip (title + one line per key),
+  // which pops up above the bar — same clipping issue as VerticalBars.
+  <div className="space-y-2 pt-16">
    <div className="flex flex-wrap gap-3 text-[11px] text-[#8b939e]">
     {keys.map((k, i) => (
      <span key={k} className="inline-flex items-center gap-1.5">

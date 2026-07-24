@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, memo } from 'react'
-import { AlertCircle, ChevronDown, Map as MapIcon, X } from 'lucide-react'
+import { AlertCircle, ChevronDown, Map as MapIcon, RotateCcw, X } from 'lucide-react'
 import { MachineOverlaySvg } from '../components/MachineOverlay'
 import { AntennaMarkers } from '../components/AntennaEditor'
 import { StationMarkers } from '../components/StationEditor'
@@ -128,6 +128,7 @@ const MemoFloorPlanMap = memo(FloorPlanMap)
 
 function StationDetailPanel({ stationKey, stationName, status, sessions, onClose }) {
  if (!stationKey) return null
+ const isTenoner = stationKey === 'Tenoner' || stationKey === 'Tennoner'
  return (
   <div className="bb-panel">
    <div className="bb-panel-header">
@@ -186,6 +187,7 @@ function StationDetailPanel({ stationKey, stationName, status, sessions, onClose
         <th>Part</th>
         <th>Drawing</th>
         <th>Work order</th>
+        {isTenoner && <th className="text-right">Passes</th>}
         <th className="text-right">Dwell</th>
        </tr>
       </thead>
@@ -201,6 +203,11 @@ function StationDetailPanel({ stationKey, stationName, status, sessions, onClose
          <td className="font-mono text-xs text-[#8b939e]">
           {s.work_order || s.ibus_number || ibusOrderKey(s) || '—'}
          </td>
+         {isTenoner && (
+          <td className="text-right font-mono text-xs text-[#4dc4f4]" title="Times this part has looped back through Tenoner for another cut">
+           {s.tenoner_return_count > 0 ? s.tenoner_return_count : '—'}
+          </td>
+         )}
          <td className="text-right font-mono text-xs">
           <DwellTimer
            entranceTime={s.entry_time}
@@ -219,6 +226,133 @@ function StationDetailPanel({ stationKey, stationName, status, sessions, onClose
  )
 }
 
+const RESET_CONFIRM_WORD = 'RESET'
+
+function CleanStartModal({ busy, result, onConfirm, onClose }) {
+ const [confirmText, setConfirmText] = useState('')
+ const canConfirm = confirmText.trim().toUpperCase() === RESET_CONFIRM_WORD && !busy
+
+ return (
+  <div
+   className="fixed inset-0 z-50 flex items-center justify-center p-4"
+   onClick={busy ? undefined : onClose}
+   role="dialog"
+   aria-modal="true"
+   aria-labelledby="clean-start-title"
+  >
+   <div className="absolute inset-0 bg-black/55 backdrop-blur-[2px]" />
+   <div
+    className="relative w-full max-w-md rounded-2xl shadow-2xl bg-[#08080a] border border-[#27272f] animate-fade-in-scale"
+    onClick={e => e.stopPropagation()}
+   >
+    <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-[#27272f]">
+     <div className="flex items-center gap-3 min-w-0">
+      <span className="flex items-center justify-center w-10 h-10 rounded-xl bg-[#f87171]/15 shrink-0">
+       <RotateCcw className="w-5 h-5 text-[#f87171]" />
+      </span>
+      <h2 id="clean-start-title" className="text-lg font-bold text-[#eef2f7]">
+       Clean Start
+      </h2>
+     </div>
+     {!busy && (
+      <button
+       type="button"
+       onClick={onClose}
+       className="p-2 rounded-lg text-[#8b939e] hover:text-[#eef2f7] hover:bg-white/5"
+       aria-label="Close"
+      >
+       <X className="w-5 h-5" />
+      </button>
+     )}
+    </div>
+
+    <div className="px-5 py-4 space-y-3 text-sm">
+     {!result ? (
+      <>
+       <p className="text-[#eef2f7]">
+        This clears all live tracking data so you can start fresh: raw RFID reads,
+        station sessions, ENTER/EXIT events, operator-presence/assignment history,
+        and every station's current operator (no one will show as staffed until
+        they're seen again).
+       </p>
+       <p className="text-[#8b939e]">
+        Stations, antennas, station specs, the operator roster, and all work-order/part
+        data stay intact — nothing needs re-ingesting. A timestamped backup of the
+        database is taken automatically first.
+       </p>
+       <p className="text-[#fbbf24] font-medium">This cannot be undone from the dashboard.</p>
+       <label className="block text-xs font-semibold uppercase tracking-wide text-[#8b939e] pt-1">
+        Type {RESET_CONFIRM_WORD} to confirm
+       </label>
+       <input
+        type="text"
+        value={confirmText}
+        onChange={e => setConfirmText(e.target.value)}
+        disabled={busy}
+        placeholder={RESET_CONFIRM_WORD}
+        autoFocus
+        className="w-full rounded-md border border-[#27272f] bg-[#18181d] text-[#eef2f7]
+                   px-3 py-2 text-sm font-mono tracking-widest outline-none
+                   focus:border-[#f87171]/60"
+       />
+      </>
+     ) : result.error ? (
+      <p className="text-[#f87171]">Reset failed: {result.error}</p>
+     ) : (
+      <div className="space-y-1.5">
+       <p className="text-[#34d399] font-medium">Clean start complete.</p>
+       {result.backup_file && (
+        <p className="text-[#8b939e] text-xs">
+         Backup saved as <span className="font-mono">{result.backup_file}</span>
+        </p>
+       )}
+       {!result.listener_reset && (
+        <p className="text-[#fbbf24] text-xs">
+         Listener session state could not be cleared automatically
+         {result.listener_error ? ` (${result.listener_error})` : ''} — restart{' '}
+         <span className="font-mono">listener.py</span> to fully finish the reset.
+        </p>
+       )}
+      </div>
+     )}
+    </div>
+
+    <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-[#27272f]">
+     {!result ? (
+      <>
+       <button
+        type="button"
+        onClick={onClose}
+        disabled={busy}
+        className="px-3 py-1.5 rounded-lg text-sm text-[#8b939e] hover:bg-white/5 disabled:opacity-40"
+       >
+        Cancel
+       </button>
+       <button
+        type="button"
+        onClick={onConfirm}
+        disabled={!canConfirm}
+        className="px-3 py-1.5 rounded-lg text-sm font-medium text-white bg-[#f87171]
+                   hover:bg-rose-600 disabled:opacity-40 disabled:cursor-not-allowed"
+       >
+        {busy ? 'Resetting…' : 'Clear sessions'}
+       </button>
+      </>
+     ) : (
+      <button
+       type="button"
+       onClick={onClose}
+       className="px-3 py-1.5 rounded-lg text-sm font-medium text-white bg-[#4dc4f4] hover:bg-sky-500"
+      >
+       Done
+      </button>
+     )}
+    </div>
+   </div>
+  </div>
+ )
+}
+
 export function LiveDashboard({ liveSessions = [], tick = 0 }) {
  const { rtls, health, error, refresh } = useRtlsLive()
 
@@ -230,6 +364,9 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
  const [showSystemStatus, setShowSystemStatus] = useState(false)
  const [demoBusy, setDemoBusy] = useState(false)
  const [statusMessage, setStatusMessage] = useState(null)
+ const [cleanStartOpen, setCleanStartOpen] = useState(false)
+ const [cleanStartBusy, setCleanStartBusy] = useState(false)
+ const [cleanStartResult, setCleanStartResult] = useState(null)
  const [selectedOrderKey, setSelectedOrderKey] = useState(null)
  const [selectedStationKey, setSelectedStationKey] = useState(null)
  const [showDelays, setShowDelays] = useState(false)
@@ -459,6 +596,23 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
   }
  }, [refresh])
 
+ const handleCleanStart = useCallback(async () => {
+  setCleanStartBusy(true)
+  try {
+   const res = await apiPost('/api/admin/reset-sessions')
+   setCleanStartResult(res)
+  } catch (err) {
+   setCleanStartResult({ error: err?.message || 'Request failed' })
+  } finally {
+   setCleanStartBusy(false)
+  }
+ }, [])
+
+ const closeCleanStart = useCallback(() => {
+  setCleanStartOpen(false)
+  setCleanStartResult(null)
+ }, [])
+
  const handlePartClick = useCallback((session) => {
   const key = ibusOrderKey(session) || session.ibus_number || session.work_order
   if (key) setSelectedOrderKey(key)
@@ -589,25 +743,21 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
     </div>
    )}
 
-   {(alerts.length > 0 || showConfigWarning || showDisconnected || error) && (
-    <div className="flex flex-wrap items-center gap-2 text-xs">
-     {alerts.map(a => (
-      <span key={a} className="bb-badge-warn">{a}</span>
-     ))}
-     {(showConfigWarning || showDisconnected || error) && (
-      <button
-       type="button"
-       onClick={() => setShowSystemStatus(v => !v)}
-       className="bb-btn-outline text-[#8b939e]"
-      >
-       <AlertCircle className="w-3 h-3" />
-       System
-      </button>
-     )}
-    </div>
-   )}
+   <div className="flex flex-wrap items-center gap-2 text-xs">
+    {alerts.map(a => (
+     <span key={a} className="bb-badge-warn">{a}</span>
+    ))}
+    <button
+     type="button"
+     onClick={() => setShowSystemStatus(v => !v)}
+     className="bb-btn-outline text-[#8b939e]"
+    >
+     <AlertCircle className="w-3 h-3" />
+     System
+    </button>
+   </div>
 
-   {showSystemStatus && (showConfigWarning || showDisconnected || showNoPositions || error) && (
+   {showSystemStatus && (
     <div className="bb-panel px-3 py-2 space-y-1.5 text-xs">
      <p className="text-[10px] font-semibold uppercase tracking-wider text-[#8b939e]">System status</p>
      {error && <p className="text-[#f87171]">{error}</p>}
@@ -637,6 +787,18 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
        Clear demo operators
       </button>
      )}
+     <div className="pt-2 border-t border-[#27272f]">
+      <button
+       type="button"
+       onClick={() => setCleanStartOpen(true)}
+       className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium
+                  text-[#f87171] border border-[#f87171]/30 hover:bg-[#f87171]/10"
+       title="Clear all live tracking data (reads, sessions, events) for a fresh start"
+      >
+       <RotateCcw className="w-3 h-3" />
+       Clean Start — clear all sessions
+      </button>
+     </div>
     </div>
    )}
 
@@ -720,6 +882,15 @@ export function LiveDashboard({ liveSessions = [], tick = 0 }) {
      </div>
     )}
    </div>
+
+   {cleanStartOpen && (
+    <CleanStartModal
+     busy={cleanStartBusy}
+     result={cleanStartResult}
+     onConfirm={handleCleanStart}
+     onClose={closeCleanStart}
+    />
+   )}
   </div>
  )
 }

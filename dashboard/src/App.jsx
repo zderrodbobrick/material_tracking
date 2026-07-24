@@ -70,7 +70,7 @@ export default function App() {
     onTabChange={setTab}
     onHome={goHome}
    />
-   <main className="w-full px-3 sm:px-4 py-3 max-w-[1800px]">
+   <main className="w-full px-3 sm:px-4 py-3">
     {tab === 'live' && (
      <LiveDashboard liveSessions={liveSessions} tick={tick} />
     )}
